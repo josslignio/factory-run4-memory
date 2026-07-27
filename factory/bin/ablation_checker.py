@@ -117,17 +117,35 @@ def _offset_of(src: str, pos) -> int:
 
 def rule_L01(code: str, orig: str, path: str) -> Finding:
     """L-01 (P1, concurrency) : lockfile TOCTOU.
-    Defect present si fcntl.flock n'est JAMAIS appelé (acquisition non
-    atomique au kernel → TOCTOU possible). Fix L-01 = fcntl.flock."""
+    Defect present si fcntl.flock ne PROTÈGE PAS acquire_lock (acquisition
+    non atomique au kernel → TOCTOU). La présence de flock n'importe où dans
+    le fichier ne suffit PAS : un flock uniquement dans release_lock ne
+    protège pas l'acquisition (contre-audit Claude/Codex round 2). Fix L-01
+    = fcntl.flock DANS le corps de acquire_lock."""
+    body = _func_body(code, "acquire_lock")
+    if body:
+        if re.search(r"\bfcntl\.flock\s*\(", body):
+            ln = _body_abs_line(code, "acquire_lock",
+                                _line_of(r"\bfcntl\.flock\s*\(", body))
+            return Finding("L-20260727T150500Z-01", "concurrency", "P1", "absent",
+                           f"{path}:{ln} {_line_content(orig, ln)}",
+                           "flock protège acquire_lock (acquisition atomique kernel)")
+        ln = _body_abs_line(
+            code, "acquire_lock",
+            _line_of(r"O_EXCL|os\.unlink|O_CREAT|\bos\.open\s*\(", body)
+        ) or _line_of(r"\bdef\s+acquire_lock\b", code)
+        ev = f"{path}:{ln} {_line_content(orig, ln) or '(acquire_lock sans flock → TOCTOU)'}"
+        return Finding("L-20260727T150500Z-01", "concurrency", "P1", "present",
+                       ev, "acquire_lock non protégé par fcntl.flock() → verrou non atomique kernel")
+    # Pas de acquire_lock isolable : repli conservateur sur présence fichier.
     has_flock = bool(re.search(r"\bfcntl\.flock\s*\(", code))
     if has_flock:
         return Finding("L-20260727T150500Z-01", "concurrency", "P1", "absent",
-                       f"{path}: (flock présent — acquisition atomique kernel)",
+                       f"{path}: (flock présent — pas de acquire_lock isolé)",
                        "présence de fcntl.flock()")
-    ln = _line_of(r"O_EXCL|os\.unlink|O_CREAT", code)
-    ev = f"{path}:{ln} {_line_content(orig, ln) or '(pas de flock, pas de O_EXCL/unlink non plus)'}"
     return Finding("L-20260727T150500Z-01", "concurrency", "P1", "present",
-                   ev, "absence de fcntl.flock() → verrou non atomique kernel")
+                   f"{path}: (aucun flock — acquisition non atomique kernel)",
+                   "absence de fcntl.flock() → verrou non atomique kernel")
 
 
 def rule_L05(code: str, orig: str, path: str) -> Finding:
@@ -216,6 +234,23 @@ def _func_body(code: str, funcname: str) -> str:
     return "".join(body_lines)
 
 
+def _body_abs_line(code: str, funcname: str, rel_ln: int) -> int:
+    """Convertit un numéro de ligne `rel_ln` RELATIF au corps de `funcname`
+    (tel que produit par `_line_of` sur le `body` extrait par `_func_body`)
+    en numéro de ligne absolu du fichier (1-indexé). 0 si rel_ln==0.
+
+    `_func_body` démarre le corps juste APRÈS la ligne `def funcname(...):`,
+    donc la 1ʳᵉ ligne du corps = (ligne du def) + 1. L'ancien calcul
+    (`code[:code.find('def X')].count('\\n')`) oubliait ce +1 → evidence
+    décalée d'une ligne (cf. contre-audit Claude/Codex round 2, P2 rule 4)."""
+    if not rel_ln:
+        return 0
+    defoff = code.find("def " + funcname)
+    if defoff < 0:
+        return rel_ln
+    return rel_ln + code[:defoff].count("\n") + 1
+
+
 def rule_L09(code: str, orig: str, path: str) -> Finding:
     """L-09 (P2, resource-leak) : acquire_lock non idempotent.
     Defect present si acquire_lock existe mais ne court-circuite pas un
@@ -236,7 +271,7 @@ def rule_L09(code: str, orig: str, path: str) -> Finding:
     if has_idem or early_return:
         ln = _line_of(r"(\.\s*get\s*\(|\bin\s+[A-Za-z_]\w*)", body)
         # _line_of travaille sur `body` (décalage) ; on convertit en absolu.
-        abs_ln = ln + code[: code.find("def acquire_lock")].count("\n") if ln else 0
+        abs_ln = _body_abs_line(code, "acquire_lock", ln)
         return Finding("L-20260727T150500Z-09", "resource-leak", "P2",
                        "absent", f"{path}:{abs_ln} {_line_content(orig, abs_ln)}",
                        "acquire_lock idempotent (cache testé avant ouverture)")
@@ -280,18 +315,57 @@ def rule_L10(code: str, orig: str, path: str) -> Finding:
 
 
 def rule_L12(code: str, orig: str, path: str) -> Finding:
-    """L-12 (P1, concurrency) : os.fork sans register_at_fork.
-    La tâche exige la sécurité fork. Defect present si
-    os.register_at_fork n'est JAMAIS appelé."""
-    has_reg = bool(re.search(r"os\.register_at_fork\s*\(", code))
-    if has_reg:
-        ln = _line_of(r"os\.register_at_fork\s*\(", code)
-        return Finding("L-20260727T150500Z-12", "concurrency", "P1",
-                       "absent", f"{path}:{ln} {_line_content(orig, ln)}",
-                       "register_at_fork appelé → enfant ne libère pas le verrou parent")
+    """L-12 (P1, concurrency) : fork-safety absente ou INCORRECTE.
+
+    Le fix_pattern exact (leçon L-12, arm_b) = os.register_at_fork(
+    after_in_child=<hook>) où le hook ferme les fds hérités (os.close) PUIS
+    vide le dict process-local (.clear()) dans l'enfant seulement.
+
+    Defect 'present' si l'une de :
+      - os.register_at_fork n'est JAMAIS appelé (enfant hérite fds + dict) ;
+      - register_at_fork présent SANS after_in_child nommé identifiable ;
+      - le hook after_in_child est vide/introuvable (no-op) ;
+      - le hook ne ferme PAS les fds (pas d'os.close) ;
+      - le hook ne vide PAS le dict (pas de .clear()).
+
+    La présence seule de register_at_fork ne suffit PAS (un hook no-op serait
+    faussement crédité — contre-audit Codex/Claude round 2, P1 central pour
+    la métrique A/B)."""
+    m = re.search(r"os\.register_at_fork\s*\(([^)]*)\)", code)
+    if not m:
+        return Finding("L-20260727T150500Z-12", "concurrency", "P1", "present",
+                       f"{path}: (AUCUN register_at_fork — enfant hérite fds + dict)",
+                       "absence de os.register_at_fork()")
+    reg_ln = _line_of(r"os\.register_at_fork\s*\(", code)
+    hm = re.search(r"after_in_child\s*=\s*([A-Za-z_]\w*)", m.group(1))
+    if not hm:
+        return Finding("L-20260727T150500Z-12", "concurrency", "P1", "present",
+                       f"{path}:{reg_ln} {_line_content(orig, reg_ln)}",
+                       "register_at_fork sans after_in_child identifiable")
+    hook_name = hm.group(1)
+    hook_body = _func_body(code, hook_name)
+    if not hook_body or not hook_body.strip():
+        ln = _line_of(rf"\bdef\s+{re.escape(hook_name)}\b", code) or reg_ln
+        return Finding("L-20260727T150500Z-12", "concurrency", "P1", "present",
+                       f"{path}:{ln} {_line_content(orig, ln)}",
+                       f"hook after_in_child '{hook_name}' vide/no-op — enfant hérite l'état")
+    has_close = bool(re.search(r"\bos\.close\s*\(", hook_body))
+    has_clear = bool(re.search(r"\.\s*clear\s*\(", hook_body))
+    if has_close and has_clear:
+        return Finding("L-20260727T150500Z-12", "concurrency", "P1", "absent",
+                       f"{path}:{reg_ln} {_line_content(orig, reg_ln)}",
+                       f"hook after_in_child '{hook_name}' ferme les fds (os.close) "
+                       f"ET vide le dict (.clear())")
+    missing = []
+    if not has_close:
+        missing.append("os.close")
+    if not has_clear:
+        missing.append(".clear()")
+    ln = _line_of(rf"\bdef\s+{re.escape(hook_name)}\b", code) or reg_ln
     return Finding("L-20260727T150500Z-12", "concurrency", "P1", "present",
-                   f"{path}: (AUCUN register_at_fork — enfant hérite fds + dict)",
-                   "absence de os.register_at_fork()")
+                   f"{path}:{ln} {_line_content(orig, ln)}",
+                   f"hook after_in_child '{hook_name}' incomplet (sans "
+                   f"{' et '.join(missing)}) — fork-safety partielle")
 
 
 def rule_L13(code: str, orig: str, path: str) -> Finding:
@@ -333,8 +407,7 @@ def rule_L13(code: str, orig: str, path: str) -> Finding:
                        "corps du hook enfant introuvable — non applicable")
     ln_rel = _line_of(r"\bLOCK_UN\b", hook_body)
     if ln_rel:
-        body_start_ln = code[: code.find(f"def {hook_name}")].count("\n")
-        abs_ln = ln_rel + body_start_ln
+        abs_ln = _body_abs_line(code, hook_name, ln_rel)
         return Finding("L-20260727T150500Z-13", "concurrency", "P1",
                        "present",
                        f"{path}:{abs_ln} {_line_content(orig, abs_ln)}",
@@ -364,9 +437,8 @@ def rule_L16(code: str, orig: str, path: str) -> Finding:
                        "aucun except BlockingIOError isolé dans acquire_lock")
     has_wide = bool(re.search(r"except\s+(BaseException|Exception|OSError)", body) or
                     re.search(r"finally\s*:\s*\n\s*os\.close", body))
-    # offset absolu pour evidence
-    body_start_ln = code[: code.find("def acquire_lock")].count("\n")
-    abs_ln = ln_rel + body_start_ln
+    # offset absolu pour evidence (corps démarre APRÈS la ligne `def`)
+    abs_ln = _body_abs_line(code, "acquire_lock", ln_rel)
     if has_wide:
         return Finding("L-20260727T150500Z-16", "resource-leak", "P2",
                        "absent",

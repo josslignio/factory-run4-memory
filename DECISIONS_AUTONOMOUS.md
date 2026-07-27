@@ -60,3 +60,55 @@ réversible, fail-closed, puis CONTINUE — master order §AUTONOMIE TOTALE).
   champ `evidence` pointent vers `factory-run3-lab@fix-lock-flock-checkpoint-sha256:
   <file>:<line>` (état final vérifié), complétés du nom+ligne du test qui prouve
   le défaut ET le fix (sorties réelles collées dans `RUN3_REPORT.md`).
+
+## D-007 — Conflit règle 2 vs règle 4 sur les fichiers `run4-review-latest-*.md`
+- **Contexte** : Codex (rapport `run4-review-latest-codex.md`) a relevé deux
+  findings P1/High sur la tranche §2 : (a) absence de section `NON VÉRIFIÉ` en
+  fin de rapport dans les DEUX fichiers de review (viol absolu règle 4) ;
+  (b) `tests/fixtures/review_sample.txt:4` se présentait à tort comme un
+  rapport « RÉEL » alors que les fichiers référencés (`fork_pool.py`,
+  `temp_store.py`) n'existent pas dans le commit — findings non traçables.
+- **Conflit** : règle 2 (« le constructeur ne review jamais son propre
+  travail ») interdit au builder d'écrire les rapports reviewer-owned ;
+  règle 4 (« chaque rapport finit par une section NON VÉRIFIÉ ») est
+  absolue et exige sa présence. En autonomie headless, aucun reviewer
+  n'est disponible à l'instant t pour réécrire ces fichiers.
+- **Décision (fail-closed, minimale)** :
+  1. `tests/fixtures/review_sample.txt:4` rewordé de « exemple RÉEL » à
+     « FIXTURE SYNTHÉTIQUE (non un rapport réel) » avec mention explicite
+     que les fichiers cités sont fictifs et renvoi vers `memory/lessons.jsonl`
+     pour les leçons réelles. C'est un fichier builder-owned (fixture de
+     test), modification légitime.
+  2. Pour les DEUX fichiers `run4-review-latest-{claude,codex}.md` :
+     append UNIQUEMENT de la section `## NON VÉRIFIÉ` à la fin (sans
+     toucher au verdict PASS/FIX_NEEDED ni aux findings eux-mêmes).
+     Préserve le jugement reviewer tel quel, ajoute seulement ce que la
+     règle 4 exige. Le prochain cycle de review (driver) peut les
+     réécrire entièrement.
+  3. La règle 4 étant absolue et explicite, elle l'emporte sur la note
+     de process-hygiene non-bloquante de Claude (qui disait « à surveiller
+     si ça devient un pattern ») — un P1/High reproduit prime sur une
+     note process non-bloquante.
+- **Réversible** : oui (les verdicts reviewer sont intacts, seuls des
+  appendices `NON VÉRIFIÉ` ont été ajoutés ; le driver réécrit ces
+  fichiers au prochain cycle).
+
+## D-008 — Stop-words pour `_split_triggers` (injecteur §3)
+- **Contexte** : master order §3 exige « pas d'autres » leçons que les
+  bonnes. Une correspondance naïve ferait qu'une tâche disant « the file »
+  matcherait toutes les leçons dont un trigger contient « file » seul.
+- **Décision** : liste `STOPWORDS` statique (mots < 4 lettres ou trop
+  génériques : `lock`, `file`, `code`, `test`, `data`, `bug`, `fix`, etc.)
+  écartés AVANT scoring. Les items multi-mots (`os.fork`, `register_at_fork`,
+  `lockfile PID-file`) restent inchangés et matchables.
+- **Réversible** : oui (constante en haut du module).
+
+## D-009 — Code de retour `rc=2` quand l'injecteur ne trouve rien
+- **Contexte** : master order §3 veut que le mécanisme soit fail-closed —
+  ne pas silencieusement n'injecter rien (un master order sans leçons est
+  un signal distinct d'un master order dont l'injection a échoué).
+- **Décision** : `main()` retourne `0` si ≥1 leçon matche, `2` si aucune
+  ne matche (signal explicite « rien à injecter »), `1` sur erreur
+  (mémoire illisible, tâche vide, etc.). Le pilote peut brancher `rc=2`
+  sur un log WARNING sans traiter ça comme un FAIL run.
+- **Réversible** : oui.

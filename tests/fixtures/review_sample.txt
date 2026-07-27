@@ -1,8 +1,12 @@
 Rapport de review — fixture Run 4 §2 (lesson_extractor)
 =======================================================
 
-Ce fichier est un exemple RÉEL de rapport finding-block tel qu'un reviewer
-(Claude ou Codex) peut en produire après audit d'un module. Il mélange :
+Ce fichier est une FIXTURE SYNTHÉTIQUE (non un rapport réel) au format
+finding-block, utilisée pour tester l'extracteur §2 de manière déterministe.
+Les fichiers `fork_pool.py`, `temp_store.py` et `README.md` référencés
+ci-dessous sont des noms fictifs — ils n'existent pas dans ce dépôt et les
+findings ne sont PAS traçables à un vrai commit. Pour des leçons réelles,
+voir `memory/lessons.jsonl` (bootstrap §1 depuis Run #3). La fixture mélange :
   - un en-tête libre (ces lignes) ignoré par l'extracteur ;
   - trois blocs [FINDING]...[/FINDING] avec severities P1/P2/P3 ;
   - un bloc avec continuation multi-ligne (description + fix indentés) ;

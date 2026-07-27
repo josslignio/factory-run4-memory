@@ -1,0 +1,12 @@
+# Python (stdlib uniquement — jamais de dépendances externes)
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Run #4 runtime (sortie verbeuse du pilote, régénérée à chaque run)
+reports/run4-driver.log
+
+# macOS
+.DS_Store

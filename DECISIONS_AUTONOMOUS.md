@@ -112,3 +112,33 @@ réversible, fail-closed, puis CONTINUE — master order §AUTONOMIE TOTALE).
   (mémoire illisible, tâche vide, etc.). Le pilote peut brancher `rc=2`
   sur un log WARNING sans traiter ça comme un FAIL run.
 - **Réversible** : oui.
+
+## D-008 — Repair audit round 1 (P1 contre-audit Codex)
+- **Contexte** : `reports/run4-review-latest-codex.md` (round 1) a relevé 2 P1
+  bloquants après que l'état fut passé à READY_FOR_FINAL_AUDIT. La règle du
+  master order exige qu'un P1/High reproduit soit fixé AVANT de continuer.
+- **P1-A** : `factory/bin/lesson_extractor.py` `--out` non sérialisé — deux
+  extracteurs concurrents validaient l'absence de collision hors-verrou puis
+  écrivaient le MÊME fichier `.tmp` fixe ; un `os.replace` écrasait
+  silencieusement l'autre (perte possible).
+- **P1-B** : `reports/RUN4_ABLATION_AB.md` se contredisait — tableau corrigé
+  annonçait A=5/1P1 mais l'analyse §6 gardait A=6/2P1 ; header §1 et §7
+  disaient 15/15 tests alors qu'il y en a 17 ; aucune trace d'exécution
+  datée n'attestait que les chiffres résultaient d'un vrai run.
+- **Décision (option la plus sûre, réversible, fail-closed)** :
+  1. `_write_jsonl_fresh` acquiert le MÊME flock exclusif que
+     `_append_jsonl` (sur `*.lock`), re-vérifie les collisions SOUS verrou,
+     et utilise `tempfile.mkstemp` pour un `.tmp` unique par process ;
+  2. branches `--out` et `--append` de `main()` wrappées en try/except
+     `(LessonError, OSError)` → `rc=1` contrôlé (couvre aussi les P2 du
+     même chemin, même repair) ;
+  3. ajout du test RÉEL `TestOutConcurrentSerialization` (2 sous-processus
+     parallèles, assertion `codes == [0,1]`, fichier sain, aucun `.tmp`
+     résiduel) ;
+  4. correction des chiffres staleness (17/17 tests, 1→0 P1, 5→2 total) ;
+  5. création de `ablation/ABLATION_RUN_LOG.txt` (append-only, horodaté UTC
+     + hash HEAD + sortie checker complète) comme trace de traçabilité.
+- **Vérification réelle** : 87 pytest + 13/13 bash verts ; ablation
+  re-jouée → 5/1 → 2/0 cohérent avec le rapport corrigé.
+- **Réversible** : oui (flock levé en finally ; .lock est un fichier
+  auxiliaire sans impact sur lessons.jsonl lui-même).

@@ -3,7 +3,9 @@
 > Preuve par ablation de l'efficacité de la mémoire injectée. Chiffres
 > RÉELS produits par `factory/bin/ablation_checker.py` (bug-detector
 > déterministe, stdlib, scan statique, 8 règles validées par
-> `tests/test_ablation_checker.py` 15/15 OK). Aucun chiffre inventé.
+> `tests/test_ablation_checker.py` 17/17 OK). Aucun chiffre inventé.
+> Trace d'exécution datée et reproductible archivée dans
+> `ablation/ABLATION_RUN_LOG.txt` (append-only).
 
 ## 1. Protocole (figé AVANT exécution — `ablation/PROTOCOL.md`)
 
@@ -73,7 +75,7 @@ rappel de l'injecteur, pas du mécanisme de mémoire lui-même.
 ## 6. Analyse (honnête, tracée)
 
 - **Effet réel mesuré** : l'injection de 3 leçons pertinentes a réduit les
-  défauts P1 de 2 à 0 et les défauts totaux de 6 à 2 sur une tâche
+  défauts P1 de 1 à 0 et les défauts totaux de 5 à 2 sur une tâche
   représentative de la famille lock_manager+fork.
 - **Limite de rappel** : l'injecteur n'a remonté que 3 leçons sur les 8
   applicables, parce que la spec neutre ne mentionnait pas les triggers
@@ -99,7 +101,7 @@ rappel de l'injecteur, pas du mécanisme de mémoire lui-même.
   pas le code. Les défauts d'exécution non visibles dans le source
   (deadlocks subtils, perf, comportement OS-spécifique) ne sont PAS
   mesurés ici. Les 8 règles sont validées sur snippets défectueux ET
-  sains (15/15 tests) mais ne couvrent que les anti-patterns listés.
+  sains (17/17 tests) mais ne couvrent que les anti-patterns listés.
 - **Pas de boucle reviewer** : la métrique « nombre de tours de review
   avant PASS » du master order §4 n'est pas mesurable en exécution
   headless autonome (pas de reviewer disponible dans la boucle d'ablation).
@@ -114,4 +116,21 @@ rappel de l'injecteur, pas du mécanisme de mémoire lui-même.
 - **Reproductibilité** : les chiffres ci-dessus sont reproductibles
   exactement via `python3 factory/bin/ablation_checker.py
   ablation/arm_{a,b}_lock_manager.py --json` (JSON archivés dans
-  `ablation/arm_{a,b}_measurements.json`).
+  `ablation/arm_{a,b}_measurements.json`). Une **trace d'exécution datée
+  et append-only** (`ablation/ABLATION_RUN_LOG.txt`) capture l'horodatage
+  UTC, le hash HEAD du repo et la sortie complète du checker pour chaque
+  exécution — exigence de traçabilité du contre-audit Codex satisfaite.
+
+## 8. Traçabilité de l'exécution (contre-audit Codex P1 #2)
+
+Le contre-audit a exigé une trace horodatée/non modifiable, pas seulement
+la cohérence statique des JSON archivés. Celle-ci vit dans
+`ablation/ABLATION_RUN_LOG.txt` (append-only) :
+
+- en-tête daté (UTC ISO8601), hôte, version Python, hash HEAD du repo ;
+- sortie JSON complète du checker pour chaque bras ;
+- ligne de verdict consolidée (`p1 A->B`, `total A->B`).
+
+Commande pour rejouer et appender un nouveau bloc daté :
+`python3 factory/bin/ablation_checker.py ablation/arm_{a,b}_lock_manager.py --json`
+(exécutée dans le bloc `===== RUN <ts> =====` du fichier de trace).

@@ -16,7 +16,8 @@
 
 ### §2 — Extracteur de leçons : **PROUVÉ PAR EXÉCUTION**
 - `factory/bin/lesson_extractor.py` : parsing déterministe de rapports de review structurés → leçons normalisées. Aucun LLM dans le chemin d'extraction.
-- **CORRIGÉ** post-audit : écriture fresh atomique ; append sérialisé par flock exclusif avec re-vérification des collisions d'ids À L'INTÉRIEUR du verrou (deux `--append` concurrents ne peuvent plus dupliquer/perdre des données) ; lecture d'entrée protégée (OSError/UnicodeDecodeError → rc=1 contrôlé) ; `--source-tag` réellement appliqué (était exposé mais inerte).
+- **CORRIGÉ** post-audit : écriture fresh atomique ET sérialisée (flock partagé avec `--append` + tmp unique par process via `mkstemp` + re-vérification des collisions SOUS verrou) — deux `--out` concurrents ne peuvent plus ni écraser silencieusement le résultat de l'autre (P1 contre-audit Codex) ni corrompre le fichier via la course sur le `.tmp` fixe ; append sérialisé par flock exclusif avec re-vérification des collisions d'ids À L'INTÉRIEUR du verrou (deux `--append` concurrents ne peuvent plus dupliquer/perdre des données) ; chemins destination `--out`/`--append` protégés (LessonError/OSError → rc=1 contrôlé, pas de traceback) ; lecture d'entrée protégée (OSError/UnicodeDecodeError → rc=1 contrôlé) ; `--source-tag` réellement appliqué (était exposé mais inerte).
+- **Test réel ajouté (P1 contre-audit Codex)** : `tests/test_lesson_extractor.py::TestOutConcurrentSerialization` lance deux CLI `--out` en parallèle (vrais sous-processus) sur le même destination avec mêmes ids — prouve qu'exactement un gagne (rc=0) et un refuse proprement (rc=1), fichier sain, aucun résidu `.tmp`.
 - Tests : `tests/test_lesson_extractor.py` — verts.
 
 ### §3 — Injecteur de leçons : **PROUVÉ PAR EXÉCUTION**
@@ -48,7 +49,7 @@
 ## Verdict des audits finaux
 - Audit Claude : PAS PRET (P1 : rapport final absent ; P1-2 : gate audit_ok) → **les deux corrigés dans ce rapport et le driver**.
 - Audit Codex : PAS PRÊT (P1 : rapport final absent ; P1 : règle L-13 fausse la métrique ; P2/P3 divers) → **tous corrigés** (ce document, règle re-sémantisée + re-mesure, écritures atomiques/flock, validation date, gestion d'erreurs CLI, --source-tag, dédoublonnage).
-- Suite de tests complète après corrections : **86 passed**.
+- Suite de tests complète après corrections : **87 passed** (86 pytest + ajout du test de sérialisation concurrente `--out`) + 13/13 checks bash driver.
 
 ## NON VÉRIFIÉ (honnêteté absolue)
 - **Single-agent** : les deux bras d'ablation ont été produits par le même agent GLM dans la même session (il avait extrait les leçons plus tôt dans le run, donc n'était pas parfaitement amnésique pour le bras A). L'effet mesuré est un minorant conservateur ; un builder vraiment frais produirait statistiquement au moins autant de défauts au bras A.

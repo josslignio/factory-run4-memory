@@ -85,6 +85,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -358,16 +359,44 @@ def _read_existing_ids(path: Path) -> Tuple[List[dict], set]:
 
 
 def _write_jsonl_fresh(path: Path, lessons: List[dict]) -> None:
-    # P2 audit Codex : écriture ATOMIQUE (tmp + fsync + os.replace). Un crash
-    # pendant l'écriture ne peut plus tronquer un lessons.jsonl existant.
+    # P1 audit Codex (sérialisation --out) : écriture ATOMIQUE ET SÉRIALISÉE.
+    #   1. flock exclusif sur le MÊME fichier .lock que _append_jsonl, pour
+    #      qu'un --out concurrent d'un --append (ou d'un autre --out) ne puisse
+    #      pas valider l'absence de collision en parallèle puis écrire.
+    #   2. tmp UNIQUE par process (mkstemp) : le `.tmp` fixe d'origine était
+    #      partagé par tous les --out concurrents -> un os.replace pouvait
+    #      écraser silencieusement le résultat d'un autre process (perte).
+    #   3. re-vérification des collisions SOUS verrou : couvre la course
+    #      entre le pré-check hors-verrou de main() et l'écriture effective.
     path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
     lines = [json.dumps(l, ensure_ascii=False, sort_keys=False) for l in lessons]
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        _, existing_ids = _read_existing_ids(path)
+        collisions = existing_ids & {l["id"] for l in lessons}
+        if collisions:
+            raise LessonError(
+                f"collision d'ids détectée sous verrou (--out/append "
+                f"concurrent ?) : {sorted(collisions)}")
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+    finally:
+        os.close(lock_fd)
 
 
 def _append_jsonl(path: Path, new_lessons: List[dict]) -> None:
@@ -467,34 +496,47 @@ def main(argv: List[str] = None) -> int:
 
     if args.out:
         out_path = Path(args.out)
-        _, existing_ids = _read_existing_ids(out_path)
-        new_ids = {l["id"] for l in lessons}
-        collisions = existing_ids & new_ids
-        if collisions:
-            print(
-                f"lesson_extractor: collision d'ids avec le fichier existant "
-                f"{out_path} : {sorted(collisions)} — refuse d'écraser",
-                file=sys.stderr,
-            )
+        try:
+            # Pré-check hors-verrou : rejette tôt avec un message clair. La
+            # re-vérification SOUS verrou dans _write_jsonl_fresh couvre la
+            # course entre deux --out/--append concurrents.
+            _, existing_ids = _read_existing_ids(out_path)
+            new_ids = {l["id"] for l in lessons}
+            collisions = existing_ids & new_ids
+            if collisions:
+                print(
+                    f"lesson_extractor: collision d'ids avec le fichier existant "
+                    f"{out_path} : {sorted(collisions)} — refuse d'écraser",
+                    file=sys.stderr,
+                )
+                return 1
+            _write_jsonl_fresh(out_path, lessons)
+        except (LessonError, OSError) as e:
+            print(f"lesson_extractor: écriture {out_path} impossible — "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
             return 1
-        _write_jsonl_fresh(out_path, lessons)
         print(
             f"lesson_extractor: {len(lessons)} leçons écrites (frais) dans {out_path}",
             file=sys.stderr,
         )
     elif args.append:
         app_path = Path(args.append)
-        _, existing_ids = _read_existing_ids(app_path)
-        new_ids = [l["id"] for l in lessons]
-        dups = [i for i in new_ids if i in existing_ids]
-        if dups:
-            print(
-                f"lesson_extractor: {len(dups)} id(s) déjà présent(s) dans "
-                f"{app_path} : {dups} — RIEN n'a été écrit (atomicité)",
-                file=sys.stderr,
-            )
+        try:
+            _, existing_ids = _read_existing_ids(app_path)
+            new_ids = [l["id"] for l in lessons]
+            dups = [i for i in new_ids if i in existing_ids]
+            if dups:
+                print(
+                    f"lesson_extractor: {len(dups)} id(s) déjà présent(s) dans "
+                    f"{app_path} : {dups} — RIEN n'a été écrit (atomicité)",
+                    file=sys.stderr,
+                )
+                return 1
+            _append_jsonl(app_path, lessons)
+        except (LessonError, OSError) as e:
+            print(f"lesson_extractor: ajout à {app_path} impossible — "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
             return 1
-        _append_jsonl(app_path, lessons)
         print(
             f"lesson_extractor: {len(lessons)} leçons ajoutées à {app_path} "
             f"(total précédent : {len(existing_ids)})",

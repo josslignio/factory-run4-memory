@@ -1,36 +1,29 @@
-Verdict global : **PAS PRÊT À MERGER**.
-
-J’ai audité `factory/bin/*.py`, `memory/`, `tests/` et les artefacts d’ablation. Aucun fichier n’a été modifié.
+PAS PRET
 
 ### P1
 
-- Le livrable final obligatoire est absent : `reports/RUN4_FINAL_REPORT.md` n’existe pas. `reports/RUN4_ABLATION_AB.md` ne le remplace pas : il manque la synthèse des capacités et leurs statuts exigés. Référence : [MASTER_ORDER_RUN4_MEMORY.md:52](/Users/jocelyngrosjean/factory-run4-memory/MASTER_ORDER_RUN4_MEMORY.md:52).
+- `factory/bin/lesson_extractor.py:468-480` — `--out` n’est pas sérialisé. Deux extracteurs concurrents peuvent tous deux valider l’absence de collision, écrire le même fichier temporaire fixe (`.jsonl.tmp`) et faire un `os.replace`; un résultat peut écraser silencieusement l’autre. Perte de données possible.
 
-- La métrique P1 de l’ablation est sémantiquement erronée : la règle L-13 classe tout `LOCK_UN` du fichier comme un défaut “dans l’enfant”, alors que le bras A l’emploie dans `release_lock`, précisément l’opération normale de libération. Le résultat `A: 2 P1` et le delta `2 → 0` ne constituent donc pas une preuve valide de l’effet mémoire. Références : [ablation_checker.py:328](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/ablation_checker.py:328), [arm_a_lock_manager.py:32](/Users/jocelyngrosjean/factory-run4-memory/ablation/arm_a_lock_manager.py:32), [RUN4_ABLATION_AB.md:44](/Users/jocelyngrosjean/factory-run4-memory/reports/RUN4_ABLATION_AB.md:44).
+- `reports/RUN4_ABLATION_AB.md:73-77` — le rapport final se contredit : le tableau corrigé annonce A=5 défauts/1 P1, mais l’analyse affirme encore A=6 défauts/2 P1. Les JSON archivés confirment bien 5/1 et 2/0, mais ne constituent pas une trace d’exécution horodatée/non modifiable. Avec les outils lecture seule, je peux confirmer la cohérence statique des artefacts, pas prouver qu’ils résultent d’une exécution réelle. L’exigence de traçabilité de l’ablation n’est donc pas satisfaite.
 
 ### P2
 
-- Les écritures de mémoire ne sont ni atomiques ni protégées contre deux processus. Un crash pendant `write_text()` peut tronquer `lessons.jsonl`; deux `--append` concurrents peuvent valider les mêmes IDs puis écrire tous deux, ou intercaler/perdre des données. Références : [bootstrap_lessons.py:443](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/bootstrap_lessons.py:443), [lesson_extractor.py:349](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/lesson_extractor.py:349), [lesson_extractor.py:364](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/lesson_extractor.py:364), [lesson_extractor.py:433](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/lesson_extractor.py:433).
+- `factory/bin/lesson_extractor.py:470,480,487,497` — les erreurs de destination ne sont pas capturées : JSONL existant corrompu, répertoire à la place du fichier, permission refusée, disque plein, ou collision détectée sous le verrou provoquent un traceback au lieu d’un `rc=1` contrôlé.
 
-- Plusieurs chemins CLI promis comme contrôlés laissent remonter des exceptions d’E/S ou de décodage : lecture de `--task-file`, lecture de l’entrée de l’extracteur, validation/écriture de la destination. Une permission refusée ou un fichier supprimé entre `is_file()` et `read_text()` produit une traceback. Références : [lesson_injector.py:274](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/lesson_injector.py:274), [lesson_injector.py:285](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/lesson_injector.py:285), [lesson_extractor.py:408](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/lesson_extractor.py:408), [lesson_extractor.py:412](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/lesson_extractor.py:412).
+- `factory/bin/lesson_extractor.py:449-451` — `--source-tag` remplace `source` après validation sans reconstruire `evidence` ni revalider. Un tag blanc produit une leçon invalide; un tag différent rend `source` et le préfixe de preuve contradictoires.
 
-- Le schéma annonce `date: ISO8601`, mais ne valide que “chaîne non vide”. Des données telles que `date: n’importe quoi` passent la validation et entrent dans la mémoire. Références : [lesson_schema.py:45](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/lesson_schema.py:45), [lesson_schema.py:78](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/lesson_schema.py:78), [MASTER_ORDER_RUN4_MEMORY.md:25](/Users/jocelyngrosjean/factory-run4-memory/MASTER_ORDER_RUN4_MEMORY.md:25).
+- `factory/bin/lesson_schema.py:66-68,107-110` — la « validation ISO8601 » n’est qu’une regex : elle accepte des dates/heures inexistantes (`2026-99-99`, `2026-02-31T29:99`). Cela contredit la validation stricte annoncée.
+
+- `factory/bin/ablation_checker.py:122-126,286-291,343-346` — plusieurs règles P1 concluent à tort qu’un défaut est absent sur simple présence de token. Un `flock` uniquement dans `release_lock`, un `register_at_fork(after_in_child=noop)`, ou un hook enfant ne faisant ni `close` ni `clear`, sont tous crédités comme sûrs. Les tests ne couvrent pas ces faux négatifs (`tests/test_ablation_checker.py:198-256`). La métrique est correcte pour les deux sources actuelles après lecture, mais le détecteur ne justifie pas l’affirmation générale de « défauts objectivement éliminés ».
+
+- `reports/RUN4_ABLATION_AB.md:6,101-102` — annonce « 15/15 OK », alors que `tests/test_ablation_checker.py` contient 17 tests. La documentation d’audit est stale.
 
 ### P3
 
-- `--source-tag` est exposé par l’extracteur mais n’est jamais appliqué ; l’option est trompeuse. Référence : [lesson_extractor.py:402](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/lesson_extractor.py:402).
+- `factory/bin/bootstrap_lessons.py:445-452,479-480` — fichier temporaire fixe et absence de verrou : deux bootstrap concurrents peuvent se gêner; une erreur d’E/S laisse aussi un traceback et potentiellement un `.tmp`.
 
-- `rule_L10` est définie deux fois : la première implémentation est du code mort, ce qui augmente le risque de divergence lors d’une maintenance. Références : [ablation_checker.py:249](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/ablation_checker.py:249), [ablation_checker.py:280](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/ablation_checker.py:280).
+- `factory/bin/ablation_checker.py:385-387` — lecture UTF-8 non protégée; `UnicodeDecodeError`/erreur d’E/S contredit le contrat « rc=0 toujours ».
 
-### Ablation A/B
+- `factory/bin/lesson_schema.py:127-136` — une erreur de validation de schéma ne reçoit pas le numéro de ligne JSONL, ce qui complique la correction d’une mémoire volumineuse.
 
-Le chiffre est bien reproductible comme sortie actuelle du checker : je l’ai ré-exécuté et les sorties correspondent octet pour octet aux archives :
-
-- A : `total_defects=6`, `p1_defects=2`
-- B : `total_defects=2`, `p1_defects=0`
-
-Les archives correspondantes sont [arm_a_measurements.json](/Users/jocelyngrosjean/factory-run4-memory/ablation/arm_a_measurements.json) et [arm_b_measurements.json](/Users/jocelyngrosjean/factory-run4-memory/ablation/arm_b_measurements.json). La mémoire contient également 18 leçons JSONL valides et IDs uniques.
-
-Cela prouve que le chiffre n’est pas inventé au sens “sortie actuelle du programme”, mais pas que la conclusion A/B est valide : la règle P1 L-13 gonfle artificiellement le bras A. De plus, le rapport final attendu est absent.
-
-Je n’ai pas pu relancer `pytest` dans ce sandbox strictement lecture seule : pytest ne peut pas créer de répertoire temporaire. Cette limitation ne change pas les constats statiques ci-dessus.
+Les nombres actuellement archivés sont cohérents entre eux : A=5 / 1 P1 et B=2 / 0 P1. Ils doivent toutefois être ré-exécutés, avec sortie datée conservée, et le rapport contradictoire doit être corrigé avant merge.

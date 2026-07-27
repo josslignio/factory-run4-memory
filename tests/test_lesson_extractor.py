@@ -233,6 +233,55 @@ class TestAppendIntegration(unittest.TestCase):
         self.assertEqual(rc2, 1)
 
 
+class TestOutConcurrentSerialization(unittest.TestCase):
+    """P1 audit Codex : deux --out concurrents sur le même destination ne
+    doivent ni corrompre le fichier ni se perdre silencieusement. Le flock
+    partagé avec --append + la re-vérification SOUS verrou garantissent
+    qu'un seul process gagne (rc=0) et que l'autre refuse proprement (rc=1)
+    — jamais de traceback, jamais de fichier corrompu.
+
+    Preuve RÉELLE par sous-processus parallèles (Popen simultanés), pas par
+    mock : on lance deux CLI indépendantes en parallèle sur le même --out."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="run4_ext_conc_")
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_two_concurrent_out_same_ids_one_wins_one_refuses(self):
+        import subprocess
+        base = Path(self.tmp) / "lessons.jsonl"
+        # Même ts -> mêmes ids pour les deux process : collision garantie.
+        # On lance les deux EN PARALLÈLE (Popen simultanés) pour exercer la
+        # course qui, avant le fix, voyait les deux valider l'absence de
+        # fichier et écrire le même `.tmp` fixe (écrasement silencieux).
+        cli = str(REPO / "factory" / "bin" / "lesson_extractor.py")
+        cmd = [sys.executable, cli, str(FIXTURE),
+               "--out", str(base), "--extraction-ts", FIX_TS]
+        p1 = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL)
+        p2 = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL)
+        rc1 = p1.wait(timeout=30)
+        rc2 = p2.wait(timeout=30)
+        # Exactement un des deux doit gagner (rc=0), l'autre doit refuser
+        # proprement (rc=1). Jamais rc=2 (traceback) ni double-écriture.
+        codes = sorted([rc1, rc2])
+        self.assertEqual(codes, [0, 1],
+                         f"attendu [0,1] (un gagnant + un refus propre), "
+                         f"eu rc1={rc1} rc2={rc2}")
+        # Le fichier destination doit être sain (3 leçons valides) — pas
+        # corrompu par la course sur le `.tmp`.
+        rows = load_jsonl(base)
+        self.assertEqual(len(rows), 3)
+        # Aucun résidu `.tmp` (mkstemp unique + nettoyage finally).
+        leftovers = list(Path(self.tmp).glob("*.tmp"))
+        self.assertEqual(leftovers, [], f".tmp résiduels : {leftovers}")
+
+
 class TestCliStdout(unittest.TestCase):
     def test_main_stdout_emits_jsonl(self):
         # Capture stdout, stderr séparés. main() n'appelle pas sys.exit

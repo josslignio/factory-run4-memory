@@ -1,0 +1,59 @@
+Rapport de review — fixture Run 4 §2 (lesson_extractor)
+=======================================================
+
+Ce fichier est un exemple RÉEL de rapport finding-block tel qu'un reviewer
+(Claude ou Codex) peut en produire après audit d'un module. Il mélange :
+  - un en-tête libre (ces lignes) ignoré par l'extracteur ;
+  - trois blocs [FINDING]...[/FINDING] avec severities P1/P2/P3 ;
+  - un bloc avec continuation multi-ligne (description + fix indentés) ;
+  - un bloc sans champ `test:` (evidence sans suffixe test) ;
+  - un bloc avec `trigger_keywords` séparés par des virgules.
+
+L'extracteur doit produire exactement 3 leçons valides.
+
+[FINDING]
+severity: P1
+category: concurrency
+file: fork_pool.py
+line: 47
+description: Le pool lance un os.fork() par tâche sans masquer SIGINT dans
+  l'enfant : un Ctrl-C pendant une tâche propagate le signal à tout le
+  pool, laissant les workers enfants orphelins et le fichier de journal
+  dans un état mi-écrit.
+fix: Dans l'enfant juste après fork, appeler signal.signal(SIGINT, SIG_IGN)
+  avant tout autre code. Le parent conserve son handler et collecte
+  proprement les enfants via wait().
+trigger_keywords: os.fork; SIGINT; signal handler; worker pool; Ctrl-C
+source: fixture-run4
+test: test_fork_pool.test_sigint_child_ignored
+date: 2026-07-27
+[/FINDING]
+
+[FINDING]
+severity: P2
+category: resource-leak
+file: temp_store.py
+line: 118
+description: tempfile.NamedTemporaryFile créé sans delete=False, le fd est
+  refermé immédiatement mais le chemin est quand même réutilisé plus loin
+  par open(path) — sur Linux cela peut lever FileNotFoundError sous charge.
+fix: Passer delete=False puis fermer/supprimer explicitement dans un bloc
+  finally ; ne jamais réouvrir par chemin un temporaire déjà auto-supprimé.
+trigger_keywords: tempfile, NamedTemporaryFile, fd leak, finally
+source: fixture-run4
+test: test_temp_store.test_concurrent_reopen
+[/FINDING]
+
+[FINDING]
+severity: P3
+category: doc-sync
+file: README.md
+line: 12
+description: Le README documente une CLI --workers=N absente du code
+  actuel (supprimée au commit précédent) — un nouvel utilisateur échoue
+  silencieusement avec argparse.
+fix: Synchroniser la doc à chaque changement d'interface CLI via un test
+  qui parse README.md et asserte que chaque flag listé existe dans argparse.
+trigger_keywords: README stale, doc CLI, argparse, flag inexistant
+source: fixture-run4
+[/FINDING]

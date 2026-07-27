@@ -59,6 +59,14 @@ REQUIRED_FIELDS: Tuple[Tuple[str, type, bool], ...] = (
 # L- pour distinguer d'un seq brut ou d'un hash.
 ID_RE = re.compile(r"^L-[0-9TZa-z._:+-]+-[0-9A-Za-z]+$")
 
+# Date ISO8601 (P2 audit Codex) : le schéma annonce ISO8601, on le valide
+# réellement au lieu d'accepter n'importe quelle chaîne non vide.
+# Formats admis : date seule (2026-07-27) ou datetime avec heure et fuseau
+# optionnels (2026-07-27T14:30:00Z, 2026-07-27T14:30:00+02:00).
+DATE_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}"
+    r"(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$")
+
 # Repère fichier:ligne : <chemin>:<ligne> quelque part dans evidence.
 # Le chemin peut contenir un @ (ex: repo@branche:fichier:ligne, convention D-006).
 FILE_LINE_RE = re.compile(r"[\w/.@\-+]+:\d+")
@@ -96,6 +104,10 @@ def validate_lesson(obj) -> None:
         raise LessonError(
             f"severity invalide : {obj['severity']!r} (attendu parmi {ALLOWED_SEVERITIES})"
         )
+    if not DATE_RE.match(obj["date"]):
+        raise LessonError(
+            f"date doit être ISO8601 (YYYY-MM-DD[THH:MM[:SS][TZ]]), "
+            f"eu {obj['date']!r}")
     if not ID_RE.match(obj["id"]):
         raise LessonError(f"id mal formé : {obj['id']!r} (attendu L-<timestamp>-<seq>)")
     if not FILE_LINE_RE.search(obj["evidence"]):

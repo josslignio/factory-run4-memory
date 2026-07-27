@@ -64,6 +64,43 @@ def release_lock(lockfile):
 '''
 
 
+BAD_FORK_HOOK = """
+import os, fcntl
+from pathlib import Path
+
+_LOCK_FDS = {}
+
+def acquire_lock(lockfile):
+    key = str(Path(lockfile).resolve())
+    if key in _LOCK_FDS:
+        return True
+    fd = os.open(lockfile, os.O_CREAT | os.O_WRONLY)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return False
+    except BaseException:
+        os.close(fd)
+        raise
+    _LOCK_FDS[key] = fd
+    return True
+
+def release_lock(lockfile):
+    key = str(Path(lockfile).resolve())
+    fd = _LOCK_FDS.pop(key, None)
+    if fd is not None:
+        os.close(fd)
+
+def _bad_child_hook():
+    for fd in _LOCK_FDS.values():
+        fcntl.flock(fd, fcntl.LOCK_UN)  # L-13: DEFECT reel — deverrouille le parent
+    _LOCK_FDS.clear()
+os.register_at_fork(after_in_child=_bad_child_hook)
+"""
+
+
 # ---- snippets sains (applique les fix_patterns → défauts absents) ------
 
 GOOD_LOCK = '''
@@ -137,10 +174,13 @@ class TestRulesOnBadSnippet(unittest.TestCase):
         self.assertEqual(f.status, "present",
                          f"L-12 devrait être DEFECT: {f}")
 
-    def test_L13_lock_un_used(self):
+    def test_L13_lock_un_in_release_is_legitimate(self):
+        # CORRIGÉ (contre-audit Codex) : LOCK_UN dans release_lock est
+        # l'usage LÉGITIME de libération. Sans hook post-fork, le défaut de
+        # fork-safety est porté par L-12 — L-13 ne doit PAS double-compter.
         f = _find(self.findings, "-13")
-        self.assertEqual(f.status, "present",
-                         f"L-13 devrait être DEFECT: {f}")
+        self.assertEqual(f.status, "absent",
+                         f"L-13 ne doit pas marquer un LOCK_UN de release: {f}")
 
     def test_L16_blockingioerror_only(self):
         f = _find(self.findings, "-16")
@@ -196,12 +236,33 @@ class TestRulesOnGoodSnippet(unittest.TestCase):
                          f"L-16 devrait être ok (filet large): {f}")
 
 
+class TestRuleL13OnBadForkHook(unittest.TestCase):
+    """Le VRAI défaut L-13 : LOCK_UN à l'intérieur du hook enfant post-fork.
+    La règle corrigée doit toujours l'attraper (test discriminant : ce
+    snippet est propre partout ailleurs)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.findings = run_checker(BAD_FORK_HOOK)
+
+    def test_L13_lock_un_in_child_hook_is_defect(self):
+        f = _find(self.findings, "-13")
+        self.assertEqual(f.status, "present",
+                         f"L-13 doit marquer LOCK_UN dans le hook enfant: {f}")
+
+    def test_L12_register_present_so_ok(self):
+        f = _find(self.findings, "-12")
+        self.assertEqual(f.status, "absent",
+                         f"L-12 ok (register_at_fork présent): {f}")
+
+
 class TestSummary(unittest.TestCase):
     def test_bad_has_more_defects_than_good(self):
         bad = chk.summarize(run_checker(BAD_LOCK))
         good = chk.summarize(run_checker(GOOD_LOCK))
         self.assertGreater(bad["total_defects"], good["total_defects"])
-        self.assertGreaterEqual(bad["p1_defects"], 2)  # L-12 + L-13 au moins
+        self.assertGreaterEqual(bad["p1_defects"], 1)  # L-12 (L-13 ne
+        # double-compte plus le LOCK_UN de release — contre-audit Codex)
         self.assertEqual(good["p1_defects"], 0,
                          "le snippet sain ne doit avoir AUCUN défaut P1")
 

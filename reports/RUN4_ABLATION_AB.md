@@ -32,18 +32,26 @@ leurs fix_patterns en cascade.
 
 ## 4. RÉSULTAT BRUT (chiffres réels)
 
+> **CHIFFRES CORRIGÉS après contre-audit Codex** : la règle L-13 du
+> checker marquait initialement TOUT `LOCK_UN` du fichier comme défaut P1,
+> y compris l'usage légitime de libération dans `release_lock` du bras A —
+> gonflant artificiellement son comptage (6 défauts dont 2 P1). La règle a
+> été corrigée (L-13 ne marque plus que le `LOCK_UN` situé DANS un hook
+> post-fork enfant, sa sémantique réelle) et les deux bras re-mesurés.
+> Les chiffres ci-dessous sont les chiffres honnêtes post-correction.
+
 | Métrique                                | Bras A (sans mémoire) | Bras B (avec mémoire) | Delta |
 |-----------------------------------------|----------------------:|----------------------:|------:|
-| `total_defects` (anti-patterns présents)| **6**                 | **2**                 | −4    |
-| `p1_defects` (défauts critiques P1)     | **2**                 | **0**                 | −2    |
+| `total_defects` (anti-patterns présents)| **5**                 | **2**                 | −3    |
+| `p1_defects` (défauts critiques P1)     | **1**                 | **0**                 | −1    |
 | `distinct_categories_with_defect`       | **2** (concurrency, resource-leak) | **1** (resource-leak) | −1 |
-| `covered_lessons_avoided` (sur 8)       | 2/8                   | **6/8**               | +4    |
 
 Détail des défauts par bras (sortie checker non éditée) :
 
-- **Bras A — 6 défauts** : L-05 (unlink lockfile), L-09 (acquire non
+- **Bras A — 5 défauts** : L-05 (unlink lockfile), L-09 (acquire non
   idempotent), L-10 (clé dict brute), L-12 (**P1** pas de register_at_fork),
-  L-13 (**P1** LOCK_UN en release), L-16 (except BlockingIOError seul).
+  L-16 (except BlockingIOError seul). Le L-13 initialement compté était un
+  faux positif de la règle (LOCK_UN de release légitime), retiré.
 - **Bras B — 2 défauts** : L-09 (acquire non idempotent), L-16 (except
   BlockingIOError seul). **0 défaut P1.**
 
@@ -52,12 +60,12 @@ Détail des défauts par bras (sortie checker non éditée) :
 > Bras B déclaré meilleur si `p1_defects(B) < p1_defects(A)` ET
 > `total_defects(B) < total_defects(A)`.
 
-**VERDICT : BRAS B MEILLEUR.**
-- `p1_defects` : 2 → 0 (−2, les 2 défauts critiques éliminés).
-- `total_defects` : 6 → 2 (−4, −66%).
+**VERDICT : BRAS B MEILLEUR** (avec les chiffres honnêtes post-correction).
+- `p1_defects` : 1 → 0 (−1, le défaut critique fork éliminé).
+- `total_defects` : 5 → 2 (−3, −60%).
 
-La mémoire injectée a permis d'éviter les 2 défauts P1 (L-12 fork, L-13
-LOCK_UN) et 4 défauts au total. Les 2 défauts résiduels de Bras B (L-09,
+La mémoire injectée a permis d'éviter le défaut P1 (L-12 fork) et 3
+défauts au total. Les 2 défauts résiduels de Bras B (L-09,
 L-16) correspondent à des leçons qui **n'ont pas été injectées** (la spec
 neutre ne contenait pas leurs mots-clés trigger) — défaut honnête de
 rappel de l'injecteur, pas du mécanisme de mémoire lui-même.

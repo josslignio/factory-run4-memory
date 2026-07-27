@@ -282,7 +282,14 @@ def main(argv: List[str] = None) -> int:
             print(f"lesson_injector: --task-file n'est pas un fichier "
                   f"(répertoire ?) : {task_path}", file=sys.stderr)
             return 1
-        task = task_path.read_text(encoding="utf-8")
+        try:
+            task = task_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            # P2 audit Codex : permission refusée ou fichier supprimé entre
+            # is_file() et read_text() → rc=1 contrôlé, pas une traceback.
+            print(f"lesson_injector: lecture de {task_path} impossible — "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+            return 1
     elif args.task is not None:
         task = args.task
     else:

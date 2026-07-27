@@ -80,7 +80,9 @@ Stdlib uniquement. Aucune dépendance externe (règle 1).
 """
 import argparse
 import datetime as _dt
+import fcntl
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -356,16 +358,41 @@ def _read_existing_ids(path: Path) -> Tuple[List[dict], set]:
 
 
 def _write_jsonl_fresh(path: Path, lessons: List[dict]) -> None:
+    # P2 audit Codex : écriture ATOMIQUE (tmp + fsync + os.replace). Un crash
+    # pendant l'écriture ne peut plus tronquer un lessons.jsonl existant.
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [json.dumps(l, ensure_ascii=False, sort_keys=False) for l in lessons]
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 def _append_jsonl(path: Path, new_lessons: List[dict]) -> None:
+    # P2 audit Codex : l'append est sérialisé par un flock EXCLUSIF sur un
+    # fichier de verrou dédié, et les collisions d'ids sont re-vérifiées
+    # À L'INTÉRIEUR du verrou — deux --append concurrents ne peuvent plus
+    # valider les mêmes ids puis écrire tous les deux (perte/duplication).
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        for l in new_lessons:
-            f.write(json.dumps(l, ensure_ascii=False, sort_keys=False) + "\n")
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        _, existing_ids = _read_existing_ids(path)
+        collisions = existing_ids & {l["id"] for l in new_lessons}
+        if collisions:
+            raise LessonError(
+                f"collision d'ids détectée sous verrou (append concurrent ?) "
+                f": {sorted(collisions)}")
+        with open(path, "a", encoding="utf-8") as f:
+            for l in new_lessons:
+                f.write(json.dumps(l, ensure_ascii=False, sort_keys=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+    finally:
+        os.close(lock_fd)
 
 
 # --------------------------------------------------------------- main
@@ -400,7 +427,7 @@ def main(argv: List[str] = None) -> int:
     )
     p.add_argument(
         "--source-tag",
-        help="(réservé) forcer la balise source pour tous les blocs ; "
+        help="forcer la balise source pour tous les blocs extraits ; "
         "par défaut on prend la clé `source:` de chaque bloc",
     )
     args = p.parse_args(argv)
@@ -409,10 +436,19 @@ def main(argv: List[str] = None) -> int:
     if args.input == "-":
         text = sys.stdin.read()
     else:
-        text = Path(args.input).read_text(encoding="utf-8")
+        try:
+            text = Path(args.input).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            print(f"lesson_extractor: lecture de {args.input} impossible — "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+            return 1
 
     try:
         lessons = extract_lessons(text, extraction_ts=args.extraction_ts)
+        # P3 audit Codex : --source-tag était exposé mais jamais appliqué.
+        if args.source_tag:
+            for l in lessons:
+                l["source"] = args.source_tag
     except (ExtractionError, LessonError) as e:
         print(f"lesson_extractor: ECHEC — {e}", file=sys.stderr)
         return 1

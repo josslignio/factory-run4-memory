@@ -257,37 +257,6 @@ def rule_L10(code: str, orig: str, path: str) -> Finding:
         return Finding("L-20260727T150500Z-10", "concurrency", "P2",
                        "absent", f"{path}: (pas de acquire_lock)",
                        "acquire_lock absent — non applicable")
-    has_canon = bool(re.search(r"\.resolve\s*\(", code) or
-                     re.search(r"os\.path\.realpath\s*\(", code))
-    raw_key = bool(re.search(r"\[[\s]*" + re.escape(param) + r"[\s]*\]",
-                             code))
-    if not raw_key:
-        return Finding("L-20260727T150500Z-10", "concurrency", "P2",
-                       "absent", f"{path}: ({param} pas utilisé comme clé dict brute)",
-                       "paramètre chemin pas clé de dict — non applicable")
-    if has_canon:
-        ln = _line_of(r"(\.resolve\s*\(|os\.path\.realpath\s*\()", code)
-        return Finding("L-20260727T150500Z-10", "concurrency", "P2",
-                       "absent", f"{path}:{ln} {_line_content(orig, ln)}",
-                       f"clé canonicalisée (resolve/realpath) avant indexation")
-    ln = _line_of(r"\[[\s]*" + re.escape(param) + r"[\s]*\]", code)
-    return Finding("L-20260727T150500Z-10", "concurrency", "P2", "present",
-                   f"{path}:{ln} {_line_content(orig, ln)}",
-                   f"clé dict = paramètre brut '{param}' (pas de resolve) → "
-                   f"mismatch relatif/absolu")
-
-
-def rule_L10(code: str, orig: str, path: str) -> Finding:
-    """L-10 (P2, concurrency) : clé dict non canonicalisée.
-    Defect present si le paramètre chemin de acquire_lock est utilisé
-    DIRECTEMENT comme clé de dict (sans Path.resolve()/realpath au préalable).
-    Détection STRUCTURELLE (indépendante du nom du dict) pour équité de
-    mesure."""
-    param = _acquire_param(code)
-    if not param:
-        return Finding("L-20260727T150500Z-10", "concurrency", "P2",
-                       "absent", f"{path}: (pas de acquire_lock)",
-                       "acquire_lock absent — non applicable")
     # Canonicalisation présente ?
     has_canon = bool(re.search(r"\.resolve\s*\(", code) or
                      re.search(r"os\.path\.realpath\s*\(", code))
@@ -326,17 +295,55 @@ def rule_L12(code: str, orig: str, path: str) -> Finding:
 
 
 def rule_L13(code: str, orig: str, path: str) -> Finding:
-    """L-13 (P1, concurrency) : flock(LOCK_UN) dans enfant au lieu de os.close.
-    Defect present si LOCK_UN est référencé en code (un hook enfant doit
-    utiliser os.close, pas LOCK_UN qui déverrouille le parent)."""
-    ln = _line_of(r"\bLOCK_UN\b", code)
-    if ln:
+    """L-13 (P1, concurrency) : LOCK_UN dans le hook post-fork ENFANT.
+
+    CORRIGE (contre-audit Codex, review finale Run 4) : l'ancienne version
+    marquait TOUT LOCK_UN du fichier comme defaut P1 — y compris l'usage
+    LEGITIME de liberation dans release_lock — ce qui gonflait
+    artificiellement le comptage du bras A de l'ablation. La semantique
+    reelle de la lecon L-13 est : *dans le hook enfant post-fork*, utiliser
+    os.close (qui ne libere que la reference de CE processus), jamais
+    LOCK_UN (qui deverrouille la file description PARTAGEE avec le parent).
+
+    Le defaut n'est donc 'present' que si un hook after_in_child
+    identifiable contient LOCK_UN. Sans hook post-fork du tout, c'est L-12
+    qui porte le defaut de fork-safety — pas de double comptage."""
+    m = re.search(r"os\.register_at_fork\s*\(([^)]*)\)", code)
+    if not m:
         return Finding("L-20260727T150500Z-13", "concurrency", "P1",
-                       "present", f"{path}:{ln} {_line_content(orig, ln)}",
-                       "LOCK_UN présent → déverrouille la file description partagée parent/enfant")
+                       "absent",
+                       f"{path}: (pas de hook post-fork — l'absence de "
+                       f"fork-safety est portee par L-12 ; un LOCK_UN hors "
+                       f"hook enfant est l'usage legitime de release)",
+                       "aucun hook after_in_child ; LOCK_UN hors contexte "
+                       "enfant = liberation normale, pas un defaut")
+    hm = re.search(r"after_in_child\s*=\s*([A-Za-z_]\w*)", m.group(1))
+    if not hm:
+        return Finding("L-20260727T150500Z-13", "concurrency", "P1",
+                       "absent",
+                       f"{path}: (register_at_fork sans after_in_child "
+                       f"nomme identifiable)",
+                       "hook enfant non identifiable — non applicable")
+    hook_name = hm.group(1)
+    hook_body = _func_body(code, hook_name)
+    if not hook_body:
+        return Finding("L-20260727T150500Z-13", "concurrency", "P1",
+                       "absent",
+                       f"{path}: (corps du hook {hook_name} introuvable)",
+                       "corps du hook enfant introuvable — non applicable")
+    ln_rel = _line_of(r"\bLOCK_UN\b", hook_body)
+    if ln_rel:
+        body_start_ln = code[: code.find(f"def {hook_name}")].count("\n")
+        abs_ln = ln_rel + body_start_ln
+        return Finding("L-20260727T150500Z-13", "concurrency", "P1",
+                       "present",
+                       f"{path}:{abs_ln} {_line_content(orig, abs_ln)}",
+                       f"LOCK_UN dans le hook enfant {hook_name} -> "
+                       f"deverrouille la file description partagee du parent")
     return Finding("L-20260727T150500Z-13", "concurrency", "P1", "absent",
-                   f"{path}: (aucun LOCK_UN — enfant utiliserait os.close)",
-                   "aucun LOCK_UN en code")
+                   f"{path}: (hook {hook_name} sans LOCK_UN — utilise "
+                   f"os.close)",
+                   f"hook enfant {hook_name} propre (pas de LOCK_UN)")
 
 
 def rule_L16(code: str, orig: str, path: str) -> Finding:

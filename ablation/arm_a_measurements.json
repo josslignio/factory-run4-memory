@@ -1,5 +1,5 @@
 {
-  "label": "A",
+  "label": "",
   "source": "ablation/arm_a_lock_manager.py",
   "findings": [
     {
@@ -54,9 +54,9 @@
       "lesson_id": "L-20260727T150500Z-13",
       "category": "concurrency",
       "severity": "P1",
-      "status": "present",
-      "evidence": "ablation/arm_a_lock_manager.py:32 fcntl.flock(fd, fcntl.LOCK_UN)",
-      "rule": "LOCK_UN présent → déverrouille la file description partagée parent/enfant"
+      "status": "absent",
+      "evidence": "ablation/arm_a_lock_manager.py: (pas de hook post-fork — l'absence de fork-safety est portee par L-12 ; un LOCK_UN hors hook enfant est l'usage legitime de release)",
+      "rule": "aucun hook after_in_child ; LOCK_UN hors contexte enfant = liberation normale, pas un defaut"
     },
     {
       "lesson_id": "L-20260727T150500Z-16",
@@ -68,18 +68,17 @@
     }
   ],
   "stats": {
-    "total_defects": 6,
+    "total_defects": 5,
     "distinct_categories_with_defect": 2,
     "categories_with_defect": [
       "concurrency",
       "resource-leak"
     ],
-    "p1_defects": 2,
+    "p1_defects": 1,
     "p1_defect_ids": [
-      "L-20260727T150500Z-12",
-      "L-20260727T150500Z-13"
+      "L-20260727T150500Z-12"
     ],
-    "covered_lessons_avoided": 2,
+    "covered_lessons_avoided": 3,
     "total_applicable_lessons": 8
   }
 }

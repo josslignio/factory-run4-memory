@@ -1,5 +1,5 @@
 {
-  "label": "B",
+  "label": "",
   "source": "ablation/arm_b_lock_manager.py",
   "findings": [
     {
@@ -55,8 +55,8 @@
       "category": "concurrency",
       "severity": "P1",
       "status": "absent",
-      "evidence": "ablation/arm_b_lock_manager.py: (aucun LOCK_UN — enfant utiliserait os.close)",
-      "rule": "aucun LOCK_UN en code"
+      "evidence": "ablation/arm_b_lock_manager.py: (hook _after_fork_in_child sans LOCK_UN — utilise os.close)",
+      "rule": "hook enfant _after_fork_in_child propre (pas de LOCK_UN)"
     },
     {
       "lesson_id": "L-20260727T150500Z-16",

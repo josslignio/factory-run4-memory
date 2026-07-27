@@ -87,11 +87,21 @@ apply_backoff() {
   sleep "$(backoff_secs "$1")"
 }
 
-# --- D-004 : verdict d'audit. OK = fichier non vide ET contenant "PRET A MERGER". ---
+# --- D-004 + fix audit final Claude (P1-2) : verdict d'audit STRICT. ---
+# OK = fichier non vide ET verdict positif sur la PREMIERE ligne ET absence
+# de "PAS PRET" sur cette ligne. L'ancienne version cherchait la locution
+# n'importe ou dans le fichier : un audit negatif citant la locution cible
+# (ex. "verdict attendu : PRET A MERGER") passait a tort.
 audit_ok() {
   [ -s "$1" ] || return 1
-  grep -qi "PRET A MERGER" "$1" || return 1
-  return 0
+  local first
+  first=$(head -n 1 "$1")
+  case "$first" in
+    *"PAS PRET"*|*"PAS PRÊT"*) return 1 ;;
+  esac
+  printf '%s' "$first" | grep -qi "PRET A MERGER" >/dev/null 2>&1 && return 0
+  printf '%s' "$first" | grep -qi "PRÊT À MERGER" >/dev/null 2>&1 && return 0
+  return 1
 }
 
 main() {

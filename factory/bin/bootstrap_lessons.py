@@ -440,9 +440,16 @@ def write_jsonl(lessons, out_path: Path) -> None:
 
     Idempotent : même entrée → mêmes octets. Pas de newline final superflu.
     """
+    # P2 audit Codex : écriture ATOMIQUE (tmp + fsync + os.replace). Un
+    # crash pendant write_text ne peut plus tronquer un fichier existant.
     out_path.parent.mkdir(parents=True, exist_ok=True)
     lines = [json.dumps(l, ensure_ascii=False, sort_keys=False) for l in lessons]
-    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, out_path)
 
 
 def main() -> int:

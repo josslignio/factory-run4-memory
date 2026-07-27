@@ -38,6 +38,7 @@
 
 - **Verdict au critère figé du protocole §5** (`p1(B) < p1(A)` ET `total(B) < total(A)`) : **BRAS B MEILLEUR**. La mémoire injectée élimine le défaut critique (fork-safety) et 3 défauts au total.
 - Détecteur : 8 règles statiques validées par `tests/test_ablation_checker.py` (snippets défectueux ET sains, y compris le nouveau test discriminant du vrai défaut L-13 en hook enfant).
+- **Durcissement round-2 (post double-audit Claude+Codex)** : `rule_L12` n'accepte plus un `os.register_at_fork()` seul (exige un hook `after_in_child` qui `os.close` les fds ET `.clear()` le dict — un hook no-op n'est plus crédité, faux négatif central pour la métrique A/B) ; `rule_L01` exige que `flock` protège `acquire_lock` ; offsets de ligne d'evidence L-09/L-13/L-16 corrigés d'un décalage +1 (rule 4 traceabilité). **Chiffres A/B inchangés** (A=5/1P1, B=2/0P1), re-mesurés et archivés (nouveau bloc daté dans `ablation/ABLATION_RUN_LOG.txt`, HEAD `db8fcc7`).
 
 ## Nombre de leçons en base : **18** (`memory/lessons.jsonl`)
 
@@ -47,9 +48,10 @@
 - Code mort retiré : doublon de `rule_L10` dans le checker (P3 audit Codex).
 
 ## Verdict des audits finaux
-- Audit Claude : PAS PRET (P1 : rapport final absent ; P1-2 : gate audit_ok) → **les deux corrigés dans ce rapport et le driver**.
-- Audit Codex : PAS PRÊT (P1 : rapport final absent ; P1 : règle L-13 fausse la métrique ; P2/P3 divers) → **tous corrigés** (ce document, règle re-sémantisée + re-mesure, écritures atomiques/flock, validation date, gestion d'erreurs CLI, --source-tag, dédoublonnage).
-- Suite de tests complète après corrections : **87 passed** (86 pytest + ajout du test de sérialisation concurrente `--out`) + 13/13 checks bash driver.
+- Audit Claude round-1 : PAS PRET (P1 : rapport final absent ; P1-2 : gate audit_ok) → **les deux corrigés dans ce rapport et le driver**.
+- Audit Codex round-1 : PAS PRÊT (P1 : rapport final absent ; P1 : règle L-13 fausse la métrique ; P2/P3 divers) → **tous corrigés** (ce document, règle re-sémantisée + re-mesure, écritures atomiques/flock, validation date, gestion d'erreurs CLI, --source-tag, dédoublonnage).
+- **Double-audit round-2 (Claude + Codex)** : ont confirmé l'ablation A/B **réelle et reproductible** (chiffres retracés à la main), mais relevé un **nouveau P1 code** : le détecteur `rule_L12` crédité à tort la fork-safety sur simple présence de `register_at_fork` (un hook no-op donnait P1=0). → **Corrigé dans cette tranche** (durcissement `rule_L12`/`rule_L01` + off-by-one, cf. §4 ci-dessus, +5 tests de régression). Chiffres A/B stables. **En attente de la re-review round-3 par Claude/Codex** avant merge (`CAMPAIGN_STATE=READY_FOR_FINAL_AUDIT`).
+- Suite de tests complète après corrections : **92 pytest passed + 13/13 checks bash driver** (+5 tests de régression du durcissement round-2 du détecteur, vs 87 pytest round-1).
 
 ## NON VÉRIFIÉ (honnêteté absolue)
 - **Single-agent** : les deux bras d'ablation ont été produits par le même agent GLM dans la même session (il avait extrait les leçons plus tôt dans le run, donc n'était pas parfaitement amnésique pour le bras A). L'effet mesuré est un minorant conservateur ; un builder vraiment frais produirait statistiquement au moins autant de défauts au bras A.

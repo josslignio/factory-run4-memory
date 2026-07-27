@@ -7,8 +7,8 @@
       "category": "concurrency",
       "severity": "P1",
       "status": "absent",
-      "evidence": "ablation/arm_a_lock_manager.py: (flock présent — acquisition atomique kernel)",
-      "rule": "présence de fcntl.flock()"
+      "evidence": "ablation/arm_a_lock_manager.py:19 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)",
+      "rule": "flock protège acquire_lock (acquisition atomique kernel)"
     },
     {
       "lesson_id": "L-20260727T150500Z-05",
@@ -63,7 +63,7 @@
       "category": "resource-leak",
       "severity": "P2",
       "status": "present",
-      "evidence": "ablation/arm_a_lock_manager.py:19 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)",
+      "evidence": "ablation/arm_a_lock_manager.py:20 except BlockingIOError:",
       "rule": "acquire_lock : except BlockingIOError seul → fuite fd sur autre OSError"
     }
   ],

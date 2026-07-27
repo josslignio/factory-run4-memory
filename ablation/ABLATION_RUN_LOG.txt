@@ -182,3 +182,181 @@
 BRAS A (sans mémoire): total_defects=5 p1_defects=1 categories=2
 BRAS B (avec mémoire): total_defects=2 p1_defects=0 categories=1
 VERDICT: bras B meilleur (p1 1->0, total 5->2)
+
+===== RUN 2026-07-27T17:37:47Z =====
+# Re-execution APRES durcissement du detecteur (round-2 P1 fix).
+# Repo HEAD: db8fcc72fac5b99b0926026b4632095ada76cfcc
+# Hote: Darwin 24.6.0
+# Python: 3.12.10 (v3.12.10:0cc81280367, Apr  8 2025, 08:46:59) [Clang 13.0.0 (clang-1300.0.29.30)]
+--- python3 factory/bin/ablation_checker.py ablation/arm_a_lock_manager.py --json ---
+{
+  "label": "",
+  "source": "ablation/arm_a_lock_manager.py",
+  "findings": [
+    {
+      "lesson_id": "L-20260727T150500Z-01",
+      "category": "concurrency",
+      "severity": "P1",
+      "status": "absent",
+      "evidence": "ablation/arm_a_lock_manager.py:19 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)",
+      "rule": "flock protège acquire_lock (acquisition atomique kernel)"
+    },
+    {
+      "lesson_id": "L-20260727T150500Z-05",
+      "category": "resource-leak",
+      "severity": "P2",
+      "status": "present",
+      "evidence": "ablation/arm_a_lock_manager.py:34 os.unlink(lockfile_path)",
+      "rule": "os.unlink() présent → fichier de lock supprimé"
+    },
+    {
+      "lesson_id": "L-20260727T150500Z-07",
+      "category": "concurrency",
+      "severity": "P2",
+      "status": "absent",
+      "evidence": "ablation/arm_a_lock_manager.py:23 _locks[lockfile_path] = fd",
+      "rule": "fd stocké dans un dict [clé] (multi-verrous supporté)"
+    },
+    {
+      "lesson_id": "L-20260727T150500Z-09",
+      "category": "resource-leak",
+      "severity": "P2",
+      "status": "present",
+      "evidence": "ablation/arm_a_lock_manager.py:15 def acquire_lock(lockfile_path):",
+      "rule": "acquire_lock sans cache check → double acquire = fuite fd"
+    },
+    {
+      "lesson_id": "L-20260727T150500Z-10",
+      "category": "concurrency",
+      "severity": "P2",
+      "status": "present",
+      "evidence": "ablation/arm_a_lock_manager.py:23 _locks[lockfile_path] = fd",
+      "rule": "clé dict = paramètre brut 'lockfile_path' (pas de resolve) → mismatch relatif/absolu"
+    },
+    {
+      "lesson_id": "L-20260727T150500Z-12",
+      "category": "concurrency",
+      "severity": "P1",
+      "status": "present",
+      "evidence": "ablation/arm_a_lock_manager.py: (AUCUN register_at_fork — enfant hérite fds + dict)",
+      "rule": "absence de os.register_at_fork()"
+    },
+    {
+      "lesson_id": "L-20260727T150500Z-13",
+      "category": "concurrency",
+      "severity": "P1",
+      "status": "absent",
+      "evidence": "ablation/arm_a_lock_manager.py: (pas de hook post-fork — l'absence de fork-safety est portee par L-12 ; un LOCK_UN hors hook enfant est l'usage legitime de release)",
+      "rule": "aucun hook after_in_child ; LOCK_UN hors contexte enfant = liberation normale, pas un defaut"
+    },
+    {
+      "lesson_id": "L-20260727T150500Z-16",
+      "category": "resource-leak",
+      "severity": "P2",
+      "status": "present",
+      "evidence": "ablation/arm_a_lock_manager.py:20 except BlockingIOError:",
+      "rule": "acquire_lock : except BlockingIOError seul → fuite fd sur autre OSError"
+    }
+  ],
+  "stats": {
+    "total_defects": 5,
+    "distinct_categories_with_defect": 2,
+    "categories_with_defect": [
+      "concurrency",
+      "resource-leak"
+    ],
+    "p1_defects": 1,
+    "p1_defect_ids": [
+      "L-20260727T150500Z-12"
+    ],
+    "covered_lessons_avoided": 3,
+    "total_applicable_lessons": 8
+  }
+}
+--- python3 factory/bin/ablation_checker.py ablation/arm_b_lock_manager.py --json ---
+{
+  "label": "",
+  "source": "ablation/arm_b_lock_manager.py",
+  "findings": [
+    {
+      "lesson_id": "L-20260727T150500Z-01",
+      "category": "concurrency",
+      "severity": "P1",
+      "status": "absent",
+      "evidence": "ablation/arm_b_lock_manager.py:43 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)",
+      "rule": "flock protège acquire_lock (acquisition atomique kernel)"
+    },
+    {
+      "lesson_id": "L-20260727T150500Z-05",
+      "category": "resource-leak",
+      "severity": "P2",
+      "status": "absent",
+      "evidence": "ablation/arm_b_lock_manager.py: (aucun os.unlink — fichier persistant)",
+      "rule": "aucun os.unlink()"
+    },
+    {
+      "lesson_id": "L-20260727T150500Z-07",
+      "category": "concurrency",
+      "severity": "P2",
+      "status": "absent",
+      "evidence": "ablation/arm_b_lock_manager.py:48 _LOCK_FDS[_canon(lockfile_path)] = fd",
+      "rule": "fd stocké dans un dict [clé] (multi-verrous supporté)"
+    },
+    {
+      "lesson_id": "L-20260727T150500Z-09",
+      "category": "resource-leak",
+      "severity": "P2",
+      "status": "present",
+      "evidence": "ablation/arm_b_lock_manager.py:39 def acquire_lock(lockfile_path):",
+      "rule": "acquire_lock sans cache check → double acquire = fuite fd"
+    },
+    {
+      "lesson_id": "L-20260727T150500Z-10",
+      "category": "concurrency",
+      "severity": "P2",
+      "status": "absent",
+      "evidence": "ablation/arm_b_lock_manager.py: (lockfile_path pas utilisé comme clé dict brute)",
+      "rule": "paramètre chemin pas clé de dict — non applicable"
+    },
+    {
+      "lesson_id": "L-20260727T150500Z-12",
+      "category": "concurrency",
+      "severity": "P1",
+      "status": "absent",
+      "evidence": "ablation/arm_b_lock_manager.py:72 os.register_at_fork(after_in_child=_after_fork_in_child)",
+      "rule": "hook after_in_child '_after_fork_in_child' ferme les fds (os.close) ET vide le dict (.clear())"
+    },
+    {
+      "lesson_id": "L-20260727T150500Z-13",
+      "category": "concurrency",
+      "severity": "P1",
+      "status": "absent",
+      "evidence": "ablation/arm_b_lock_manager.py: (hook _after_fork_in_child sans LOCK_UN — utilise os.close)",
+      "rule": "hook enfant _after_fork_in_child propre (pas de LOCK_UN)"
+    },
+    {
+      "lesson_id": "L-20260727T150500Z-16",
+      "category": "resource-leak",
+      "severity": "P2",
+      "status": "present",
+      "evidence": "ablation/arm_b_lock_manager.py:44 except BlockingIOError:",
+      "rule": "acquire_lock : except BlockingIOError seul → fuite fd sur autre OSError"
+    }
+  ],
+  "stats": {
+    "total_defects": 2,
+    "distinct_categories_with_defect": 1,
+    "categories_with_defect": [
+      "resource-leak"
+    ],
+    "p1_defects": 0,
+    "p1_defect_ids": [],
+    "covered_lessons_avoided": 6,
+    "total_applicable_lessons": 8
+  }
+}
+
+--- stats summary ---
+BRAS A (sans memoire): total_defects=5 p1_defects=1 categories=2
+BRAS B (avec memoire): total_defects=2 p1_defects=0 categories=1
+VERDICT: bras B meilleur (p1 1->0, total 5->2) ; chiffres INCHANGES par le durcissement (detecteur stricter, memes statuts sur les 2 bras reels).

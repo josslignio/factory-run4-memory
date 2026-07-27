@@ -3,9 +3,10 @@
 > Preuve par ablation de l'efficacité de la mémoire injectée. Chiffres
 > RÉELS produits par `factory/bin/ablation_checker.py` (bug-detector
 > déterministe, stdlib, scan statique, 8 règles validées par
-> `tests/test_ablation_checker.py` 17/17 OK). Aucun chiffre inventé.
+> `tests/test_ablation_checker.py` 22/22 OK). Aucun chiffre inventé.
 > Trace d'exécution datée et reproductible archivée dans
-> `ablation/ABLATION_RUN_LOG.txt` (append-only).
+> `ablation/ABLATION_RUN_LOG.txt` (append-only, 2 blocs : run initial +
+> re-run post-durcissement round-2).
 
 ## 1. Protocole (figé AVANT exécution — `ablation/PROTOCOL.md`)
 
@@ -41,6 +42,18 @@ leurs fix_patterns en cascade.
 > été corrigée (L-13 ne marque plus que le `LOCK_UN` situé DANS un hook
 > post-fork enfant, sa sémantique réelle) et les deux bras re-mesurés.
 > Les chiffres ci-dessous sont les chiffres honnêtes post-correction.
+
+> **Durcissement round-2 (post double-audit Claude+Codex)** : le détecteur a
+> été re-durci — `rule_L12` n'accepte plus un `os.register_at_fork()` seul
+> (exige un hook `after_in_child` qui `os.close` les fds ET `.clear()` le
+> dict, le fix_pattern exact de L-12 ; un hook no-op n'est plus crédité) ;
+> `rule_L01` exige que `flock` protège `acquire_lock` (pas seulement
+> `release_lock`) ; les offsets de ligne d'evidence de L-09/L-13/L-16
+> corrigés d'un décalage de +1. Les deux bras ont été re-mesurés : **les
+> statuts present/absent sont identiques** (A a toujours flock dans
+> acquire_lock et aucun register_at_fork ; B a toujours un hook close+clear
+> correct), verdict inchangé. Bloc de trace daté ajouté dans
+> `ablation/ABLATION_RUN_LOG.txt` (HEAD `db8fcc7`).
 
 | Métrique                                | Bras A (sans mémoire) | Bras B (avec mémoire) | Delta |
 |-----------------------------------------|----------------------:|----------------------:|------:|
@@ -101,7 +114,9 @@ rappel de l'injecteur, pas du mécanisme de mémoire lui-même.
   pas le code. Les défauts d'exécution non visibles dans le source
   (deadlocks subtils, perf, comportement OS-spécifique) ne sont PAS
   mesurés ici. Les 8 règles sont validées sur snippets défectueux ET
-  sains (17/17 tests) mais ne couvrent que les anti-patterns listés.
+  sains (22/22 tests, dont 5 tests de régression round-2 : hook no-op,
+  hook sans `.clear()`, flock hors `acquire_lock`, off-by-one de ligne
+  d'evidence) mais ne couvrent que les anti-patterns listés.
 - **Pas de boucle reviewer** : la métrique « nombre de tours de review
   avant PASS » du master order §4 n'est pas mesurable en exécution
   headless autonome (pas de reviewer disponible dans la boucle d'ablation).

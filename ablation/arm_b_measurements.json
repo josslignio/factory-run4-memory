@@ -7,8 +7,8 @@
       "category": "concurrency",
       "severity": "P1",
       "status": "absent",
-      "evidence": "ablation/arm_b_lock_manager.py: (flock présent — acquisition atomique kernel)",
-      "rule": "présence de fcntl.flock()"
+      "evidence": "ablation/arm_b_lock_manager.py:43 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)",
+      "rule": "flock protège acquire_lock (acquisition atomique kernel)"
     },
     {
       "lesson_id": "L-20260727T150500Z-05",
@@ -48,7 +48,7 @@
       "severity": "P1",
       "status": "absent",
       "evidence": "ablation/arm_b_lock_manager.py:72 os.register_at_fork(after_in_child=_after_fork_in_child)",
-      "rule": "register_at_fork appelé → enfant ne libère pas le verrou parent"
+      "rule": "hook after_in_child '_after_fork_in_child' ferme les fds (os.close) ET vide le dict (.clear())"
     },
     {
       "lesson_id": "L-20260727T150500Z-13",
@@ -63,7 +63,7 @@
       "category": "resource-leak",
       "severity": "P2",
       "status": "present",
-      "evidence": "ablation/arm_b_lock_manager.py:43 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)",
+      "evidence": "ablation/arm_b_lock_manager.py:44 except BlockingIOError:",
       "rule": "acquire_lock : except BlockingIOError seul → fuite fd sur autre OSError"
     }
   ],

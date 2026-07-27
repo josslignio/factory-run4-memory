@@ -145,62 +145,106 @@ def rule_L05(code: str, orig: str, path: str) -> Finding:
 
 
 def rule_L07(code: str, orig: str, path: str) -> Finding:
-    """L-07 (P2, concurrency) : scalaire _LOCK_FD global.
-    Defect present si un scalaire global type `_LOCK_FD = None` existe
-    (un seul fd → 2e acquire écrase le 1er). Fix = dict indexé par chemin."""
-    ln = _line_of(r"(?m)^\s*_lock_fd\s*=\s*(None|-1|0)\b", code, re.IGNORECASE)
-    if ln:
+    """L-07 (P2, concurrency) : scalaire _LOCK_FD global (un seul fd).
+    Defect STRUCTUREL present si AUCUNE assignation dict `<name>[<key>] =`
+    n'existe (le fd est stocké en scalaire → un seul verrou possible).
+    Indépendant du nom de variable (équité de mesure entre bras A et B)."""
+    # N'importe quelle assignation dict (directe `d[k]=os.open` ou via temp
+    # `fd=os.open; d[k]=fd`) suffit à prouver le stockage multi-verrous.
+    has_dict_store = bool(
+        re.search(r"(?m)^[ \t]*[A-Za-z_]\w*\s*\[[^\]]+\]\s*=", code))
+    has_open = bool(re.search(r"os\.open\s*\(", code))
+    if has_dict_store:
+        ln = _line_of(r"(?m)^[ \t]*[A-Za-z_]\w*\s*\[[^\]]+\]\s*=", code)
+        return Finding("L-20260727T150500Z-07", "concurrency", "P2",
+                       "absent", f"{path}:{ln} {_line_content(orig, ln)}",
+                       "fd stocké dans un dict [clé] (multi-verrous supporté)")
+    if has_open:
+        # os.open présent mais aucun stockage dict → scalaire implicite.
+        ln = _line_of(r"os\.open\s*\(", code)
         return Finding("L-20260727T150500Z-07", "concurrency", "P2",
                        "present", f"{path}:{ln} {_line_content(orig, ln)}",
-                       "globale scalaire _lock_fd (un seul fd possible)")
-    has_dict = bool(re.search(r"_lock_fds\s*=\s*\{\}", code, re.IGNORECASE))
+                       "aucun stockage dict [clé] → fd scalaire (un seul verrou)")
     return Finding("L-20260727T150500Z-07", "concurrency", "P2", "absent",
-                   f"{path}: ({'dict _lock_fds présent' if has_dict else 'pas de scalaire global'})",
-                   "pas de globale scalaire _lock_fd")
+                   f"{path}: (pas de os.open évident)",
+                   "pas de os.open détecté — non applicable")
+
+
+def _acquire_param(code: str):
+    """Retourne le nom du paramètre chemin de acquire_lock, ou None."""
+    m = re.search(r"\bdef\s+acquire_lock\s*\(\s*(?:self\s*,\s*)?([A-Za-z_]\w*)",
+                  code)
+    return m.group(1) if m else None
 
 
 def rule_L09(code: str, orig: str, path: str) -> Finding:
     """L-09 (P2, resource-leak) : acquire_lock non idempotent.
     Defect present si acquire_lock existe mais ne court-circuite pas un
-    chemin déjà détenu (pas de `key in _LOCK_FDS` / `.get(key)`)."""
+    chemin déjà détenu. Détection STRUCTURELLE (indépendante du nom du
+    dict) : cherche un test d'appartenance / .get() dans le corps."""
     if not re.search(r"\bdef\s+acquire_lock\b", code):
         return Finding("L-20260727T150500Z-09", "resource-leak", "P2",
                        "absent", f"{path}: (pas de acquire_lock)",
                        "acquire_lock absent — non applicable")
-    has_idem = bool(re.search(r"(in\s+_lock_fds|_lock_fds\.get\b|"
-                              r"_lock_fds\[.*\]\s*(?:is\s+not\s+none|!=\s*none))",
-                              code, re.IGNORECASE))
-    if has_idem:
-        ln = _line_of(r"(in\s+_lock_fds|_lock_fds\.get\b)", code, re.IGNORECASE)
+    # Idempotence = early-return quand le chemin est déjà en cache.
+    # Patterns structurels : `if <x> in <dict>`, `<dict>.get(<x>`,
+    # `if <x> in self.<dict>`, retour anticipé avant os.open.
+    has_idem = bool(re.search(r"\bin\s+[A-Za-z_]\w*(\.[A-Za-z_]\w*)?\b",
+                              code) or
+                    re.search(r"\.\s*get\s*\(\s*[A-Za-z_]\w*", code))
+    # Plus précis : un return True/le-fd AVANT le os.open dans acquire_lock.
+    acq_match = re.search(r"\bdef\s+acquire_lock\b.*?(?=\ndef\s|\Z)",
+                          code, re.DOTALL)
+    early_return = False
+    if acq_match:
+        body = acq_match.group(0)
+        # Y a-t-il un `return` avant le premier os.open ?
+        ret_pos = body.find("return")
+        open_pos = body.find("os.open")
+        if ret_pos >= 0 and (open_pos < 0 or ret_pos < open_pos):
+            early_return = True
+    if has_idem or early_return:
+        ln = _line_of(r"(\.\s*get\s*\(|\bin\s+[A-Za-z_]\w*)", code)
         return Finding("L-20260727T150500Z-09", "resource-leak", "P2",
                        "absent", f"{path}:{ln} {_line_content(orig, ln)}",
-                       "acquire_lock idempotent (check clé déjà détenue)")
+                       "acquire_lock idempotent (cache testé avant ouverture)")
     ln = _line_of(r"\bdef\s+acquire_lock\b", code)
     return Finding("L-20260727T150500Z-09", "resource-leak", "P2", "present",
                    f"{path}:{ln} {_line_content(orig, ln)}",
-                   "acquire_lock sans check d'idempotence → double acquire fuite fd")
+                   "acquire_lock sans cache check → double acquire = fuite fd")
 
 
 def rule_L10(code: str, orig: str, path: str) -> Finding:
     """L-10 (P2, concurrency) : clé dict non canonicalisée.
-    Defect present si un dict _lock_fds est utilisé SANS Path.resolve()
-    ni os.path.realpath (acquire relatif + release absolu = mismatch)."""
-    uses_dict = bool(re.search(r"_lock_fds\[", code, re.IGNORECASE))
-    if not uses_dict:
+    Defect present si le paramètre chemin de acquire_lock est utilisé
+    DIRECTEMENT comme clé de dict (sans Path.resolve()/realpath au préalable).
+    Détection STRUCTURELLE (indépendante du nom du dict) pour équité de
+    mesure."""
+    param = _acquire_param(code)
+    if not param:
         return Finding("L-20260727T150500Z-10", "concurrency", "P2",
-                       "absent", f"{path}: (pas de dict _lock_fds indexé)",
-                       "pas de dict chemin→fd — non applicable")
+                       "absent", f"{path}: (pas de acquire_lock)",
+                       "acquire_lock absent — non applicable")
+    # Canonicalisation présente ?
     has_canon = bool(re.search(r"\.resolve\s*\(", code) or
                      re.search(r"os\.path\.realpath\s*\(", code))
+    # Le paramètre est-il utilisé comme clé brute ?
+    raw_key = bool(re.search(r"\[[\s]*" + re.escape(param) + r"[\s]*\]",
+                             code))
+    if not raw_key:
+        return Finding("L-20260727T150500Z-10", "concurrency", "P2",
+                       "absent", f"{path}: ({param} pas utilisé comme clé dict brute)",
+                       "paramètre chemin pas clé de dict — non applicable")
     if has_canon:
         ln = _line_of(r"(\.resolve\s*\(|os\.path\.realpath\s*\()", code)
         return Finding("L-20260727T150500Z-10", "concurrency", "P2",
                        "absent", f"{path}:{ln} {_line_content(orig, ln)}",
-                       "clé canonicalisée via resolve/realpath")
-    ln = _line_of(r"_lock_fds\[", code, re.IGNORECASE)
+                       f"clé canonicalisée (resolve/realpath) avant indexation")
+    ln = _line_of(r"\[[\s]*" + re.escape(param) + r"[\s]*\]", code)
     return Finding("L-20260727T150500Z-10", "concurrency", "P2", "present",
                    f"{path}:{ln} {_line_content(orig, ln)}",
-                   "clé dict brute (pas de resolve/realpath) → mismatch relatif/absolu")
+                   f"clé dict = paramètre brut '{param}' (pas de resolve) → "
+                   f"mismatch relatif/absolu")
 
 
 def rule_L12(code: str, orig: str, path: str) -> Finding:

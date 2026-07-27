@@ -1,84 +1,78 @@
-AUDIT_REPAIR_NEEDED (round 1)
+AUDIT_REPAIR_NEEDED (round 2)
 --- Claude audit ---
-# PRET A MERGER
+# PAS PRET
 
-## Audit final indépendant — Run 4 (Experience Compiler)
+## Résumé du verdict
 
-Périmètre couvert : `factory/bin/*.py` (lesson_schema, bootstrap_lessons, lesson_extractor, lesson_injector, ablation_checker), `memory/lessons.jsonl`, `tests/` (4 fichiers pytest + `test_driver_helpers.bash`), `ablation/` (arm_a/arm_b, PROTOCOL.md, TASK_SPEC.md, measurements JSON), `reports/RUN4_FINAL_REPORT.md` et `RUN4_ABLATION_AB.md`, `run_run4_autonomous.sh`, `MASTER_ORDER_RUN4_MEMORY.md`, `DECISIONS_AUTONOMOUS.md`. Lecture intégrale des fichiers, pas d'exécution (Read/Grep/Glob uniquement).
+Le code produit (§1-§4 du master order) est globalement solide et l'ablation A/B est **réelle et vérifiée** (détail ci-dessous), mais le **gate de fin de campagne défini par le projet lui-même n'est pas satisfait par l'état actuellement committé du dépôt** — c'est à lui seul suffisant pour bloquer le merge, indépendamment des findings de code. Plusieurs findings P2 réels et non corrigés s'y ajoutent.
 
-### Vérification spécifique demandée : le chiffre d'ablation A/B est-il réel ?
+## Vérification de l'ablation A/B (exigence explicite de la tâche)
 
-**Oui, confirmé par retraçage manuel ligne à ligne**, pas seulement par confiance dans le rapport :
-- J'ai retracé à la main la logique déterministe des 8 règles de `factory/bin/ablation_checker.py` contre le code source réel de `ablation/arm_a_lock_manager.py` et `ablation/arm_b_lock_manager.py` (regex, calcul des numéros de ligne via `_line_of`/`_func_body`/offset docstring), et j'obtiens exactement les mêmes `status`, `evidence` (fichier:ligne + extrait de code) et `lesson_id` que ceux archivés dans `ablation/arm_a_measurements.json` et `ablation/arm_b_measurements.json` — y compris les décalages de ligne non triviaux dus au blanchiment des docstrings/commentaires (ex. L-16 : ligne 19 exacte, vérifiée par comptage de newlines).
-- Les chiffres cités dans `reports/RUN4_FINAL_REPORT.md:35-36` et `reports/RUN4_ABLATION_AB.md:45-47` (`total_defects` 5→2, `p1_defects` 1→0) correspondent **exactement** aux stats des deux fichiers JSON archivés.
-- Recoupement indépendant : `tests/test_ablation_checker.py` contient 17 `def test_`, `test_lesson_injector.py` 32, `test_lessons_bootstrap.py` 12, `test_lesson_extractor.py` 25 → **86 tests** au total, ce qui correspond exactement au « 86 passed » annoncé dans `RUN4_FINAL_REPORT.md:51`.
-- La correction de la règle L-13 (le point central du contre-audit Codex précédent) est bien implémentée : `ablation_checker.py:297-346` ne marque `present` que si `LOCK_UN` apparaît **dans le corps du hook `after_in_child`** identifié via `os.register_at_fork(...)`, pas n'importe où dans le fichier — vérifié par lecture directe de la regex et par les tests `test_L13_lock_un_in_release_is_legitimate` / `test_L13_lock_un_in_child_hook_is_defect` (`tests/test_ablation_checker.py:177-183,248-251`).
+**Verdict : chiffres réels, tracés, reproductibles — pas inventés.**
 
-**Conclusion : le chiffre d'ablation est réel, tracé à une exécution reproductible, pas inventé.**
+- `ablation/arm_a_measurements.json`, `ablation/arm_b_measurements.json` et `ablation/ABLATION_RUN_LOG.txt` sont mutuellement cohérents à l'octet près (mêmes 8 findings par bras, mêmes stats : A=5 défauts/1 P1, B=2 défauts/0 P1).
+- J'ai **re-dérivé à la main** les 8 règles de `factory/bin/ablation_checker.py` contre le code source réel de `ablation/arm_a_lock_manager.py` et `ablation/arm_b_lock_manager.py` : chaque statut `present`/`absent` et les totaux (5/1 vs 2/0) correspondent exactement à ce que produit la logique actuelle du checker — ce ne sont pas des chiffres copiés/collés arbitrairement.
+- `ablation/ABLATION_RUN_LOG.txt:6` cite `Repo HEAD: 285199123058afb...` — ce hash court (`2851991`) correspond à un commit réellement présent dans l'historique de la branche (`2851991 restore executable bit`), preuve supplémentaire que la trace n'a pas été fabriquée hors contexte du dépôt.
+- Limite trouvée au passage : la ligne d'`evidence` de la règle `rule_L16` (et le même calcul d'offset dans `rule_L09`/`rule_L13`) est **décalée d'une ligne** (voir P2 ci-dessous) — n'affecte pas les totaux ni le verdict, mais affaiblit la traçabilité fichier:ligne que le projet érige en règle absolue (règle 4).
+- Non vérifié par moi (outils lecture seule) : je n'ai pas ré-exécuté `pytest`/le CLI moi-même. J'ai recompté à la main les méthodes de test des 4 fichiers `tests/*.py` (17+26+32+12 = **87**), cohérent avec le « 87 passed » annoncé — mais ce n'est qu'une reconstruction arithmétique, pas une exécution réelle de ma part.
 
-### P1 — bloquants
-Aucun. Les deux P1 des audits précédents (Claude et Codex) sont vérifiés corrigés :
-- `reports/RUN4_FINAL_REPORT.md` existe et contient les 4 éléments exigés par `MASTER_ORDER_RUN4_MEMORY.md:53` (nombre de leçons=18, résultat brut A/B, statut par capacité §1-§4, section NON VÉRIFIÉ).
-- `run_run4_autonomous.sh:95-105` (`audit_ok()`) n'accepte plus qu'un verdict positif sur la **première ligne uniquement**, et rejette explicitement `"PAS PRET"`/`"PAS PRÊT"` sur cette ligne — reproduit correctement par `tests/test_driver_helpers.bash:45-50` (`audit_ok_rejects_bad`).
+## P1
 
-### P2
+- **`factory/campaigns/CAMPAIGN_STATE:1`** — la valeur committée est `READY_FOR_FINAL_AUDIT`. Or `MASTER_ORDER_RUN4_MEMORY.md:10` (marqué « non négociable ») énumère explicitement les **seuls** arrêts autorisés : `RUNNING`, `WAITING_INFRA`, `FAIL`, `WAITING_HUMAN_BOSS_GO`. `READY_FOR_FINAL_AUDIT` n'y figure pas, et `MASTER_ORDER_RUN4_MEMORY.md:56` exige explicitement `CAMPAIGN_STATE=WAITING_HUMAN_BOSS_GO` en fin de campagne. Déjà relevé indépendamment par les deux reviewers de tranche (`reports/run4-review-latest-codex.md:1-3` en `FIX_NEEDED`, `reports/run4-review-latest-claude.md` en PASS-avec-réserve) sans être résolu depuis.
 
-**P2-1 — `factory/bin/lesson_extractor.py:468-502` : le chemin d'écriture destination (`--out`/`--append`) n'attrape aucune exception**
-- Le seul `try/except (ExtractionError, LessonError)` de `main()` se referme à la ligne 452, **avant** le bloc « Destination » (lignes 458-506). Les appels `_read_existing_ids()` (470, 487), `_write_jsonl_fresh()` (480) et `_append_jsonl()` (497) ne sont protégés par aucun `try/except` dans `main()`.
-- Conséquence concrète 1 : si le fichier destination (`memory/lessons.jsonl` ou tout autre `--append`/`--out`) est corrompu (une ligne JSON invalide, un id dupliqué), `_read_existing_ids` → `load_jsonl` lève `LessonError` — non rattrapée, traceback brut au lieu du `rc=1` propre promis par le module (comparer avec le message d'erreur soigné à la ligne 493 : `"RIEN n'a été écrit (atomicité)"`).
-- Conséquence concrète 2, plus significative : `_append_jsonl` (ligne 373-395) fait *exactement ce que le commentaire ligne 374-377 promet* — sérialisation par `fcntl.flock` exclusif, re-vérification des collisions **sous verrou** (ligne 383-388). Mais si cette re-vérification sous verrou détecte une vraie collision concurrente (deux process qui appendent au même instant avec le même `extraction-ts`), elle lève `LessonError` (ligne 386-388) — qui remonte **non rattrapée** jusqu'à `sys.exit(main())` (ligne 512) et produit un traceback Python brut au lieu du message contrôlé. Le mécanisme anti-collision fonctionne (rien n'est écrit à tort), mais le comportement de sortie n'est pas celui documenté.
-- Ni `tests/test_lesson_extractor.py::TestAppendIntegration` ni aucun autre test n'exerce ce chemin sous verrou avec collision réelle (seul le pré-check hors-verrou de `main()`, ligne 489-496, est testé) — le gap n'est donc pas couvert par la suite de 86 tests.
-- Pas de corruption de données (l'écriture n'a pas lieu avant la levée de l'exception), mais c'est une lacune réelle de « gestion d'erreurs incomplète » sur le chemin critique qui protège `memory/lessons.jsonl`.
+- **Gate d'audit final non satisfait par l'état actuel du dépôt** — `run_run4_autonomous.sh:124-147` déclenche les deux audits finaux (Claude + Codex) précisément quand `CAMPAIGN_STATE=READY_FOR_FINAL_AUDIT`, et n'autorise `WAITING_HUMAN_BOSS_GO` que si `audit_ok()` (ligne 95-105 : verdict positif en 1ʳᵉ ligne, ni « PAS PRET » ni « PAS PRÊT ») passe sur LES DEUX fichiers. Or, dans l'état actuel du dépôt : `reports/RUN4_FINAL_AUDIT_CLAUDE.md` est **vide**, et `reports/RUN4_FINAL_AUDIT_CODEX.md:1` commence littéralement par `PAS PRET`, en citant des défauts (`--out` non sérialisé, contradiction du rapport d'ablation) qui sont **déjà corrigés** dans le code actuel — cet audit est donc à la fois négatif ET obsolète vis-à-vis du commit courant. Si le pilote évaluait `audit_ok()` maintenant, il refuserait de passer à `WAITING_HUMAN_BOSS_GO`. Le dépôt n'a donc, à ce jour, jamais atteint l'état terminal que le projet définit lui-même comme prêt à merger.
 
-### P3
+## P2
 
-**P3-1 — `factory/bin/bootstrap_lessons.py:479-482` : écriture non protégée**
-`write_jsonl(LESSONS, out)` dans `main()` n'est entourée d'aucun `try/except` ; une `OSError` (permission, disque plein pendant `os.fsync`) produit un traceback brut plutôt qu'un `rc=1` contrôlé. Impact limité (script bootstrap one-shot, environnement contrôlé).
+- **`factory/bin/lesson_extractor.py:477-480`** — `--source-tag` réécrit `l["source"]` **après** que `build_lesson()`/`validate_lesson()` ait déjà tourné, sans reconstruire `evidence` (qui embarque le `source` d'origine en préfixe, `lesson_extractor.py:302`) ni re-valider. Un tag composé uniquement d'espaces (`--source-tag " "`) est truthy en Python donc appliqué, produisant une leçon avec un `source` vide en pratique qui contourne le contrôle « champ non vide » du schéma ; tout tag non trivial rend `source` et le préfixe tracé dans `evidence` contradictoires. Aucun test ne couvre `--source-tag` (absent de `tests/test_lesson_extractor.py`). C'est exactement le défaut relevé par un round d'audit antérieur (voir `DECISIONS_AUTONOMOUS.md`) et il n'a pas été traité — seul le « jamais appliqué » a été corrigé, pas la cohérence avec `evidence`.
 
-**P3-2 — `factory/bin/ablation_checker.py:385-388` (`check_file`) : lecture non protégée contredit le docstring**
-`path.read_text(encoding="utf-8")` peut lever `UnicodeDecodeError` non rattrapée, alors que le module s'auto-décrit ligne 27-28 comme « rc=0 toujours (le checker ne « fail » pas ; il mesure) ». Impact nul sur l'ablation actuelle (les deux fichiers arm_a/arm_b sont de l'UTF-8 propre), risque uniquement en cas de réutilisation future sur du code source à l'encodage inattendu.
+- **`factory/bin/ablation_checker.py:368-369` (`rule_L16`) et le même calcul dans `rule_L09`/`rule_L13`** — le numéro de ligne d'evidence est **décalé d'une ligne** (`code[: code.find("def acquire_lock")].count("\n")` compte les retours à la ligne AVANT la ligne `def`, alors que `body` commence juste APRÈS elle). Confirmé concrètement : `ablation/arm_a_measurements.json:66` et `ablation/arm_b_measurements.json:66` pointent tous deux vers la ligne du `fcntl.flock(...)` alors que le vrai `except BlockingIOError:` matché est la ligne suivante. N'affecte pas le statut present/absent ni les totaux (vérifié par ma retracée manuelle), mais casse la garantie « toute affirmation tracée fichier:ligne » (règle 4) sur cette règle précise. Aucun test n'asserte sur le numéro de ligne exact, d'où le passage inaperçu.
 
-**P3-3 (rappel, déjà honnêtement documenté, pas un nouveau défaut)** — les règles structurelles `rule_L07`/`rule_L09` du checker restent scope-fragiles en général (matching sur toute assignation `x[k]=` ou tout `\bin\b`/`.get(` du corps de fonction, pas strictement lié au cache du verrou) ; déjà reconnu dans `ablation/PROTOCOL.md:73-75` et l'audit Codex précédent (P3-2). Aucun impact sur les chiffres mesurés ici (vérifié par retraçage manuel ci-dessus).
+- **`factory/bin/ablation_checker.py:122-126` (`rule_L01`) et `:286-294` (`rule_L12`)** — heuristiques faibles, déjà signalées par un round d'audit Codex antérieur et toujours non corrigées : `rule_L01` marque le défaut TOCTOU « absent » dès qu'un `fcntl.flock(` apparaît N'IMPORTE OÙ dans le fichier, même uniquement dans `release_lock` sans jamais protéger `acquire_lock` ; `rule_L12` marque le défaut fork-safety « absent » dès qu'un `os.register_at_fork(` est présent, même avec un hook no-op qui ne fait ni `close` ni `clear`. Pour les deux fichiers réellement mesurés ici (`arm_a`/`arm_b`) j'ai vérifié à la main que ça ne fausse pas le résultat actuel, mais la prétention du détecteur à mesurer objectivement « l'absence d'anti-patterns connus » (`ablation/TASK_SPEC.md:35-37`) est plus fragile que présentée pour un usage futur/générique.
 
-### Ce qui est solide et vérifié directement
-- 18 leçons dans `memory/lessons.jsonl` (compté), toutes conformes au schéma, source traçable `factory-run3-lab@fix-lock-flock-checkpoint-sha256`.
-- `rule_L10` n'est plus dupliquée (une seule définition, ligne 249) — le P3 de l'audit Codex précédent est corrigé.
-- Séparation constructeur/contrôleur respectée, aucune dépendance externe (stdlib uniquement) dans tous les fichiers `factory/bin/*.py` lus.
-- `tests/fixtures/review_sample.txt` correctement labellisée comme fixture synthétique (D-007), pas présentée comme un rapport réel.
-- Les fichiers `lesson_injector.py` et `lesson_schema.py` gèrent proprement toutes les erreurs d'E/S/schéma que j'ai pu tracer (répertoire au lieu de fichier, mémoire illisible, date non-ISO8601) — aucun gap trouvé dans ces deux modules.
+- **`factory/bin/bootstrap_lessons.py:447-452`** — `write_jsonl` utilise un nom `.tmp` **fixe** (`out_path.with_suffix(".tmp")`) sans flock, exactement le pattern de course qui a causé le bug P1 déjà trouvé-et-corrigé dans `lesson_extractor.py` (voir `DECISIONS_AUTONOMOUS.md` D-008/repair round 1). Deux bootstraps concurrents sur le même `--out` peuvent s'écraser silencieusement. De plus, `main()` (ligne 479-480) n'entoure pas l'appel à `write_jsonl` d'un `try/except` : une erreur disque (plein/permissions) remonte en traceback nue au lieu du `rc=1` contrôlé désormais garanti ailleurs dans la même codebase.
 
-### NON VÉRIFIÉ par cet audit
-- Pas d'exécution réelle de `pytest`/`bash tests/` (outils Read/Grep/Glob uniquement) — la conformité des 86 tests + 13 checks bash au comportement réel du code est déduite par lecture, pas rejouée.
-- La collision concurrente réelle sous verrou (P2-1) n'a pas été provoquée avec deux process réels — le gap est démontré par lecture de code (absence de try/except), pas par reproduction en direct.
-- `reports/run4-driver.log` non lu intégralement ; `run_run4_autonomous.sh` non rejoué en conditions réelles (appels `opencode`/`claude`/`codex` live).
+## P3
+
+- **`factory/bin/lesson_schema.py:66-68` (`DATE_RE`)** — valide la FORME d'une date ISO8601, pas sa validité calendaire (`"2026-13-45"`, `"2026-02-31T29:99"` passent `validate_lesson`). `reports/RUN4_FINAL_REPORT.md:13` affirme « la date est maintenant réellement validée ISO8601 » — vrai seulement pour du texte non daté du tout, pas pour une date syntaxiquement plausible mais calendairement invalide ; l'affirmation est donc légèrement survendue.
+
+- **`factory/bin/ablation_checker.py:385-387` (`check_file`)** — `path.read_text(encoding="utf-8")` n'est pas protégé ; un fichier source non-UTF8 ou illisible lève une exception non capturée, en contradiction avec le contrat documenté du module (`ablation_checker.py:27` : « rc=0 toujours »).
+
+- **`factory/bin/lesson_schema.py` (`load_jsonl`)** — quand `validate_lesson(obj)` échoue (severity/category/date/id/evidence invalide), le message d'erreur ne porte pas le numéro de ligne JSONL (contrairement à la branche `JSONDecodeError` qui, elle, le fait) — complique le diagnostic sur une mémoire volumineuse.
+
+- **`DECISIONS_AUTONOMOUS.md`** — deux entrées portent le même identifiant `D-008` (« Stop-words pour `_split_triggers` » et « Repair audit round 1 »), erreur de numérotation mineure dans un fichier dont la fonction est justement d'être un registre de décisions fiable.
+
+## Ce qui va bien (pour situer le verdict)
+
+Le cœur technique — `lesson_schema.py`, `lesson_extractor.py` (sérialisation flock+mkstemp du `--out`/`--append` vérifiée en lecture, gestion d'erreurs contrôlée), `lesson_injector.py`, le bootstrap de 18 leçons tracées à `factory-run3-lab@fix-lock-flock-checkpoint-sha256`, et la preuve d'ablation A/B elle-même — est cohérent, testé, et honnête sur ses limites (section NON VÉRIFIÉ présente et sincère dans `RUN4_FINAL_REPORT.md` et `RUN4_ABLATION_AB.md`). Les problèmes bloquants ici sont essentiellement (a) le gate de process/état de campagne pas encore refermé, et (b) des défauts P2 réels mais localisés, pas une remise en cause de l'architecture.
 
 --- Codex audit ---
 PAS PRET
 
-### P1
+Le résultat A/B est bien rattaché à une exécution réelle : la transcript du driver montre l’exécution du checker et produit A=5/P1=1, B=2/P1=0 ([reports/run4-driver.log:37620](/Users/jocelyngrosjean/factory-run4-memory/reports/run4-driver.log:37620)); ces valeurs correspondent aux archives ([ablation/arm_a_measurements.json:70](/Users/jocelyngrosjean/factory-run4-memory/ablation/arm_a_measurements.json:70), [ablation/arm_b_measurements.json:70](/Users/jocelyngrosjean/factory-run4-memory/ablation/arm_b_measurements.json:70)) et au rapport final ([reports/RUN4_FINAL_REPORT.md:36](/Users/jocelyngrosjean/factory-run4-memory/reports/RUN4_FINAL_REPORT.md:36)). Ce n’est toutefois pas une preuve append-only : la création utilise une redirection écrasante `>` ([reports/run4-driver.log:37660](/Users/jocelyngrosjean/factory-run4-memory/reports/run4-driver.log:37660)).
 
-- `factory/bin/lesson_extractor.py:468-480` — `--out` n’est pas sérialisé. Deux extracteurs concurrents peuvent tous deux valider l’absence de collision, écrire le même fichier temporaire fixe (`.jsonl.tmp`) et faire un `os.replace`; un résultat peut écraser silencieusement l’autre. Perte de données possible.
+P1
 
-- `reports/RUN4_ABLATION_AB.md:73-77` — le rapport final se contredit : le tableau corrigé annonce A=5 défauts/1 P1, mais l’analyse affirme encore A=6 défauts/2 P1. Les JSON archivés confirment bien 5/1 et 2/0, mais ne constituent pas une trace d’exécution horodatée/non modifiable. Avec les outils lecture seule, je peux confirmer la cohérence statique des artefacts, pas prouver qu’ils résultent d’une exécution réelle. L’exigence de traçabilité de l’ablation n’est donc pas satisfaite.
+- Le checker peut déclarer à tort la fork-safety P1 correcte dès qu’il voit `os.register_at_fork(`, sans vérifier un callback `after_in_child`, ni qu’il ferme les FDs et vide le cache. Un hook no-op donne donc P1=0 malgré le défaut. C’est central à la métrique A/B. [factory/bin/ablation_checker.py:283](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/ablation_checker.py:283), [factory/bin/ablation_checker.py:286](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/ablation_checker.py:286), [tests/test_ablation_checker.py:223](/Users/jocelyngrosjean/factory-run4-memory/tests/test_ablation_checker.py:223)
 
-### P2
+P2
 
-- `factory/bin/lesson_extractor.py:470,480,487,497` — les erreurs de destination ne sont pas capturées : JSONL existant corrompu, répertoire à la place du fichier, permission refusée, disque plein, ou collision détectée sous le verrou provoquent un traceback au lieu d’un `rc=1` contrôlé.
+- `bootstrap_lessons.write_jsonl()` emploie un `.tmp` fixe, sans verrou. Deux bootstraps concurrents sur la même destination peuvent s’écraser, échouer ou publier un contenu inattendu. [factory/bin/bootstrap_lessons.py:445](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/bootstrap_lessons.py:445), [factory/bin/bootstrap_lessons.py:447](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/bootstrap_lessons.py:447), [factory/bin/bootstrap_lessons.py:452](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/bootstrap_lessons.py:452)
 
-- `factory/bin/lesson_extractor.py:449-451` — `--source-tag` remplace `source` après validation sans reconstruire `evidence` ni revalider. Un tag blanc produit une leçon invalide; un tag différent rend `source` et le préfixe de preuve contradictoires.
+- Les erreurs d’écriture du bootstrap ne sont pas converties en erreur CLI contrôlée : `main()` appelle `write_jsonl()` sans `try/except`, donc disque plein, permission ou erreur de remplacement produisent une traceback. [factory/bin/bootstrap_lessons.py:479](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/bootstrap_lessons.py:479)
 
-- `factory/bin/lesson_schema.py:66-68,107-110` — la « validation ISO8601 » n’est qu’une regex : elle accepte des dates/heures inexistantes (`2026-99-99`, `2026-02-31T29:99`). Cela contredit la validation stricte annoncée.
+- `--source-tag` modifie `source` après validation, sans revalider ni reconstruire `evidence`. Un tag blanc produit une leçon invalide ; un tag non vide rend `source` contradictoire avec le préfixe de preuve conservé. [factory/bin/lesson_extractor.py:302](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/lesson_extractor.py:302), [factory/bin/lesson_extractor.py:476](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/lesson_extractor.py:476), [factory/bin/lesson_extractor.py:479](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/lesson_extractor.py:479)
 
-- `factory/bin/ablation_checker.py:122-126,286-291,343-346` — plusieurs règles P1 concluent à tort qu’un défaut est absent sur simple présence de token. Un `flock` uniquement dans `release_lock`, un `register_at_fork(after_in_child=noop)`, ou un hook enfant ne faisant ni `close` ni `clear`, sont tous crédités comme sûrs. Les tests ne couvrent pas ces faux négatifs (`tests/test_ablation_checker.py:198-256`). La métrique est correcte pour les deux sources actuelles après lecture, mais le détecteur ne justifie pas l’affirmation générale de « défauts objectivement éliminés ».
+- La validation ISO-8601 ne valide que la forme : `2026-13-45` ou `2026-02-31T29:99` passent. Le rapport affirme donc à tort que la date est « réellement validée ». [factory/bin/lesson_schema.py:66](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/lesson_schema.py:66), [factory/bin/lesson_schema.py:107](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/lesson_schema.py:107), [reports/RUN4_FINAL_REPORT.md:13](/Users/jocelyngrosjean/factory-run4-memory/reports/RUN4_FINAL_REPORT.md:13)
 
-- `reports/RUN4_ABLATION_AB.md:6,101-102` — annonce « 15/15 OK », alors que `tests/test_ablation_checker.py` contient 17 tests. La documentation d’audit est stale.
+- Les preuves de ligne L-16 sont décalées d’une ligne : le checker trouve `except BlockingIOError` mais publie la ligne précédente (`flock`). Cela casse la traçabilité annoncée des findings. [factory/bin/ablation_checker.py:360](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/ablation_checker.py:360), [factory/bin/ablation_checker.py:368](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/ablation_checker.py:368), [ablation/arm_a_measurements.json:66](/Users/jocelyngrosjean/factory-run4-memory/ablation/arm_a_measurements.json:66)
 
-### P3
+- L’affirmation « append-only » est fausse : aucun producteur ne protège ou n’append le fichier ; la transcript le crée par écrasement. [reports/RUN4_ABLATION_AB.md:8](/Users/jocelyngrosjean/factory-run4-memory/reports/RUN4_ABLATION_AB.md:8), [reports/run4-driver.log:37660](/Users/jocelyngrosjean/factory-run4-memory/reports/run4-driver.log:37660)
 
-- `factory/bin/bootstrap_lessons.py:445-452,479-480` — fichier temporaire fixe et absence de verrou : deux bootstrap concurrents peuvent se gêner; une erreur d’E/S laisse aussi un traceback et potentiellement un `.tmp`.
+P3
 
-- `factory/bin/ablation_checker.py:385-387` — lecture UTF-8 non protégée; `UnicodeDecodeError`/erreur d’E/S contredit le contrat « rc=0 toujours ».
+- `--top` et `--min-score` acceptent des valeurs négatives sans validation ; `--top -1` est silencieusement interprété comme illimité, contrairement au contrat qui réserve ce rôle à `0`. [factory/bin/lesson_injector.py:253](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/lesson_injector.py:253), [factory/bin/lesson_injector.py:259](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/lesson_injector.py:259), [factory/bin/lesson_injector.py:175](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/lesson_injector.py:175)
 
-- `factory/bin/lesson_schema.py:127-136` — une erreur de validation de schéma ne reçoit pas le numéro de ligne JSONL, ce qui complique la correction d’une mémoire volumineuse.
+- Les tests ne couvrent ni la concurrence du bootstrap, ni la validation calendaire, ni `--source-tag`; les défauts ci-dessus peuvent donc repasser malgré la suite annoncée. [tests/test_lessons_bootstrap.py:104](/Users/jocelyngrosjean/factory-run4-memory/tests/test_lessons_bootstrap.py:104), [tests/test_lesson_extractor.py:285](/Users/jocelyngrosjean/factory-run4-memory/tests/test_lesson_extractor.py:285)
 
-Les nombres actuellement archivés sont cohérents entre eux : A=5 / 1 P1 et B=2 / 0 P1. Ils doivent toutefois être ré-exécutés, avec sortie datée conservée, et le rapport contradictoire doit être corrigé avant merge.
+Le chiffre A/B est réel et cohérent pour les deux artefacts actuels, mais la robustesse du détecteur P1 et les incohérences de validation/traçabilité empêchent le merge final.

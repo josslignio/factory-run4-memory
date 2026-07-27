@@ -177,41 +177,104 @@ def _acquire_param(code: str):
     return m.group(1) if m else None
 
 
+def _func_body(code: str, funcname: str) -> str:
+    """Extrait le corps source d'une fonction `def funcname(...)` jusqu'à
+    la prochaine def/class au même niveau d'indentation (ou fin de fichier).
+
+    Indispensable pour que L-09/L-16 n'aillent PAS chercher des patterns
+    (`for ... in`, `except OSError`) dans d'autres fonctions (hook fork,
+    release_lock...) — sinon faux positifs qui créditent à tort arm B.
+    """
+    m = re.search(
+        r"(?ms)^[ \t]*def\s+" + re.escape(funcname) + r"\s*\([^)]*\)\s*(?:->[^:]+)?:\n",
+        code)
+    if not m:
+        return ""
+    start = m.end()
+    # Déterminer l'indentation du corps (lignes non vides suivantes).
+    after = code[start:]
+    indent = ""
+    for line in after.splitlines(True):
+        if line.strip() == "":
+            continue
+        stripped = line.lstrip(" \t")
+        indent = line[: len(line) - len(stripped)]
+        break
+    if not indent:
+        return after
+    # Le corps = toutes les lignes indentées d'au moins `indent` (+ lignes
+    # vides), jusqu'à la première ligne non vide moins indentée.
+    body_lines = []
+    for line in after.splitlines(True):
+        if line.strip() == "":
+            body_lines.append(line)
+            continue
+        if line.startswith(indent) or line[: len(indent)] == indent:
+            body_lines.append(line)
+        else:
+            break
+    return "".join(body_lines)
+
+
 def rule_L09(code: str, orig: str, path: str) -> Finding:
     """L-09 (P2, resource-leak) : acquire_lock non idempotent.
     Defect present si acquire_lock existe mais ne court-circuite pas un
-    chemin déjà détenu. Détection STRUCTURELLE (indépendante du nom du
-    dict) : cherche un test d'appartenance / .get() dans le corps."""
+    chemin déjà détenu. Détection STRUCTURELLE SCOPE-AWARE : on n'analyse
+    QUE le corps de acquire_lock (pas le hook fork ni release_lock)."""
     if not re.search(r"\bdef\s+acquire_lock\b", code):
         return Finding("L-20260727T150500Z-09", "resource-leak", "P2",
                        "absent", f"{path}: (pas de acquire_lock)",
                        "acquire_lock absent — non applicable")
-    # Idempotence = early-return quand le chemin est déjà en cache.
-    # Patterns structurels : `if <x> in <dict>`, `<dict>.get(<x>`,
-    # `if <x> in self.<dict>`, retour anticipé avant os.open.
-    has_idem = bool(re.search(r"\bin\s+[A-Za-z_]\w*(\.[A-Za-z_]\w*)?\b",
-                              code) or
-                    re.search(r"\.\s*get\s*\(\s*[A-Za-z_]\w*", code))
-    # Plus précis : un return True/le-fd AVANT le os.open dans acquire_lock.
-    acq_match = re.search(r"\bdef\s+acquire_lock\b.*?(?=\ndef\s|\Z)",
-                          code, re.DOTALL)
-    early_return = False
-    if acq_match:
-        body = acq_match.group(0)
-        # Y a-t-il un `return` avant le premier os.open ?
-        ret_pos = body.find("return")
-        open_pos = body.find("os.open")
-        if ret_pos >= 0 and (open_pos < 0 or ret_pos < open_pos):
-            early_return = True
+    body = _func_body(code, "acquire_lock")
+    # Idempotence = early-return quand le chemin est déjà en cache,
+    # testé DANS acquire_lock avant le os.open.
+    has_idem = bool(re.search(r"\bin\s+[A-Za-z_]\w*", body) or
+                    re.search(r"\.\s*get\s*\(", body))
+    ret_pos = body.find("return")
+    open_pos = body.find("os.open")
+    early_return = ret_pos >= 0 and (open_pos < 0 or ret_pos < open_pos)
     if has_idem or early_return:
-        ln = _line_of(r"(\.\s*get\s*\(|\bin\s+[A-Za-z_]\w*)", code)
+        ln = _line_of(r"(\.\s*get\s*\(|\bin\s+[A-Za-z_]\w*)", body)
+        # _line_of travaille sur `body` (décalage) ; on convertit en absolu.
+        abs_ln = ln + code[: code.find("def acquire_lock")].count("\n") if ln else 0
         return Finding("L-20260727T150500Z-09", "resource-leak", "P2",
-                       "absent", f"{path}:{ln} {_line_content(orig, ln)}",
+                       "absent", f"{path}:{abs_ln} {_line_content(orig, abs_ln)}",
                        "acquire_lock idempotent (cache testé avant ouverture)")
     ln = _line_of(r"\bdef\s+acquire_lock\b", code)
     return Finding("L-20260727T150500Z-09", "resource-leak", "P2", "present",
                    f"{path}:{ln} {_line_content(orig, ln)}",
                    "acquire_lock sans cache check → double acquire = fuite fd")
+
+
+def rule_L10(code: str, orig: str, path: str) -> Finding:
+    """L-10 (P2, concurrency) : clé dict non canonicalisée.
+    Defect present si le paramètre chemin de acquire_lock est utilisé
+    DIRECTEMENT comme clé de dict (sans Path.resolve()/realpath au préalable).
+    Détection STRUCTURELLE (indépendante du nom du dict) pour équité de
+    mesure."""
+    param = _acquire_param(code)
+    if not param:
+        return Finding("L-20260727T150500Z-10", "concurrency", "P2",
+                       "absent", f"{path}: (pas de acquire_lock)",
+                       "acquire_lock absent — non applicable")
+    has_canon = bool(re.search(r"\.resolve\s*\(", code) or
+                     re.search(r"os\.path\.realpath\s*\(", code))
+    raw_key = bool(re.search(r"\[[\s]*" + re.escape(param) + r"[\s]*\]",
+                             code))
+    if not raw_key:
+        return Finding("L-20260727T150500Z-10", "concurrency", "P2",
+                       "absent", f"{path}: ({param} pas utilisé comme clé dict brute)",
+                       "paramètre chemin pas clé de dict — non applicable")
+    if has_canon:
+        ln = _line_of(r"(\.resolve\s*\(|os\.path\.realpath\s*\()", code)
+        return Finding("L-20260727T150500Z-10", "concurrency", "P2",
+                       "absent", f"{path}:{ln} {_line_content(orig, ln)}",
+                       f"clé canonicalisée (resolve/realpath) avant indexation")
+    ln = _line_of(r"\[[\s]*" + re.escape(param) + r"[\s]*\]", code)
+    return Finding("L-20260727T150500Z-10", "concurrency", "P2", "present",
+                   f"{path}:{ln} {_line_content(orig, ln)}",
+                   f"clé dict = paramètre brut '{param}' (pas de resolve) → "
+                   f"mismatch relatif/absolu")
 
 
 def rule_L10(code: str, orig: str, path: str) -> Finding:
@@ -278,25 +341,33 @@ def rule_L13(code: str, orig: str, path: str) -> Finding:
 
 def rule_L16(code: str, orig: str, path: str) -> Finding:
     """L-16 (P2, resource-leak) : except BlockingIOError seul.
-    Defect present si `except BlockingIOError` apparaît SANS un filet
-    large (finally ou except BaseException/Exception + os.close) couvrant
-    les autres OSError (ENOTSUP etc. → fuite fd)."""
-    ln = _line_of(r"except\s+BlockingIOError", code)
-    if not ln:
+    Defect present si `except BlockingIOError` apparaît dans acquire_lock
+    SANS un filet large (finally ou except BaseException/Exception + close)
+    DANS LE MÊME acquire_lock. Scope-aware : un `except OSError` dans le
+    hook fork ne compte pas (sinon faux positif crédité à tort)."""
+    body = _func_body(code, "acquire_lock")
+    if not body:
         return Finding("L-20260727T150500Z-16", "resource-leak", "P2",
-                       "absent", f"{path}: (pas de except BlockingIOError isolé)",
-                       "aucun except BlockingIOError isolé")
-    has_wide = bool(re.search(r"except\s+(BaseException|Exception|OSError)", code) or
-                    re.search(r"finally\s*:\s*\n\s*os\.close", code))
+                       "absent", f"{path}: (pas de acquire_lock)",
+                       "acquire_lock absent — non applicable")
+    ln_rel = _line_of(r"except\s+BlockingIOError", body)
+    if not ln_rel:
+        return Finding("L-20260727T150500Z-16", "resource-leak", "P2",
+                       "absent", f"{path}: (pas de except BlockingIOError dans acquire_lock)",
+                       "aucun except BlockingIOError isolé dans acquire_lock")
+    has_wide = bool(re.search(r"except\s+(BaseException|Exception|OSError)", body) or
+                    re.search(r"finally\s*:\s*\n\s*os\.close", body))
+    # offset absolu pour evidence
+    body_start_ln = code[: code.find("def acquire_lock")].count("\n")
+    abs_ln = ln_rel + body_start_ln
     if has_wide:
-        ln2 = _line_of(r"except\s+(BaseException|Exception|OSError)", code)
         return Finding("L-20260727T150500Z-16", "resource-leak", "P2",
                        "absent",
-                       f"{path}:{ln2 or ln} {_line_content(orig, ln2 or ln)}",
-                       "filet large présent (finally/except large + close)")
+                       f"{path}:{abs_ln} {_line_content(orig, abs_ln)}",
+                       "filet large présent dans acquire_lock (finally/except large + close)")
     return Finding("L-20260727T150500Z-16", "resource-leak", "P2", "present",
-                   f"{path}:{ln} {_line_content(orig, ln)}",
-                   "except BlockingIOError seul → fuite fd sur autre OSError")
+                   f"{path}:{abs_ln} {_line_content(orig, abs_ln)}",
+                   "acquire_lock : except BlockingIOError seul → fuite fd sur autre OSError")
 
 
 RULES = (rule_L01, rule_L05, rule_L07, rule_L09, rule_L10,

@@ -1,0 +1,85 @@
+{
+  "label": "A",
+  "source": "ablation/arm_a_lock_manager.py",
+  "findings": [
+    {
+      "lesson_id": "L-20260727T150500Z-01",
+      "category": "concurrency",
+      "severity": "P1",
+      "status": "absent",
+      "evidence": "ablation/arm_a_lock_manager.py: (flock présent — acquisition atomique kernel)",
+      "rule": "présence de fcntl.flock()"
+    },
+    {
+      "lesson_id": "L-20260727T150500Z-05",
+      "category": "resource-leak",
+      "severity": "P2",
+      "status": "present",
+      "evidence": "ablation/arm_a_lock_manager.py:34 os.unlink(lockfile_path)",
+      "rule": "os.unlink() présent → fichier de lock supprimé"
+    },
+    {
+      "lesson_id": "L-20260727T150500Z-07",
+      "category": "concurrency",
+      "severity": "P2",
+      "status": "absent",
+      "evidence": "ablation/arm_a_lock_manager.py:23 _locks[lockfile_path] = fd",
+      "rule": "fd stocké dans un dict [clé] (multi-verrous supporté)"
+    },
+    {
+      "lesson_id": "L-20260727T150500Z-09",
+      "category": "resource-leak",
+      "severity": "P2",
+      "status": "present",
+      "evidence": "ablation/arm_a_lock_manager.py:15 def acquire_lock(lockfile_path):",
+      "rule": "acquire_lock sans cache check → double acquire = fuite fd"
+    },
+    {
+      "lesson_id": "L-20260727T150500Z-10",
+      "category": "concurrency",
+      "severity": "P2",
+      "status": "present",
+      "evidence": "ablation/arm_a_lock_manager.py:23 _locks[lockfile_path] = fd",
+      "rule": "clé dict = paramètre brut 'lockfile_path' (pas de resolve) → mismatch relatif/absolu"
+    },
+    {
+      "lesson_id": "L-20260727T150500Z-12",
+      "category": "concurrency",
+      "severity": "P1",
+      "status": "present",
+      "evidence": "ablation/arm_a_lock_manager.py: (AUCUN register_at_fork — enfant hérite fds + dict)",
+      "rule": "absence de os.register_at_fork()"
+    },
+    {
+      "lesson_id": "L-20260727T150500Z-13",
+      "category": "concurrency",
+      "severity": "P1",
+      "status": "present",
+      "evidence": "ablation/arm_a_lock_manager.py:32 fcntl.flock(fd, fcntl.LOCK_UN)",
+      "rule": "LOCK_UN présent → déverrouille la file description partagée parent/enfant"
+    },
+    {
+      "lesson_id": "L-20260727T150500Z-16",
+      "category": "resource-leak",
+      "severity": "P2",
+      "status": "present",
+      "evidence": "ablation/arm_a_lock_manager.py:19 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)",
+      "rule": "acquire_lock : except BlockingIOError seul → fuite fd sur autre OSError"
+    }
+  ],
+  "stats": {
+    "total_defects": 6,
+    "distinct_categories_with_defect": 2,
+    "categories_with_defect": [
+      "concurrency",
+      "resource-leak"
+    ],
+    "p1_defects": 2,
+    "p1_defect_ids": [
+      "L-20260727T150500Z-12",
+      "L-20260727T150500Z-13"
+    ],
+    "covered_lessons_avoided": 2,
+    "total_applicable_lessons": 8
+  }
+}

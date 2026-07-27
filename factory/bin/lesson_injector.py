@@ -73,10 +73,19 @@ def load_memory(path: Path) -> List[dict]:
     """
     if not path.exists():
         raise InjectionError(f"fichier mémoire introuvable : {path}")
+    if not path.is_file():
+        # P1 Codex : un répertoire (ex: --memory memory) doit produire une
+        # erreur contrôlée, pas une traceback IsADirectoryError dans load_jsonl.
+        raise InjectionError(
+            f"mémoire n'est pas un fichier (répertoire ?) : {path}")
     try:
         return load_jsonl(path)
     except LessonError as e:
         raise InjectionError(f"mémoire invalide ({path}) : {e}") from e
+    except OSError as e:
+        # Filet de sécurité : toute autre erreur d'E/S (permissions, etc.)
+        # est convertie en erreur contrôlée, jamais de traceback nue.
+        raise InjectionError(f"mémoire illisible ({path}) : {e}") from e
 
 
 # --------------------------------------------------------- normalisation
@@ -266,6 +275,12 @@ def main(argv: List[str] = None) -> int:
         if not task_path.exists():
             print(f"lesson_injector: --task-file introuvable : {task_path}",
                   file=sys.stderr)
+            return 1
+        if not task_path.is_file():
+            # P1 Codex : un répertoire doit renvoyer rc=1 contrôlé, pas une
+            # traceback IsADirectoryError dans read_text().
+            print(f"lesson_injector: --task-file n'est pas un fichier "
+                  f"(répertoire ?) : {task_path}", file=sys.stderr)
             return 1
         task = task_path.read_text(encoding="utf-8")
     elif args.task is not None:

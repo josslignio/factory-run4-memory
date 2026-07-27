@@ -80,6 +80,13 @@ class TestMemory(unittest.TestCase):
         with self.assertRaises(InjectionError):
             load_memory(REPO / "memory" / "does_not_exist.jsonl")
 
+    def test_directory_memory_raises_injection_error(self):
+        # P1 Codex : --memory pointant vers un RÉPERTOIRE doit lever
+        # InjectionError (sortie contrôlée rc=1), PAS une traceback
+        # IsADirectoryError non gérée.
+        with self.assertRaises(InjectionError):
+            load_memory(REPO / "memory")  # répertoire, pas un .jsonl
+
 
 class TestSplitTriggers(unittest.TestCase):
     def test_semicolon_split(self):
@@ -350,6 +357,23 @@ class TestCli(unittest.TestCase):
     def test_missing_memory_returns_1(self):
         rc, _, err = self._capture(
             [TASK_BROAD, "--memory", "/tmp/run4_does_not_exist.jsonl",
+             "--format", "quiet"])
+        self.assertEqual(rc, 1)
+        self.assertIn("mémoire", err.lower())
+
+    def test_task_file_directory_returns_1(self):
+        # P1 Codex : --task-file pointant vers un RÉPERTOIRE doit retourner
+        # rc=1 (erreur contrôlée), PAS une traceback IsADirectoryError.
+        rc, _, err = self._capture(
+            ["--task-file", str(REPO / "memory"), "--format", "quiet"])
+        self.assertEqual(rc, 1)
+        self.assertIn("répertoire", err.lower() + "repertoire")
+
+    def test_memory_directory_returns_1(self):
+        # P1 Codex : --memory pointant vers un RÉPERTOIRE doit retourner
+        # rc=1 (erreur contrôlée), PAS une traceback IsADirectoryError.
+        rc, _, err = self._capture(
+            [TASK_BROAD, "--memory", str(REPO / "memory"),
              "--format", "quiet"])
         self.assertEqual(rc, 1)
         self.assertIn("mémoire", err.lower())

@@ -49,5 +49,24 @@ audit_ok "$TMP/ok";      chk "audit_ok_passes_good"      "$?" "0"
 audit_ok "$TMP/bad";     chk "audit_ok_rejects_bad"      "$?" "1"
 audit_ok "$TMP/missing"; chk "audit_ok_rejects_missing"  "$?" "1"
 
+# --- P0 finding 6 : state_kind — autorité UNIQUE des états. Aucun état invalide
+# n'est traité silencieusement comme RUNNING (build) ; tout état non listé ->
+# 'illegal' (le pilote fail-closed, ne répare jamais silencieusement). ---
+chk "kind_RUNNING"          "$(state_kind RUNNING)"                "build"
+chk "kind_READY_FOR_AUDIT"  "$(state_kind READY_FOR_FINAL_AUDIT)"  "audit"
+chk "kind_WAITING_INFRA"    "$(state_kind WAITING_INFRA)"          "infra_stop"
+chk "kind_WAITING_HUMAN_GO" "$(state_kind WAITING_HUMAN_BOSS_GO)"  "terminal"
+chk "kind_WAITING_HUMAN"    "$(state_kind WAITING_HUMAN)"          "terminal"
+chk "kind_FAIL"             "$(state_kind FAIL)"                   "terminal"
+chk "kind_DONE"             "$(state_kind DONE)"                   "terminal"
+chk "kind_MEMORY_FAIL"      "$(state_kind MEMORY_SYSTEM_FAIL)"     "terminal"
+# états illégaux -> 'illegal' (JAMAIS 'build' = jamais silencieusement RUNNING) :
+chk "kind_empty"            "$(state_kind '')"                     "illegal"
+chk "kind_bogus"            "$(state_kind BOGUS_STATE)"            "illegal"
+chk "kind_lowercase"        "$(state_kind running)"                "illegal"
+chk "kind_spaced"           "$(state_kind ' RUNNING')"             "illegal"
+chk "kind_typo"             "$(state_kind READY)"                  "illegal"
+chk "kind_unnormalized"     "$(state_kind 'CAMPAIGN_STATE=RUNNING')" "illegal"
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

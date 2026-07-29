@@ -84,6 +84,27 @@ read_phase() {
   esac
 }
 
+# --- P0 finding 6 : autorité UNIQUE des états (MASTER_ORDER § « MACHINE À ÉTATS »).
+# state_kind classifie un état lu dans CAMPAIGN_STATE en action LÉGALE. Toute
+# valeur non listée -> 'illegal' : le pilote ne répare JAMAIS silencieusement un
+# état invalide. (L'ancien code laissait un état inconnu tomber dans la boucle
+# de build = traité de fait comme RUNNING, ce qui était une réparation
+# silencieuse.) États légaux et leur action :
+#   RUNNING                       -> build   (continue vers la construction)
+#   READY_FOR_FINAL_AUDIT         -> audit   (audit double Claude + Codex)
+#   WAITING_INFRA                 -> infra_stop
+#   WAITING_HUMAN_BOSS_GO|WAITING_HUMAN|FAIL|DONE|MEMORY_SYSTEM_FAIL -> terminal
+# Testé par tests/test_driver_helpers.bash.
+state_kind() {
+  case "$1" in
+    RUNNING) printf 'build' ;;
+    READY_FOR_FINAL_AUDIT) printf 'audit' ;;
+    WAITING_INFRA) printf 'infra_stop' ;;
+    WAITING_HUMAN_BOSS_GO|WAITING_HUMAN|FAIL|DONE|MEMORY_SYSTEM_FAIL) printf 'terminal' ;;
+    *) printf 'illegal' ;;
+  esac
+}
+
 sha256_file() { python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1" 2>/dev/null; }
 
 # --- Verdict d audit par token EXACT en premiere ligne (PHASE_P0_PASS / PHASE_P1_PASS). ---
@@ -262,12 +283,12 @@ main() {
   for i in $(seq 1 $MAX_ITERS); do
   echo "$i" > "$ITER_FILE"
   ST=$(read_state)
-  case "$ST" in
-    WAITING_HUMAN_BOSS_GO|WAITING_HUMAN|FAIL|DONE|MEMORY_SYSTEM_FAIL)
+  case "$(state_kind "$ST")" in
+    terminal)
       echo "[$(date -u +%FT%TZ)] STATE=$ST -> arret pilote (iter $i)" >> "$LOG"; exit 0 ;;
-    WAITING_INFRA)
+    infra_stop)
       echo "[$(date -u +%FT%TZ)] STATE=WAITING_INFRA -> arret pilote (quota/reseau, iter $i)" >> "$LOG"; exit 0 ;;
-    READY_FOR_FINAL_AUDIT)
+    audit)
       PHASE=$(read_phase) || { echo "[$(date -u +%FT%TZ)] phase invalide dans $PHASE_FILE -> arret fail-closed (aucune reinit silencieuse)" >> "$LOG"; exit 1; }
       if [ "$PHASE" = "P0" ]; then
         PHASE_NOTE="AUDIT DE PHASE P0 UNIQUEMENT : verifie que les 6 findings P0 (source-tag/evidence, finding vide fail-closed, ecriture concurrente bootstrap, credit fd comportemental, claim ablation honnete, machine a etats) sont fermes par des tests reels, et qu AUCUN changement de phase P1 (receipt, promotion automatique) n a ete introduit avant le checkpoint. PREMIERE LIGNE de ta reponse : EXACTEMENT PHASE_P0_PASS si tout est ferme et prouve, sinon EXACTEMENT PHASE_P0_FAIL suivi des findings."
@@ -321,6 +342,15 @@ $FINAL_AUDIT_PROMPT" > "$AUDIT_CODEX" 2>>"$LOG" \
       echo "RUNNING" > "$STATE_FILE"
       echo "[$(date -u +%FT%TZ)] audits phase $PHASE non-OK (round $audit_repairs) -> findings routes vers review, STATE=RUNNING, boucle" >> "$LOG"
       continue ;;
+    build)
+      : ;;   # RUNNING (etat nominal) -> on continue vers la boucle de build
+    illegal)
+      # P0 finding 6 : etat INCONNU/illegal dans CAMPAIGN_STATE. Le pilote ne le
+      # repare JAMAIS silencieusement (l'ancien code le laissait tomber a la
+      # boucle de build = traite comme RUNNING). Fail-closed + message clair.
+      echo "[$(date -u +%FT%TZ)] STATE='$ST' INCONNU/illegal dans $STATE_FILE -> arret fail-closed (aucune reparation silencieuse). Etats legaux : RUNNING, READY_FOR_FINAL_AUDIT, WAITING_INFRA, WAITING_HUMAN_BOSS_GO, WAITING_HUMAN, FAIL, DONE, MEMORY_SYSTEM_FAIL (cf. MASTER_ORDER MACHINE A ETATS)." >> "$LOG"
+      echo "Etat illegal '$ST' dans $STATE_FILE -> arret fail-closed (voir MASTER_ORDER § MACHINE A ETATS). Aucune reinitialisation silencieuse ; corriges l'etat a la main si voulu." >&2
+      exit 1 ;;
   esac
 
   # --- Ordre fusionne 29/07 (P1.4 cote driver) : memoire fail-closed AVANT tout appel agent. ---

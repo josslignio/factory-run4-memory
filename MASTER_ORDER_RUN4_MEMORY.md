@@ -71,8 +71,15 @@ Cette section est la SEULE autorité des états, phases et transitions du pilote
 - `factory/campaigns/PILOT_ITER` — numéro d'itération courant (consommé par le heartbeat).
 - `$HOME/.factory-receipts/factory-run4-memory/` — receipts hors du repo : `resume_receipt.json`, `checkpoint_p0/` (checkpoint.json + copies des 2 audits + leurs SHA-256), verrou `driver.lock.d/`. Séparés du worktree et protégés par le séquencement, mais PAS tamper-proof face à un processus du même utilisateur macOS (limite V1 assumée et documentée).
 
-### États autorisés
-`RUNNING`, `READY_FOR_FINAL_AUDIT` (transition interne, écrite par le builder en fin de phase), `WAITING_INFRA`, `WAITING_HUMAN_BOSS_GO` (terminal succès), `FAIL` (terminal échec), `MEMORY_SYSTEM_FAIL` (terminal : mémoire de leçons invalide ou injecteur en panne — aucun agent n'est appelé dans cet état).
+### États autorisés (autorité unique, appliquée par `state_kind` dans `run_run4_autonomous.sh`)
+Tout état lu dans `CAMPAIGN_STATE` hors de cette liste est `illegal` : le pilote s'arrête en **fail-closed** (jamais de réparation silencieuse en `RUNNING`). La fonction `state_kind` du pilote est l'implémentation exacte de cette liste (testée par `tests/test_driver_helpers.bash`).
+- `RUNNING` → `build` (construction).
+- `READY_FOR_FINAL_AUDIT` (transition interne, écrite par le builder en fin de phase) → `audit` double.
+- `WAITING_INFRA` → `infra_stop` (arrêt quota/réseau).
+- `WAITING_HUMAN_BOSS_GO` (terminal succès, fin de run) ; `WAITING_HUMAN` (terminal : attente humaine générique).
+- `FAIL` (terminal échec, après épuisement du budget de repair).
+- `DONE` (terminal succès, campagne complète).
+- `MEMORY_SYSTEM_FAIL` (terminal : mémoire de leçons invalide ou injecteur en panne — aucun agent n'est appelé dans cet état).
 
 ### Transitions légales
 - `RUNNING → READY_FOR_FINAL_AUDIT` (builder, fin de phase) → audit double (Claude + Codex, tokens exacts en première ligne : `PHASE_P0_PASS`/`PHASE_P0_FAIL` en P0, `PHASE_P1_PASS`/`PHASE_P1_FAIL` en P1).

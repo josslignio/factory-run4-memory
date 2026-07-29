@@ -420,11 +420,18 @@ def rule_L13(code: str, orig: str, path: str) -> Finding:
 
 
 def rule_L16(code: str, orig: str, path: str) -> Finding:
-    """L-16 (P2, resource-leak) : except BlockingIOError seul.
-    Defect present si `except BlockingIOError` apparaît dans acquire_lock
-    SANS un filet large (finally ou except BaseException/Exception + close)
-    DANS LE MÊME acquire_lock. Scope-aware : un `except OSError` dans le
-    hook fork ne compte pas (sinon faux positif crédité à tort)."""
+    """L-16 (P2, resource-leak) : except BlockingIOError SANS fermeture réelle.
+
+    P0 finding 4 : un filet large (`except BaseException/Exception/OSError` ou
+    `finally`) n'est crédité comme sûr QUE s'il ferme RÉELLEMENT le fd dans
+    acquire_lock — c'est le COMPORTEMENT RÉEL qui compte (un fd réellement
+    fermé), pas la simple présence d'un `except OSError` générique. Un mutant
+    `except OSError: return False` qui retourne sans fermer doit donc être
+    marqué DEFECT (present) : il fuit réellement le fd (prouvé en comportement
+    réel par test_ablation_checker.TestRuleL16BehavioralFdLeak).
+
+    Scope-aware : on ne regarde QUE le corps de acquire_lock (un `except
+    OSError` dans le hook fork ne compte pas — sinon faux positif crédité)."""
     body = _func_body(code, "acquire_lock")
     if not body:
         return Finding("L-20260727T150500Z-16", "resource-leak", "P2",
@@ -435,18 +442,31 @@ def rule_L16(code: str, orig: str, path: str) -> Finding:
         return Finding("L-20260727T150500Z-16", "resource-leak", "P2",
                        "absent", f"{path}: (pas de except BlockingIOError dans acquire_lock)",
                        "aucun except BlockingIOError isolé dans acquire_lock")
-    has_wide = bool(re.search(r"except\s+(BaseException|Exception|OSError)", body) or
-                    re.search(r"finally\s*:\s*\n\s*os\.close", body))
     # offset absolu pour evidence (corps démarre APRÈS la ligne `def`)
     abs_ln = _body_abs_line(code, "acquire_lock", ln_rel)
-    if has_wide:
+    # Filet large = except BaseException/Exception/OSError OU finally. Sa
+    # simple présence NE SUFFIT PAS (un `except OSError: return False` sans
+    # close est un filet qui fuit).
+    has_wide = bool(re.search(r"except\s+(BaseException|Exception|OSError)", body)
+                    or re.search(r"\bfinally\s*:", body))
+    # Fermeture RÉELLE du fd dans acquire_lock : os.close( / .close( / un
+    # contexte `with` (os.fdopen). C'est le comportement réel (fd fermé) qui
+    # rend le filet sûr — on ne crédite plus un `except OSError` générique.
+    has_real_close = bool(
+        re.search(r"\bos\.close\s*\(", body)
+        or re.search(r"\.\s*close\s*\(", body)
+        or re.search(r"\bwith\s+os\.fdopen\s*\(", body)
+    )
+    if has_wide and has_real_close:
         return Finding("L-20260727T150500Z-16", "resource-leak", "P2",
                        "absent",
                        f"{path}:{abs_ln} {_line_content(orig, abs_ln)}",
-                       "filet large présent dans acquire_lock (finally/except large + close)")
+                       "filet large ET fermeture réelle du fd (os.close/.close/"
+                       "with) dans acquire_lock")
     return Finding("L-20260727T150500Z-16", "resource-leak", "P2", "present",
                    f"{path}:{abs_ln} {_line_content(orig, abs_ln)}",
-                   "acquire_lock : except BlockingIOError seul → fuite fd sur autre OSError")
+                   "acquire_lock : except BlockingIOError SANS fermeture réelle "
+                   "du fd dans un filet large → fuite fd sur autre OSError")
 
 
 RULES = (rule_L01, rule_L05, rule_L07, rule_L09, rule_L10,

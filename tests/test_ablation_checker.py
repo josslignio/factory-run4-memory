@@ -438,5 +438,136 @@ class TestSummary(unittest.TestCase):
                          "le snippet sain ne doit avoir AUCUN défaut P1")
 
 
+# ===================================================================
+# P0 finding 4 : rule_L16 mesure le COMPORTEMENT RÉEL (fd réellement fermé),
+# ne crédite plus un `except OSError` générique.
+# ===================================================================
+
+# Mutant statique : `except OSError: return False` SANS fermer le fd. L'ancien
+# rule_L16 créditait à tort ceci comme sûr (présence d'un filet large). Le
+# détecteur durci doit le marquer DEFECT (present) car le fd fuit réellement.
+MUTANT_NO_CLOSE = '''
+import os, fcntl
+_LOCK_FDS = {}
+
+def acquire_lock(lockfile):
+    key = lockfile
+    if key in _LOCK_FDS:
+        return True
+    fd = os.open(lockfile, os.O_CREAT | os.O_WRONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    except OSError:
+        return False
+    _LOCK_FDS[key] = fd
+    return True
+'''
+
+
+class TestRuleL16MutantNoClose(unittest.TestCase):
+    """Un mutant `except OSError: return False` qui ne ferme PAS le fd doit
+    être détecté comme DEFECT (NON-ok). C'était le défaut central du créditage
+    générique d'un `except OSError`."""
+
+    def test_mutant_returning_false_without_close_is_defect(self):
+        findings = run_checker(MUTANT_NO_CLOSE)
+        f = _find(findings, "-16")
+        self.assertEqual(f.status, "present",
+                         f"un mutant 'return False sans fermer' doit être "
+                         f"DEFECT (present), eu {f.status}: {f}")
+
+
+class _FdTracker:
+    """Compteur réel de fd ouverts/fermés, injecté à la place de os.open /
+    os.close pour mesurer le COMPORTEMENT RÉEL (fuite ou non) sans toucher aux
+    ressources OS. C'est le 'compteur de fd ouverts' exigé par le finding 4."""
+    def __init__(self):
+        self.open_count = 0
+        self.close_count = 0
+        self._next = 3
+
+    def open(self, path):
+        self.open_count += 1
+        self._next += 1
+        return self._next
+
+    def close(self, fd):
+        self.close_count += 1
+
+
+class TestRuleL16BehavioralFdLeak(unittest.TestCase):
+    """Le jugement de la règle L-16 est ancré dans le COMPORTEMENT RÉEL : on
+    exécute vraiment un acquire_lock SÛR (filet large + os.close) et un MUTANT
+    (`return False` sans fermer), en faisant lever une OSError NON bloquante
+    par flock, et on compte les fd ouverts. Seul le mutant fuit.
+
+    Prouve que 'return False sans fermer' = fuite RÉELLE de fd, donc le
+    détecteur a raison de le marquer DEFECT."""
+
+    @staticmethod
+    def _raise_plain_oserror(fd):
+        # Une OSError NON-BlockingIOError (ex: ENOTSUP/EOPNOTSUPP sur FS non
+        # supporté) — c'est le chemin de fuite que L-16 doit détecter.
+        raise OSError("simulated non-blocking oserror (leak path)")
+
+    @staticmethod
+    def _safe_acquire(lockfile, tracker, flock_fn):
+        # fix_pattern L-16 : filet large + os.close RÉEL.
+        fd = tracker.open(lockfile)
+        try:
+            flock_fn(fd)
+        except BlockingIOError:
+            tracker.close(fd)
+            return False
+        except BaseException:
+            tracker.close(fd)
+            raise
+        return fd
+
+    @staticmethod
+    def _mutant_acquire(lockfile, tracker, flock_fn):
+        # MUTANT : `except OSError: return False` SANS close.
+        fd = tracker.open(lockfile)
+        try:
+            flock_fn(fd)
+        except BlockingIOError:
+            return False
+        except OSError:
+            return False
+        return fd
+
+    def test_safe_version_closes_fd_no_leak(self):
+        tracker = _FdTracker()
+        with self.assertRaises(OSError):
+            self._safe_acquire("x.lock", tracker, self._raise_plain_oserror)
+        self.assertEqual(tracker.open_count, 1)
+        self.assertEqual(tracker.close_count, 1,
+                         "la version sûre doit fermer le fd (close==open)")
+        self.assertEqual(tracker.open_count - tracker.close_count, 0,
+                         "aucun fd restant ouvert (pas de fuite)")
+
+    def test_mutant_leaks_fd(self):
+        tracker = _FdTracker()
+        result = self._mutant_acquire("x.lock", tracker, self._raise_plain_oserror)
+        self.assertFalse(result, "le mutant retourne False")
+        self.assertEqual(tracker.open_count, 1)
+        self.assertEqual(tracker.close_count, 0,
+                         "le mutant ne ferme JAMAIS le fd")
+        self.assertEqual(tracker.open_count - tracker.close_count, 1,
+                         "1 fd reste ouvert = fuite réelle -> DEFECT légitime")
+
+    def test_detector_judgment_matches_real_behavior(self):
+        # Cohérence : le détecteur marque MUTANT_NO_CLOSE comme DEFECT ET le
+        # comportement réel prouve la fuite. Les deux s'accordent.
+        f = _find(run_checker(MUTANT_NO_CLOSE), "-16")
+        self.assertEqual(f.status, "present")
+        tracker = _FdTracker()
+        self._mutant_acquire("x.lock", tracker, self._raise_plain_oserror)
+        self.assertGreater(tracker.open_count - tracker.close_count, 0,
+                           "le mutant fuit réellement -> le DEFECT est justifié")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

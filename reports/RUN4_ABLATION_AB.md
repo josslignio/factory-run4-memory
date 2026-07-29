@@ -5,8 +5,9 @@
 > déterministe, stdlib, scan statique, 8 règles validées par
 > `tests/test_ablation_checker.py` 22/22 OK). Aucun chiffre inventé.
 > Trace d'exécution datée et reproductible archivée dans
-> `ablation/ABLATION_RUN_LOG.txt` (append-only, 2 blocs : run initial +
-> re-run post-durcissement round-2).
+> `ablation/ABLATION_RUN_LOG.txt` (append-only **par convention d'écriture**,
+> NON tamper-evident, NON scellé cryptographiquement — voir §8 ; 2 blocs :
+> run initial + re-run post-durcissement round-2).
 
 ## 1. Protocole (figé AVANT exécution — `ablation/PROTOCOL.md`)
 
@@ -131,21 +132,42 @@ rappel de l'injecteur, pas du mécanisme de mémoire lui-même.
 - **Reproductibilité** : les chiffres ci-dessus sont reproductibles
   exactement via `python3 factory/bin/ablation_checker.py
   ablation/arm_{a,b}_lock_manager.py --json` (JSON archivés dans
-  `ablation/arm_{a,b}_measurements.json`). Une **trace d'exécution datée
-  et append-only** (`ablation/ABLATION_RUN_LOG.txt`) capture l'horodatage
-  UTC, le hash HEAD du repo et la sortie complète du checker pour chaque
-  exécution — exigence de traçabilité du contre-audit Codex satisfaite.
+  `ablation/arm_{a,b}_measurements.json`). Une **trace d'exécution datée**,
+  append-only **par convention d'écriture** (`ablation/ABLATION_RUN_LOG.txt`),
+  capture l'horodatage UTC, le hash HEAD du repo et la sortie complète du
+  checker pour chaque exécution. **Honnêtement** : cette trace n'est PAS
+  tamper-evident et n'est PAS scellée cryptographiquement (fichier texte
+  ordinaire — voir §8) ; l'exigence de traçabilité du contre-audit est
+  satisfaite au niveau « repère daté + reproductible », pas au niveau
+  « preuve d'intégrité ».
 
-## 8. Traçabilité de l'exécution (contre-audit Codex P1 #2)
+## 8. Traçabilité de l'exécution (contre-audit Codex P1 #2) — honnêteté V1
 
-Le contre-audit a exigé une trace horodatée/non modifiable, pas seulement
+Le contre-audit demandait une trace horodatée des exécutions, pas seulement
 la cohérence statique des JSON archivés. Celle-ci vit dans
-`ablation/ABLATION_RUN_LOG.txt` (append-only) :
+`ablation/ABLATION_RUN_LOG.txt`. **Honnêtement (limite V1 assumée)** :
 
-- en-tête daté (UTC ISO8601), hôte, version Python, hash HEAD du repo ;
-- sortie JSON complète du checker pour chaque bras ;
-- ligne de verdict consolidée (`p1 A->B`, `total A->B`).
+- Le fichier est **append-only PAR CONVENTION D'ÉCRITURE seulement** : chaque
+  exécution (ajoutée manuellement — voir ci-dessous) y inscrit un bloc daté. Il
+  **n'est PAS tamper-evident** et **n'est PAS cryptographiquement scellé** : c'est
+  un fichier texte ordinaire, modifiable par tout processus du même utilisateur
+  macOS (même limite V1 que les receipts documentée dans MASTER_ORDER §« MACHINE
+  À ÉTATS »). **Aucun chaînage cryptographique n'a été construit** (et on n'en
+  prétend pas un) : cela sortirait du périmètre stdlib/honnête de Run 4.
+- Le `hash HEAD du repo` consigné dans l'en-tête prouve **quel commit a
+  produit** chaque exécution (reproductibilité) ; il **ne scelle pas** le
+  fichier de trace contre une modification ultérieure. C'est un repère
+  de reproductibilité, pas une garantie d'intégrité.
+- Contenu d'un bloc : en-tête daté (UTC ISO8601), hôte, version Python, hash
+  HEAD du repo ; sortie JSON complète du checker pour chaque bras ; ligne de
+  verdict consolidée (`p1 A->B`, `total A->B`).
 
-Commande pour rejouer et appender un nouveau bloc daté :
+**Reproduction vs journal** : la commande
 `python3 factory/bin/ablation_checker.py ablation/arm_{a,b}_lock_manager.py --json`
-(exécutée dans le bloc `===== RUN <ts> =====` du fichier de trace).
+rejoue la mesure et imprime le JSON sur stdout (JSON aussi archivés dans
+`ablation/arm_{a,b}_measurements.json`). En revanche, **aucun script n'écrit ni
+n'appende automatiquement** `ABLATION_RUN_LOG.txt` : l'ajout d'un bloc daté
+(`===== RUN <ts> =====`) est une opération **manuelle** (un humain recopie la
+sortie datée dans le journal). Cohérent avec la limite V1 ci-dessus (journal non
+scellé, non tamper-evident) : la traçabilité repose sur la reproductibilité de
+la commande + le repère de commit, pas sur un mécanisme automatique d'intégrité.

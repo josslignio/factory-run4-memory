@@ -57,3 +57,30 @@ Protocole à figer AVANT l'exécution (même discipline que M5 §16) :
 
 ---
 *Rappel process (rituel de review, appliqué automatiquement par le driver headless — voir `run_run4_autonomous.sh`) : GLM construit une tranche → commit → Claude ET Codex review cette tranche EN PARALLÈLE, chacun indépendamment (diff uniquement, rapide) → si l'un des deux relève un P1/High reproduit, GLM le fixe avant de continuer → à la toute fin du run, Claude ET Codex font CHACUN un audit exhaustif indépendant de l'intégralité du code produit (pas juste le dernier diff) avant de passer en `WAITING_HUMAN_BOSS_GO`. Ni Claude ni Codex ne construisent jamais — seul GLM écrit du code produit (séparation constructeur/contrôleur stricte, règle 2).*
+
+---
+
+## MACHINE À ÉTATS — AUTORITÉ UNIQUE (mise à jour preflight du 29/07/2026, contre-relecture GPT intégrée)
+
+Cette section est la SEULE autorité des états, phases et transitions du pilote `run_run4_autonomous.sh`. Toute valeur ou transition non listée ici est illégale et doit échouer fail-closed (le pilote ne répare jamais silencieusement un état invalide).
+
+### Fichiers d'état
+- `factory/campaigns/CAMPAIGN_STATE` — état du run.
+- `factory/campaigns/CAMPAIGN_PHASE` — phase courante : `P0` (réparation des 6 défauts du cœur) ou `P1` (Sharp Core minimal). Aucune autre valeur. Jamais réinitialisée silencieusement.
+- `factory/campaigns/PILOT_HEARTBEAT` — JSON écrit toutes les 60 s par une boucle de fond indépendante des appels agents (timestamp, pid, state, phase, iter). Preuve de vie, PAS preuve de réussite.
+- `factory/campaigns/PILOT_ITER` — numéro d'itération courant (consommé par le heartbeat).
+- `$HOME/.factory-receipts/factory-run4-memory/` — receipts hors du repo : `resume_receipt.json`, `checkpoint_p0/` (checkpoint.json + copies des 2 audits + leurs SHA-256), verrou `driver.lock.d/`. Séparés du worktree et protégés par le séquencement, mais PAS tamper-proof face à un processus du même utilisateur macOS (limite V1 assumée et documentée).
+
+### États autorisés
+`RUNNING`, `READY_FOR_FINAL_AUDIT` (transition interne, écrite par le builder en fin de phase), `WAITING_INFRA`, `WAITING_HUMAN_BOSS_GO` (terminal succès), `FAIL` (terminal échec), `MEMORY_SYSTEM_FAIL` (terminal : mémoire de leçons invalide ou injecteur en panne — aucun agent n'est appelé dans cet état).
+
+### Transitions légales
+- `RUNNING → READY_FOR_FINAL_AUDIT` (builder, fin de phase) → audit double (Claude + Codex, tokens exacts en première ligne : `PHASE_P0_PASS`/`PHASE_P0_FAIL` en P0, `PHASE_P1_PASS`/`PHASE_P1_FAIL` en P1).
+- Audit P0 double-PASS → checkpoint P0 figé (commit, worktree, SHA-256 des audits) → `CAMPAIGN_PHASE=P1`, budget de repair réinitialisé, `RUNNING`.
+- Audit P1 double-PASS → `WAITING_HUMAN_BOSS_GO` → arrêt. La suite (merge) est 100 % humaine.
+- Audit non-PASS → repair round (budget : `MAX_P0_REPAIR=4`, `MAX_P1_REPAIR=4` par phase) ; budget épuisé → `FAIL`.
+- `FAIL → RUNNING` : UNIQUEMENT via `RESUME_AFTER_FAIL=1` explicite, avec `resume_receipt.json` écrit (old_state, new_state, phase, commit, timestamp, reason). Reprise phase-aware : phase absente → reprise legacy en P0 (loggée) ; phase P0 → reprise P0 ; phase P1 → reprise P1 SEULEMENT si le checkpoint P0 se re-vérifie (hashes recalculés) ; phase inconnue ou checkpoint invalide → refus.
+- Mémoire de leçons : avant chaque itération builder, `lesson_injector.py --format quiet` est exécuté. Contrat strict : rc=0, ou rc=2 avec stderr vide (= mémoire valide, aucune leçon pertinente). Tout autre résultat → `MEMORY_SYSTEM_FAIL`. Note documentée : en V1, les reviewers de tranche reçoivent le diff, pas d'injection de leçons — la garde mémoire couvre le chemin builder.
+
+### Verrou d'exécution
+Verrou atomique par `mkdir` (`driver.lock.d/` avec pid + commit), détenu toute la vie du driver, libéré par trap EXIT. C'est la SEULE autorité anti-double-pilote (`pgrep` est un diagnostic non bloquant). Verrou présent avec PID actif → refus. Verrou stale (PID inactif) → refus avec instruction de suppression manuelle, jamais d'auto-nettoyage (risque de PID recyclé).

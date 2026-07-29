@@ -178,8 +178,18 @@ def parse_findings(text: str) -> List[Dict[str, str]]:
                 raise ExtractionError(
                     f"ligne {lineno}: `[/FINDING]` sans `[FINDING]` ouvrant"
                 )
-            if current:
-                blocks.append(current)
+            # Fail-closed (P0) : un bloc [FINDING][/FINDING] vide (aucune clé
+            # `clé: valeur`) fait échouer TOUTE l'extraction. L'ancien code
+            # sautait silencieusement un bloc vide (`if current:`) -> un
+            # rapport contenant un bloc vide était accepté à tort. On refuse
+            # désormais : un bloc ouvert doit contenir au moins une clé.
+            if not current:
+                raise ExtractionError(
+                    f"ligne {lineno}: bloc `[FINDING]...[/FINDING]` vide "
+                    f"(aucune clé `clé: valeur`) — fail-closed, l'extraction "
+                    f"entière est refusée"
+                )
+            blocks.append(current)
             in_block = False
             current = None
             current_key = None
@@ -320,6 +330,60 @@ def build_lesson(block: Dict[str, str], extraction_ts: str, seq: int) -> dict:
     }
     # Double-défense : le validateur du schéma doit aussi PASSER (ex: il
     # vérifie qu'il y a bien un repère fichier:ligne dans evidence).
+    validate_lesson(lesson)
+    return lesson
+
+
+# ----------------------------------------------- source-tag (P0 finding 1)
+def assert_source_evidence_coherent(lesson: dict) -> None:
+    """Vérifie la cohérence source/evidence d'une leçon.
+
+    Le champ `evidence` est construit (cf. build_lesson) comme
+    `<source>:<file>:<line>[ — test: <test>]`. Une leçon dont la `source`
+    a été changée sans remettre à jour le préfixe d'`evidence` est
+    INCOHÉRENTE (le repère ne pointe plus vers la source annoncée) et doit
+    être refusée. On exige donc qu'`evidence` commence exactement par
+    `<source>:`.
+    """
+    src = lesson["source"]
+    ev = lesson["evidence"]
+    if not isinstance(src, str) or not src:
+        raise ExtractionError(
+            f"source vide ou non-str — coherence impossible : {src!r}")
+    if not isinstance(ev, str) or not ev.startswith(src + ":"):
+        raise ExtractionError(
+            f"cohérence source/evidence rompue : source={src!r} mais "
+            f"evidence ne commence pas par {src + ':'!r} — evidence={ev!r}")
+
+
+def apply_source_tag(lesson: dict, new_source: str) -> dict:
+    """Applique `--source-tag` à une leçon (P0 finding 1).
+
+    1. Normalise `new_source` par strip().
+    2. Refuse vide / espaces seul (ExtractionError -> rc!=0).
+    3. Remplace `source` ET réécrit le préfixe d'`evidence` pour que la
+       cohérence source/evidence soit préservée (sinon leçon incohérente).
+    4. Vérifie la cohérence (assert_source_evidence_coherent).
+    5. RE-valide la leçon modifiée (validate_lesson) — défense en
+       profondeur : un --source-tag ne doit jamais produire une leçon
+       invalide même si l'extraction initiale était valide.
+    """
+    tag = new_source.strip()
+    if not tag:
+        raise ExtractionError(
+            "--source-tag vide ou réduit à des espaces après strip() ; "
+            "valeur refusée")
+    old = lesson.get("source", "")
+    ev = lesson.get("evidence", "")
+    # Réécriture du préfixe d'evidence : <old>:... -> <tag>:... pour garder
+    # la cohérence. Si l'ancien préfixe n'est pas trouvé, on laisse
+    # l'evidence telle quelle -> la vérification de cohérence qui suit
+    # échouera proprement (leçon incohérente refusée).
+    if old and ev.startswith(old + ":"):
+        ev = tag + ":" + ev[len(old) + 1:]
+    lesson["source"] = tag
+    lesson["evidence"] = ev
+    assert_source_evidence_coherent(lesson)
     validate_lesson(lesson)
     return lesson
 
@@ -474,10 +538,19 @@ def main(argv: List[str] = None) -> int:
 
     try:
         lessons = extract_lessons(text, extraction_ts=args.extraction_ts)
-        # P3 audit Codex : --source-tag était exposé mais jamais appliqué.
-        if args.source_tag:
+        # P0 finding 1 : --source-tag normalisé (strip), refusé si vide/espaces,
+        # appliqué AVANT la validation finale puis RE-validé, avec vérification
+        # de la cohérence source/evidence. L'ancien code se contentait de
+        # `l["source"] = args.source_tag` sans strip, sans contrôle vide, sans
+        # re-validation et sans vérifier la cohérence avec evidence.
+        if args.source_tag is not None:
+            # Normalisation + refus vide/espaces tôt (message clair).
+            tag = args.source_tag.strip()
+            if not tag:
+                raise ExtractionError(
+                    "--source-tag vide ou réduit à des espaces ; valeur refusée")
             for l in lessons:
-                l["source"] = args.source_tag
+                apply_source_tag(l, tag)
     except (ExtractionError, LessonError) as e:
         print(f"lesson_extractor: ECHEC — {e}", file=sys.stderr)
         return 1

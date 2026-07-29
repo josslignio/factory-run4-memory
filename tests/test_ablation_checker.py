@@ -725,11 +725,81 @@ class TestRuleL16ExecutesControlledSource(unittest.TestCase):
         # COMPORTEMENT RÉEL exécuté du source contrôlé.
         for src, expected in ((MUTANT_NO_CLOSE, "present"),
                               (MUTANT_UNRELATED_CLOSE, "present"),
+                              (MUTANT_DEAD_CODE_CLOSE, "present"),
                               (SAFE_ACQUIRE_WIDE_CLOSE, "absent")):
             f = _find(run_checker(src), "-16")
             self.assertEqual(f.status, expected,
                              f"juge statique {expected} != {f.status} pour "
                              f"le source exécuté: {f}")
+
+
+# ===================================================================
+# P0 finding 4 (round 4, contre-audit Codex) : règle COMPORTEMENTALE.
+# Une fermeture MORTELLE `if False: os.close(fd)` porte l'occurrence textuelle
+# `os.close(fd)` mais ne ferme JAMAIS le fd en réalité. L'ancienne règle
+# (textuelle) la créditait à tort comme sûre (FAUX NÉGATIF). La règle
+# comportementale DOIT la marquer DEFECT (present), car le fd fuit réellement.
+# ===================================================================
+
+MUTANT_DEAD_CODE_CLOSE = '''
+import os, fcntl
+
+_LOCK_FDS = {}
+
+def acquire_lock(lockfile):
+    key = lockfile
+    if key in _LOCK_FDS:
+        return True
+    fd = os.open(lockfile, os.O_CREAT | os.O_WRONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    except OSError:
+        if False:
+            os.close(fd)   # fermeture MORTELLE — fd fuit réellement
+        return False
+    _LOCK_FDS[key] = fd
+    return True
+'''
+
+
+class TestRuleL16DeadCodeCloseMutant(unittest.TestCase):
+    """La régression signalée par le contre-audit Codex (round 4) : un mutant
+    dont la fermeture est textuellement présente (`os.close(fd)`) mais derrière
+    un `if False:` (code mort) fuit RÉELLEMENT le fd. La règle comportementale
+    doit le marquer DEFECT (present) — ce qu'une analyse textuelle ne pouvait
+    pas faire (faux négatif)."""
+
+    def test_dead_code_close_is_defect(self):
+        f = _find(run_checker(MUTANT_DEAD_CODE_CLOSE), "-16")
+        self.assertEqual(f.status, "present",
+                         f"une fermeture mortelle `if False: os.close(fd)` doit "
+                         f"être DEFECT (present), eu {f.status}: {f}")
+
+    def test_dead_code_close_really_leaks_fd(self):
+        # Preuve comportementale : on exécute RÉELLEMENT le source (avec faux
+        # os/fcntl où flock lève une OSError non-bloquante) et on compte les fd.
+        # La fermeture étant morte, le fd fuit (close_count == 0).
+        tracker = _FdTracker()
+        mod = __import__("types").ModuleType("uut")
+        exec(compile(MUTANT_DEAD_CODE_CLOSE, "<uut>", "exec"), mod.__dict__)
+        mod.os = _ExecOs(tracker)
+        mod.fcntl = _ExecFcntlLeak
+        rc = mod.acquire_lock("x.lock")
+        self.assertFalse(rc, "le mutant retourne False (filet large sans close)")
+        self.assertEqual(tracker.open_count, 1)
+        self.assertEqual(tracker.close_count, 0,
+                         "la fermeture `if False:` ne s'exécute jamais -> le fd "
+                         "fuit réellement (close==0), DEFECT justifié")
+
+    def test_safe_wide_close_still_ok(self):
+        # Non-régression : la version SÛRE (filet large + os.close(fd) réel)
+        # reste marquée ok (absent) — pas de faux positif introduit.
+        f = _find(run_checker(SAFE_ACQUIRE_WIDE_CLOSE), "-16")
+        self.assertEqual(f.status, "absent",
+                         f"os.close(fd) réel dans un filet large doit rester ok, "
+                         f"eu {f.status}: {f}")
 
 
 class TestCheckerReadFailureIsClean(unittest.TestCase):

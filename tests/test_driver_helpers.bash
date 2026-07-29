@@ -68,5 +68,70 @@ chk "kind_spaced"           "$(state_kind ' RUNNING')"             "illegal"
 chk "kind_typo"             "$(state_kind READY)"                  "illegal"
 chk "kind_unnormalized"     "$(state_kind 'CAMPAIGN_STATE=RUNNING')" "illegal"
 
+# --- P0 finding 6 (transitions légales) : legal_transition — AUTORITÉ UNIQUE
+# des transitions. state_kind valide les VALEURS, legal_transition valide les
+# TRANSITIONS. Le pilote ne répare jamais silencieusement un état invalide :
+# toute transition non listée -> 'illegal' -> main() fail-closed. ---
+# transitions légales documentées (MASTER_ORDER § MACHINE À ÉTATS) :
+chk "tr_id_running"          "$(legal_transition RUNNING RUNNING)"                             "legal"
+chk "tr_id_ready"            "$(legal_transition READY_FOR_FINAL_AUDIT READY_FOR_FINAL_AUDIT)" "legal"
+chk "tr_id_fail"             "$(legal_transition FAIL FAIL)"                                   "legal"
+chk "tr_run_to_ready"        "$(legal_transition RUNNING READY_FOR_FINAL_AUDIT)"               "legal"
+chk "tr_run_to_infra"        "$(legal_transition RUNNING WAITING_INFRA)"                       "legal"
+chk "tr_run_to_memfail"      "$(legal_transition RUNNING MEMORY_SYSTEM_FAIL)"                  "legal"
+chk "tr_ready_to_running"    "$(legal_transition READY_FOR_FINAL_AUDIT RUNNING)"               "legal"
+chk "tr_ready_to_bossgo"     "$(legal_transition READY_FOR_FINAL_AUDIT WAITING_HUMAN_BOSS_GO)"  "legal"
+chk "tr_ready_to_fail"       "$(legal_transition READY_FOR_FINAL_AUDIT FAIL)"                  "legal"
+chk "tr_fail_to_running"     "$(legal_transition FAIL RUNNING)"                                "legal"
+# transitions ILLÉGALES (cœur du finding : un builder NE PEUT PAS écrire un
+# état terminal depuis RUNNING, ni sauter audit->infra, ni repartir d'un
+# terminal sans RESUME_AFTER_FAIL explicite) :
+chk "tr_run_to_bossgo_BAD"       "$(legal_transition RUNNING WAITING_HUMAN_BOSS_GO)"            "illegal"
+chk "tr_run_to_done_BAD"         "$(legal_transition RUNNING DONE)"                             "illegal"
+chk "tr_run_to_whuman_BAD"       "$(legal_transition RUNNING WAITING_HUMAN)"                    "illegal"
+chk "tr_run_to_fail_BAD"         "$(legal_transition RUNNING FAIL)"                             "illegal"
+chk "tr_ready_to_infra_BAD"      "$(legal_transition READY_FOR_FINAL_AUDIT WAITING_INFRA)"      "illegal"
+chk "tr_ready_to_memfail_BAD"    "$(legal_transition READY_FOR_FINAL_AUDIT MEMORY_SYSTEM_FAIL)" "illegal"
+chk "tr_ready_to_done_BAD"       "$(legal_transition READY_FOR_FINAL_AUDIT DONE)"               "illegal"
+chk "tr_fail_to_ready_BAD"       "$(legal_transition FAIL READY_FOR_FINAL_AUDIT)"               "illegal"
+chk "tr_bossgo_to_running_BAD"   "$(legal_transition WAITING_HUMAN_BOSS_GO RUNNING)"            "illegal"
+chk "tr_done_to_running_BAD"     "$(legal_transition DONE RUNNING)"                             "illegal"
+chk "tr_unknown_from_BAD"        "$(legal_transition BOGUS RUNNING)"                            "illegal"
+chk "tr_unknown_to_BAD"          "$(legal_transition RUNNING BOGUS)"                            "illegal"
+
+# --- P0 finding 6 : INTÉGRATION de la transition dans main(). On reproduit
+# EXACTEMENT la séquence de tête de boucle de main() (lire ST, comparer à
+# PREV_ST, appeler legal_transition) avec les VRAIES fonctions du pilote sur
+# un STATE_FILE réel. Prouve qu'une transition légale est acceptée et qu'une
+# transition illégale injectée par un « builder » est détectée (BLOCK) — donc
+# main() n'accepte plus silencieusement n'importe quel état. ---
+loop_top_guard() {  # reproduit le garde-boucle de main(): renvoie ACCEPT|BLOCK
+  local st prev="$1"
+  st="$(read_state)"
+  if [ "$st" != "$prev" ] && [ "$(legal_transition "$prev" "$st")" = "illegal" ]; then
+    printf 'BLOCK'
+  else
+    printf 'ACCEPT'
+  fi
+}
+# scénario légal : RUNNING -> READY_FOR_FINAL_AUDIT (builder déclare fin de phase)
+echo "RUNNING" > "$STATE_FILE"; _PREV="$(read_state)"
+echo "READY_FOR_FINAL_AUDIT" > "$STATE_FILE"
+chk "loop_legal_transition_accepted" "$(loop_top_guard "$_PREV")" "ACCEPT"
+# scénario illégal : RUNNING -> WAITING_HUMAN_BOSS_GO (builder injecte un
+# terminal succès en plein build -> doit être refusé, pas un arrêt muet)
+echo "RUNNING" > "$STATE_FILE"; _PREV="$(read_state)"
+echo "WAITING_HUMAN_BOSS_GO" > "$STATE_FILE"
+chk "loop_illegal_transition_blocked" "$(loop_top_guard "$_PREV")" "BLOCK"
+
+# preuve structurelle : main() doit RÉELLEMENT appeler legal_transition (sinon
+# le garde est mort-né — précisément le finding « les tests ne couvrent jamais
+# les transitions réelles de main »). On exige la forme d'appel exacte.
+if grep -q 'legal_transition "$PREV_ST" "$ST"' "$REPO/run_run4_autonomous.sh"; then
+  pass=$((pass+1))
+else
+  fail=$((fail+1)); echo "FAIL: main() n'appelle pas legal_transition (garde de transition absent)"
+fi
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

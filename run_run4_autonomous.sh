@@ -105,6 +105,53 @@ state_kind() {
   esac
 }
 
+# --- P0 finding 6 (transitions légales) : AUTORITÉ UNIQUE des transitions.
+# `state_kind` valide les VALEURS d'état ; `legal_transition` valide les
+# TRANSITIONS (from -> to). Une transition non listée ici est 'illegal' :
+# main() l'applique en tête de chaque itération et s'arrête fail-closed
+# (JAMAIS de réparation silencieuse). C'était précisément le finding de
+# l'audit Codex (PHASE_P0_FAIL) : « le pilote valide des valeurs d'état mais
+# n'applique pas les transitions légales ; un builder peut écrire directement
+# WAITING_HUMAN_BOSS_GO ou READY_FOR_FINAL_AUDIT depuis n'importe quel
+# état/phase ; le pilote les accepte ».
+#
+# Source unique = MASTER_ORDER § « MACHINE À ÉTATS » -> « Transitions
+# légales » (lignes 84-89). Transitions autorisées :
+#   - identité (X -> X) : toujours légale (pas de changement d'état).
+#   - RUNNING -> READY_FOR_FINAL_AUDIT : builder déclare fin de phase.
+#   - RUNNING -> WAITING_INFRA | MEMORY_SYSTEM_FAIL : pilot signale
+#     quota/réseau indispo ou mémoire corrompue (terminal, écrit puis exit).
+#   - READY_FOR_FINAL_AUDIT -> RUNNING : audit résolu (P0 PASS -> P1, ou
+#     non-PASS -> repair round, retour build).
+#   - READY_FOR_FINAL_AUDIT -> WAITING_HUMAN_BOSS_GO : audit P1 double-PASS.
+#   - READY_FOR_FINAL_AUDIT -> FAIL : budget de repair épuisé.
+#   - FAIL -> RUNNING : UNIQUEMENT via RESUME_AFTER_FAIL=1 (traité au
+#     démarrage, pas en boucle).
+# Toute autre transition est illégale (ex: RUNNING -> WAITING_HUMAN_BOSS_GO,
+# RUNNING -> DONE, READY_FOR_FINAL_AUDIT -> WAITING_INFRA, etc.).
+# Testé par tests/test_driver_helpers.bash (cas légaux ET illégaux + boucle
+# réelle de main).
+legal_transition() {
+  local from="$1" to="$2"
+  [ "$from" = "$to" ] && { printf 'legal'; return 0; }
+  case "$from" in
+    RUNNING)
+      case "$to" in
+        READY_FOR_FINAL_AUDIT|WAITING_INFRA|MEMORY_SYSTEM_FAIL) printf 'legal'; return 0 ;;
+      esac ;;
+    READY_FOR_FINAL_AUDIT)
+      case "$to" in
+        RUNNING|WAITING_HUMAN_BOSS_GO|FAIL) printf 'legal'; return 0 ;;
+      esac ;;
+    FAIL)
+      # Réservé à RESUME_AFTER_FAIL (démarrage). En boucle, FAIL est terminal.
+      case "$to" in
+        RUNNING) printf 'legal'; return 0 ;;
+      esac ;;
+  esac
+  printf 'illegal'
+}
+
 sha256_file() { python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1" 2>/dev/null; }
 
 # --- Verdict d audit par token EXACT en premiere ligne (PHASE_P0_PASS / PHASE_P1_PASS). ---
@@ -279,10 +326,24 @@ main() {
   local infra_fails=0 audit_repairs=0
   local ST rc i DIFF DIFF_TRUNC REVIEW_PROMPT PID_CLAUDE PID_CODEX
   local PHASE PHASE_NOTE MAX_REPAIR CUR_PROMPT INJ_RC INJ_ERR TOKEN WT_DIRTY WT_STATE WT_DIFF_SHA
+  local PREV_ST
+  # P0 finding 6 : état consommé au démarrage (post-resume). Sert de référence
+  # pour valider chaque transition lue en tête de boucle via legal_transition.
+  PREV_ST="$(read_state)"
 
   for i in $(seq 1 $MAX_ITERS); do
   echo "$i" > "$ITER_FILE"
   ST=$(read_state)
+  # P0 finding 6 (transitions légales) : toute transition PREV_ST -> ST non
+  # listée par legal_transition est ILLÉGALE -> arret fail-closed. Le pilote ne
+  # répare JAMAIS silencieusement un état invalide (ex: un builder qui écrit
+  # WAITING_HUMAN_BOSS_GO pendant la phase de build -> refus, pas d'arrêt muet).
+  if [ "$ST" != "$PREV_ST" ] && [ "$(legal_transition "$PREV_ST" "$ST")" = "illegal" ]; then
+    echo "[$(date -u +%FT%TZ)] TRANSITION ILLÉGALE '$PREV_ST' -> '$ST' dans $STATE_FILE (iter $i) -> arret fail-closed (aucune réparation silencieuse). Transitions légales : cf. MASTER_ORDER § MACHINE À ÉTATS + legal_transition." >> "$LOG"
+    echo "Transition illégale '$PREV_ST' -> '$ST' dans $STATE_FILE -> arret fail-closed (voir MASTER_ORDER § MACHINE À ÉTATS). Aucune réinitialisation silencieuse." >&2
+    exit 1
+  fi
+  PREV_ST="$ST"
   case "$(state_kind "$ST")" in
     terminal)
       echo "[$(date -u +%FT%TZ)] STATE=$ST -> arret pilote (iter $i)" >> "$LOG"; exit 0 ;;

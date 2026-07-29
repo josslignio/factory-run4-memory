@@ -569,5 +569,201 @@ class TestRuleL16BehavioralFdLeak(unittest.TestCase):
                            "le mutant fuit réellement -> le DEFECT est justifié")
 
 
+# ===================================================================
+# P0 finding 4 (round 3, contre-audit Codex) : rule_L16 ne crédite plus un
+# .close() générique — il faut que la fermeture cible le fd issu de os.open.
+# Un mutant fermant une ressource SANS RAPPORT doit rester DEFECT. Et la
+# preuve comportementale exécute RÉELLEMENT le source contrôlé (pas une
+# implémentation recopiée).
+# ===================================================================
+
+# Mutant : filet large `except OSError` qui ferme une ressource SANS RAPPORT
+# (le fd issu de os.open fuit). L'ancien rule_L16 créditait à tort ceci comme
+# sûr (présence d'un `.close()`). Le détecteur durci doit le marquer DEFECT.
+MUTANT_UNRELATED_CLOSE = '''
+import os, fcntl
+
+_LOCK_FDS = {}
+_unrelated = type("R", (), {"close": lambda self: None})()
+
+def acquire_lock(lockfile):
+    key = lockfile
+    if key in _LOCK_FDS:
+        return True
+    fd = os.open(lockfile, os.O_CREAT | os.O_WRONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    except OSError:
+        _unrelated.close()  # ferme une ressource sans rapport -> fd fuit
+        return False
+    _LOCK_FDS[key] = fd
+    return True
+'''
+
+# Source SÛR de référence pour l'exécution contrôlée : filet large + os.close(fd).
+SAFE_ACQUIRE_WIDE_CLOSE = '''
+import os, fcntl
+
+_LOCK_FDS = {}
+
+def acquire_lock(lockfile):
+    key = lockfile
+    if key in _LOCK_FDS:
+        return True
+    fd = os.open(lockfile, os.O_CREAT | os.O_WRONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return False
+    except BaseException:
+        os.close(fd)
+        raise
+    _LOCK_FDS[key] = fd
+    return True
+'''
+
+
+class TestRuleL16UnrelatedCloseMutant(unittest.TestCase):
+    """Un mutant qui ferme une ressource SANS RAPPORT (pas le fd issu de
+    os.open) doit rester DEFECT : le fd fuit réellement. C'était le déficit
+    pointé par le contre-audit Codex (« crédite toute occurrence de .close() »)."""
+
+    def test_unrelated_close_is_defect(self):
+        f = _find(run_checker(MUTANT_UNRELATED_CLOSE), "-16")
+        self.assertEqual(f.status, "present",
+                         f"un .close() sur une ressource sans rapport doit être "
+                         f"DEFECT (present), eu {f.status}: {f}")
+
+    def test_safe_wide_close_is_ok(self):
+        f = _find(run_checker(SAFE_ACQUIRE_WIDE_CLOSE), "-16")
+        self.assertEqual(f.status, "absent",
+                         f"os.close(fd) dans un filet large doit être ok, eu "
+                         f"{f.status}: {f}")
+
+
+class _ExecOs:
+    """Fake `os` pour exécuter le source contrôlé : compte les fd ouverts /
+    fermés via le tracker au lieu de toucher aux ressources OS réelles."""
+    O_CREAT = 0
+    O_WRONLY = 1
+
+    def __init__(self, tracker):
+        self._t = tracker
+
+    def open(self, path, flags):
+        return self._t.open(path)
+
+    def close(self, fd):
+        return self._t.close(fd)
+
+
+class _ExecFcntlLeak:
+    """Fake `fcntl` dont flock lève une OSError NON-BlockingIOError (= chemin
+    de fuite que L-16 doit détecter)."""
+    LOCK_EX = LOCK_NB = LOCK_UN = 0
+
+    @staticmethod
+    def flock(fd, flags):
+        raise OSError("simulated non-blocking oserror (leak path)")
+
+
+class TestRuleL16ExecutesControlledSource(unittest.TestCase):
+    """Contre-audit Codex round 3 : « les tests comportementaux n'exécutent
+    pas le source contrôlé, mais deux implémentations recopiées ». On exécute
+    RÉELLEMENT le source du snippet (le mutant ET la version sûre, tels
+    qu'écrits), en injectant un fake os/fcntl, et on compte les fd. Seul le
+    source sûr ferme le fd issu de os.open ; le mutant le fuit."""
+
+    @staticmethod
+    def _exec_acquire(src):
+        import types
+        tracker = _FdTracker()
+        mod = types.ModuleType("uut")
+        exec(compile(src, "<uut>", "exec"), mod.__dict__)
+        # On remplace os/fcntl dans l'espace de noms du module exécuté par des
+        # fakes qui mesurent le comportement réel (fd ouverts/fermés).
+        mod.os = _ExecOs(tracker)
+        mod.fcntl = _ExecFcntlLeak
+        try:
+            rc = mod.acquire_lock("x.lock")
+        except OSError:
+            rc = "raised"   # la version sûre relance après os.close(fd)
+        return rc, tracker
+
+    def test_mutant_source_executed_leaks_fd(self):
+        rc, tracker = self._exec_acquire(MUTANT_NO_CLOSE)
+        self.assertFalse(rc, "le mutant source exécuté retourne False")
+        self.assertEqual(tracker.open_count, 1)
+        self.assertEqual(tracker.close_count, 0,
+                         "le mutant source (exécuté, pas recopié) ne ferme pas "
+                         "le fd -> fuite réelle prouvée sur le source contrôlé")
+        self.assertEqual(tracker.open_count - tracker.close_count, 1)
+
+    def test_unrelated_close_source_executed_leaks_fd(self):
+        rc, tracker = self._exec_acquire(MUTANT_UNRELATED_CLOSE)
+        self.assertFalse(rc)
+        self.assertEqual(tracker.open_count, 1)
+        self.assertEqual(tracker.close_count, 0,
+                         "le .close() sans rapport ne ferme pas le fd issu de "
+                         "os.open -> fuite réelle, DEFECT justifié")
+
+    def test_safe_source_executed_closes_fd(self):
+        rc, tracker = self._exec_acquire(SAFE_ACQUIRE_WIDE_CLOSE)
+        self.assertEqual(rc, "raised",
+                         "la version sûre relance l'OSError après os.close(fd)")
+        self.assertEqual(tracker.open_count, 1)
+        self.assertEqual(tracker.close_count, 1,
+                         "le source sûr exécuté ferme réellement le fd")
+        self.assertEqual(tracker.open_count - tracker.close_count, 0,
+                         "aucun fd restant ouvert -> pas de fuite")
+
+    def test_detector_matches_executed_behavior(self):
+        # Cohérence finale : le jugement STATIQUE du détecteur correspond au
+        # COMPORTEMENT RÉEL exécuté du source contrôlé.
+        for src, expected in ((MUTANT_NO_CLOSE, "present"),
+                              (MUTANT_UNRELATED_CLOSE, "present"),
+                              (SAFE_ACQUIRE_WIDE_CLOSE, "absent")):
+            f = _find(run_checker(src), "-16")
+            self.assertEqual(f.status, expected,
+                             f"juge statique {expected} != {f.status} pour "
+                             f"le source exécuté: {f}")
+
+
+class TestCheckerReadFailureIsClean(unittest.TestCase):
+    """Contre-audit Codex (round 3) : le checker, cœur de la mesure A/B, ne
+    doit JAMAIS planter en traceback sur une source illisible/non-UTF8. Il
+    échoue proprement (rc=1, message clair) — il n'invente pas de mesure."""
+
+    def test_non_utf8_source_returns_clean_rc1(self):
+        import os as _os
+        fd, path = tempfile.mkstemp(suffix=".py")
+        with _os.fdopen(fd, "wb") as f:
+            f.write(b"def acquire_lock():\n    pass\n  # \xff\xfe non-utf8\n")
+        try:
+            rc = chk.main([path, "--json"])
+        finally:
+            _os.unlink(path)
+        self.assertEqual(rc, 1, "source non-UTF8 -> rc=1 propre (pas de mesure)")
+
+    def test_unreadable_source_returns_clean_rc1(self):
+        # Fichier existant mais illisible (chmod 0). Skip si root (root lit tout).
+        import os as _os
+        if hasattr(_os, "geteuid") and _os.geteuid() == 0:
+            self.skipTest("root lit tout : chmod 0 non discriminant")
+        fd, path = tempfile.mkstemp(suffix=".py")
+        with _os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("x = 1\n")
+        _os.chmod(path, 0o000)
+        try:
+            rc = chk.main([path, "--json"])
+        finally:
+            _os.chmod(path, 0o600)
+            _os.unlink(path)
+        self.assertEqual(rc, 1, "source illisible -> rc=1 propre (pas de traceback)")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

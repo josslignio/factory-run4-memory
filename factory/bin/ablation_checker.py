@@ -24,8 +24,10 @@ produit (status present|absent, evidence fichier:ligne + extrait).
 USAGE :
     python3 factory/bin/ablation_checker.py <source.py> [--json] [--md]
 
-Sortie par défaut : Markdown humain. --json : machine. rc=0 toujours
-(le checker ne « fail » pas ; il mesure).
+Sortie par défaut : Markdown humain. --json : machine. rc=0 quand la mesure
+s'exécute ; rc=1 si la source est illisible/introuvable/non-UTF8 (échec
+contrôlé, JAMAIS de traceback — la mesure ne peut pas être produite, on ne
+l'invente pas). Le checker ne mesure que du code qu'il arrive à lire.
 """
 import argparse
 import io
@@ -449,24 +451,45 @@ def rule_L16(code: str, orig: str, path: str) -> Finding:
     # close est un filet qui fuit).
     has_wide = bool(re.search(r"except\s+(BaseException|Exception|OSError)", body)
                     or re.search(r"\bfinally\s*:", body))
-    # Fermeture RÉELLE du fd dans acquire_lock : os.close( / .close( / un
-    # contexte `with` (os.fdopen). C'est le comportement réel (fd fermé) qui
-    # rend le filet sûr — on ne crédite plus un `except OSError` générique.
-    has_real_close = bool(
-        re.search(r"\bos\.close\s*\(", body)
-        or re.search(r"\.\s*close\s*\(", body)
-        or re.search(r"\bwith\s+os\.fdopen\s*\(", body)
-    )
+    # Fermeture RÉELLE du fd dans acquire_lock. Contre-audit Codex (round 3) :
+    # créditer n'importe quel `.close()` ferait passer un mutant qui ferme une
+    # ressource SANS RAPPORT (le fd issu de os.open fuit quand même). On cible
+    # donc la variable assignée depuis `os.open(...)` : la fermeture créditable
+    # doit référencer CETTE variable — `os.close(fd)`, `with os.fdopen(fd)` ou
+    # un wrapper `<wrapped> = os.fdopen(fd); <wrapped>.close()`. Un `.close()`
+    # sur une autre ressource ne compte plus. C'est le comportement réel (le fd
+    # ouvert dans acquire_lock est réellement fermé) qui rend le filet sûr.
+    m_open = re.search(r"([A-Za-z_]\w*)\s*=\s*os\.open\s*\(", body)
+    if m_open:
+        fv = re.escape(m_open.group(1))
+        wrapped = re.search(
+            r"([A-Za-z_]\w*)\s*=\s*os\.fdopen\s*\(\s*" + fv + r"\b", body)
+        close_targets = [fv]
+        if wrapped:
+            close_targets.append(re.escape(wrapped.group(1)))
+        close_alts = [
+            r"\bos\.close\s*\(\s*" + fv + r"\b",
+            r"\bwith\s+os\.fdopen\s*\(\s*" + fv + r"\b",
+        ]
+        close_alts += [r"\b" + w + r"\s*\.\s*close\s*\(" for w in close_targets]
+        has_real_close = any(re.search(alt, body) for alt in close_alts)
+    else:
+        # Pas d'assignation os.open isolée dans acquire_lock : repli sur la
+        # présence d'une fermeture fd créditable (os.close / with os.fdopen).
+        has_real_close = bool(
+            re.search(r"\bos\.close\s*\(", body)
+            or re.search(r"\bwith\s+os\.fdopen\s*\(", body)
+        )
     if has_wide and has_real_close:
         return Finding("L-20260727T150500Z-16", "resource-leak", "P2",
                        "absent",
                        f"{path}:{abs_ln} {_line_content(orig, abs_ln)}",
-                       "filet large ET fermeture réelle du fd (os.close/.close/"
-                       "with) dans acquire_lock")
+                       "filet large ET fermeture réelle du fd issu de os.open "
+                       "(os.close(fd)/with os.fdopen(fd)) dans acquire_lock")
     return Finding("L-20260727T150500Z-16", "resource-leak", "P2", "present",
                    f"{path}:{abs_ln} {_line_content(orig, abs_ln)}",
                    "acquire_lock : except BlockingIOError SANS fermeture réelle "
-                   "du fd dans un filet large → fuite fd sur autre OSError")
+                   "du fd issu de os.open dans un filet large → fuite fd sur autre OSError")
 
 
 RULES = (rule_L01, rule_L05, rule_L07, rule_L09, rule_L10,
@@ -531,7 +554,16 @@ def main(argv=None) -> int:
         print(f"ablation_checker: {path} n'est pas un fichier", file=sys.stderr)
         return 1
 
-    findings = check_file(path)
+    # Lecture protégée (contre-audit : la source peut être illisible ou non
+    # UTF-8 — read_text lèverait alors UnicodeDecodeError/OSError et ferait
+    # planter le checker, cœur de la mesure A/B, en traceback). On traduit en
+    # rc=1 contrôlé : la mesure ne peut pas être produite, on ne l'invente pas.
+    try:
+        findings = check_file(path)
+    except (OSError, UnicodeDecodeError) as e:
+        print(f"ablation_checker: source {path} illisible/non-UTF8 — "
+              f"{type(e).__name__}: {e} (mesure impossible, rc=1)", file=sys.stderr)
+        return 1
     stats = summarize(findings)
 
     if args.json:

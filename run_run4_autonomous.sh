@@ -24,8 +24,8 @@
 #   D-003 (Claude#1): contrat d'état cohérent (prompt = valeur seule ; lecteur tolérant au préfixe).
 #   D-004 (Codex#2) : audit final gating — non-PASS -> retour RUNNING (round de
 #                     repair) au lieu de WAITING_HUMAN_BOSS_GO. Budget repair
-#                     courant = MAX_P0_REPAIR=30 / MAX_P1_REPAIR=30 (relevé 30/07
-#                     Jocelyn ; plus bas à l'origine). AUTORITÉ UNIQUE : § MACHINE
+#                     courant = MAX_P0_REPAIR=6 / MAX_P1_REPAIR=6 (redescendu
+#                     30/07 après dérive longue). AUTORITÉ UNIQUE : § MACHINE
 #                     À ÉTATS du MASTER_ORDER + constantes ci-dessous.
 #   D-005 (Codex#3) : backoff infra 30/120/300s -> WAITING_INFRA. Seuil courant
 #                     = MAX_INFRA_FAILS=10 (relevé 30/07 Jocelyn ; plus bas à
@@ -149,12 +149,14 @@ state_kind() {
 #     quota/réseau indispo ou mémoire corrompue (terminal, écrit puis exit).
 #   - READY_FOR_FINAL_AUDIT -> RUNNING : audit résolu (P0 PASS -> P1, ou
 #     non-PASS -> repair round, retour build).
+#   - READY_FOR_FINAL_AUDIT -> WAITING_INFRA : reviewer final indisponible,
+#     sortie vide/invalide/illisible après épuisement du budget infra.
 #   - READY_FOR_FINAL_AUDIT -> WAITING_HUMAN_BOSS_GO : audit P1 PASS (Codex seul).
 #   - READY_FOR_FINAL_AUDIT -> FAIL : budget de repair épuisé.
 #   - FAIL -> RUNNING : UNIQUEMENT via RESUME_AFTER_FAIL=1 (traité au
 #     démarrage, pas en boucle).
 # Toute autre transition est illégale (ex: RUNNING -> WAITING_HUMAN_BOSS_GO,
-# RUNNING -> DONE, READY_FOR_FINAL_AUDIT -> WAITING_INFRA, etc.).
+# RUNNING -> DONE, READY_FOR_FINAL_AUDIT -> MEMORY_SYSTEM_FAIL, etc.).
 # Testé par tests/test_driver_helpers.bash (cas légaux ET illégaux + boucle
 # réelle de main).
 legal_transition() {
@@ -167,7 +169,7 @@ legal_transition() {
       esac ;;
     READY_FOR_FINAL_AUDIT)
       case "$to" in
-        RUNNING|WAITING_HUMAN_BOSS_GO|FAIL) printf 'legal'; return 0 ;;
+        RUNNING|WAITING_INFRA|WAITING_HUMAN_BOSS_GO|FAIL) printf 'legal'; return 0 ;;
       esac ;;
     FAIL)
       # Réservé à RESUME_AFTER_FAIL (démarrage). En boucle, FAIL est terminal.
@@ -197,13 +199,16 @@ enforce_legal_transition_or_die() {
 
 sha256_file() { python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1" 2>/dev/null; }
 
-# --- Verdict d audit par token EXACT en premiere ligne (PHASE_P0_PASS / PHASE_P1_PASS). ---
-phase_audit_ok() {
+# --- Verdict d audit par token EXACT en premiere ligne. ---
+phase_audit_has_token() {
   [ -s "$1" ] || return 1
   local first
-  first=$(head -n 1 "$1" | tr -d ' \t\r')
+  first=$(head -n 1 "$1")
+  first="${first#"${first%%[![:space:]]*}"}"
+  first="${first%"${first##*[![:space:]]}"}"
   [ "$first" = "$2" ]
 }
+phase_audit_ok() { phase_audit_has_token "$1" "$2"; }
 
 # --- FIX 2 (post-mortem 30/07 : bug CLI Codex "failed to load models cache:
 # missing field supports_reasoning_summaries") : le bruit d'erreur du CLI Codex
@@ -220,30 +225,29 @@ codex_cache_bug_in_file() {
   grep -qE 'failed to load models cache|supports_reasoning_summaries' "$1"
 }
 
-# --- FIX 3 (post-mortem 30/07 : 6h/16+ rounds perdus) : detection de boucle
-# sur audit IDENTIQUE. Quand 2 audits Codex consecutifs sont identiques mot
-# pour mot (meme SHA-256), GLM n a produit AUCUN changement de comportement
-# reel sur le finding signale -- continuer bouclerait jusqu au plafond
-# MAX_*_REPAIR en brulant budget/quota pour rien. Renvoie 0 (vrai) si l'audit
-# courant ($2) est identique a l'audit du round precedent (SHA-256 consigne
-# dans $1), 1 sinon. Extrait de la logique inline de main() pour etre teste
-# reellement (meme discipline que enforce_legal_transition_or_die : le test
-# appelle le VRAI predicat de production, pas une copie locale). ---
-audit_same_as_previous() {
-  local prev_sha_file="$1" cur_file="$2" prev="" cur=""
-  [ -f "$prev_sha_file" ] || return 1
-  prev=$(cat "$prev_sha_file" 2>/dev/null)
-  [ -n "$prev" ] || return 1
-  # D-013-quater : la comparaison de stall porte sur la signature des findings
-  # P1/High extraits du rapport (stall_signature), PAS sur le rapport entier.
-  # Si le rapport courant ne contient AUCUN finding P1/High, pas de stall
-  # possible : l absence de finding critique est un etat distinct (D-013 vise un
-  # blocage CRITIQUE recurrent, pas une stagnation cosmetique sur du P2). Un
-  # echec du parser (rc 1) est propage (on ne decide JAMAIS d un stall sur une
-  # signature incalculable).
-  cur="$(stall_signature "$cur_file")" || return 1
+# --- FIX 3 / D-013-quater : comparaison testable de la signature de stall.
+# Codes retour de audit_same_as_previous :
+#   0 = meme signature critique (stall)
+#   1 = premier round, absence de finding critique, ou signature differente
+#   2 = rapport/parser en echec OU signature precedente corrompue
+#       (ERREUR INFRA, jamais "progres")
+# La comparaison pure est separee du parsing pour que main() calcule UNE SEULE
+# fois STALL_SIG puis reutilise exactement cette valeur pour comparer ET stocker.
+audit_signature_same_as_previous() {
+  local prev_sha_file="$1" cur="$2" prev=""
   [ -n "$cur" ] || return 1
+  [ -e "$prev_sha_file" ] || [ -L "$prev_sha_file" ] || return 1
+  [ -f "$prev_sha_file" ] || return 2
+  prev=$(cat "$prev_sha_file" 2>/dev/null) || return 2
+  [[ "$prev" =~ ^[0-9A-Fa-f]{64}$ ]] || return 2
+  prev=$(printf '%s' "$prev" | tr '[:upper:]' '[:lower:]') || return 2
   [ "$prev" = "$cur" ]
+}
+
+audit_same_as_previous() {
+  local prev_sha_file="$1" cur_file="$2" cur=""
+  cur="$(stall_signature "$cur_file")" || return 2
+  audit_signature_same_as_previous "$prev_sha_file" "$cur"
 }
 
 # --- D-013-quater (granularite de la detection de stall) : la signature de
@@ -262,21 +266,25 @@ audit_same_as_previous() {
 # (atomic_write_exact / purge_file_logged) est preservee integralement : seul
 # le CONTENU hache change. ---
 
-# extract_p1_high_findings : extrait DETERMINISTEMENT les blocs de findings de
-# severite P1 ou High d un rapport d audit Codex. Un en-tete de severite est
-# reconnu dans toutes les formes legitimement produites par Codex : "P1" / "High"
-# nus, mais aussi "## P1", "### High" (titres markdown) ou "[P1] Titre" /
-# "[High] ..." (etiquettes entre crochets, avec optionnellement un separateur
-# ':'/'—'/'-' et un titre). Les autres severites (P0/P2/P3/P4/Medium/Low/Info/
-# Minor) ferment le bloc courant. Plusieurs blocs P1/High sont emis comme un
-# TABLEAU JSON de chaines (une par bloc, frontieres PRESERVEES) dans l ordre
-# d apparition (stable, deterministe : meme entree -> meme sortie). Conserver
-# les frontieres entre blocs evite que deux blocs distincts "P1->A" et "P1->B"
-# produisent la meme signature qu un seul bloc "P1->A+B" (masquerait un vrai
-# changement de structure en stall). Renvoie vide si aucun finding P1/High.
-# Echec du parser (fichier illisible, UTF-8 invalide) -> rc!=0 propage a l
-# appelant (stall_signature -> audit_same_as_previous / site d ecriture).
-# Teste reellement par tests/test_driver_helpers.bash.
+# extract_p1_high_findings : construit le PAYLOAD deterministe de stall.
+# Priorite :
+#   1. blocs explicitement critiques P0/P1/High (P0 inclus : plus grave que P1) ;
+#   2. fallback sur le corps complet APRES PHASE_P0_FAIL/PHASE_P1_FAIL, mais
+#      UNIQUEMENT si le rapport ne contient AUCUN en-tete de severite connu.
+# Le fallback couvre le contrat reel du prompt ("FAIL suivi des findings") sans
+# reintroduire le faux positif D-013-quater : un rapport explicitement P2-only
+# contient un en-tete connu, donc reste sans signature et ne peut pas staller.
+#
+# Formats reconnus : token nu, titre Markdown, label [P1]/[High], liste
+# "- [P1] ...", et emphase Markdown "**[P1] ...**". Un titre non bracketed doit
+# etre separe du token par ':'/'—'/'–'/'-' ; ainsi "High confidence: ..." reste
+# de la prose et ne devient JAMAIS un finding critique.
+#
+# Les frontieres de blocs critiques sont preservees dans un tableau JSON. Le
+# fallback non etiquete utilise le MEME tableau a un element qu'un bloc critique
+# unique : un reviewer qui ajoute/retire seulement le label P1 ne fabrique pas
+# un faux progres et ne peut pas obtenir une deuxieme redirection. Echec
+# UTF-8/lecture -> rc non nul.
 extract_p1_high_findings() {
   local f="$1"
   [ -s "$f" ] || return 0
@@ -288,38 +296,75 @@ import sys
 from pathlib import Path
 
 SEVERITIES = r"P[0-4]|HIGH|MEDIUM|LOW|INFO|MINOR"
+CRITICAL = {"P0", "P1", "HIGH"}
+FAIL_VERDICTS = {"PHASE_P0_FAIL", "PHASE_P1_FAIL"}
+
+def strip_outer_emphasis(text):
+    for marker in ("**", "__"):
+        if text.startswith(marker) and text.endswith(marker):
+            return text[len(marker):-len(marker)].strip()
+    return text
 
 def severity_header(raw):
     text = raw.strip()
-    text = re.sub(r"^#{1,6}\s*", "", text)
+    heading = re.match(r"^(#{1,6})\s+(.*)$", text)
+    heading_level = len(heading.group(1)) if heading else None
+    if heading:
+        text = heading.group(2).strip()
 
-    match = re.match(
-        rf"^\[({SEVERITIES})\](?:\s*[:\u2014-]?\s*(.*))?$",
+    bullet = re.match(r"^[-*+]\s+(.*)$", text)
+    if bullet:
+        text = bullet.group(1).strip()
+
+    text = strip_outer_emphasis(text)
+    # Accepte aussi "**[P1]** titre" et "**P1** : titre".
+    text = re.sub(
+        rf"^(?:\*\*|__)(\[?(?:{SEVERITIES})\]?)(?:\*\*|__)(?=$|\s|[:\u2013\u2014-])",
+        r"\1",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    bracket = re.match(
+        rf"^\[({SEVERITIES})\](?:\s*[:\u2013\u2014-]?\s*(.*))?$",
         text,
         re.IGNORECASE,
     )
-    if match:
-        return match.group(1).upper(), (match.group(2) or "").strip()
+    if bracket:
+        return (
+            bracket.group(1).upper(),
+            (bracket.group(2) or "").strip(),
+            heading_level,
+        )
 
-    # Frontiere de mot explicite apres le token de severite (fin de chaine,
-    # espace, ':' , '\u2014' ou '-' suivi d'un espace) : evite qu'un titre
-    # markdown tel que "## Highlights" ne matche "High"+"lights" (faux positif
-    # de stall/FAIL sur une signature critique sans finding reel).
-    match = re.match(
-        rf"^({SEVERITIES})(?=$|\s|[:\u2014]|-(?=\s))(.*)$",
+    bare = re.fullmatch(rf"({SEVERITIES})", text, re.IGNORECASE)
+    if bare:
+        return bare.group(1).upper(), "", heading_level
+
+    titled = re.match(
+        rf"^({SEVERITIES})\s*[:\u2013\u2014-]\s+(.+)$",
         text,
         re.IGNORECASE,
     )
-    if not match:
-        return None
+    if titled:
+        return titled.group(1).upper(), titled.group(2).strip(), heading_level
 
-    rest = match.group(2)
-    title = re.sub(r"^\s*[:\u2014-]?\s*", "", rest)
-    return match.group(1).upper(), title
+    # "P1 Titre" / "### P0 Titre" est non ambigu : contrairement au mot
+    # naturel "High", un token P0..P4 en debut de ligne est une severite.
+    numbered_title = re.match(r"^(P[0-4])\s+(.+)$", text, re.IGNORECASE)
+    if numbered_title:
+        return (
+            numbered_title.group(1).upper(),
+            numbered_title.group(2).strip(),
+            heading_level,
+        )
+
+    return None
 
 blocks = []
 current = None
 current_level = None
+saw_severity = False
 
 def flush():
     global current, current_level
@@ -334,24 +379,37 @@ def flush():
     current = None
     current_level = None
 
-for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+lines = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+first_nonempty_index = next(
+    (index for index, line in enumerate(lines) if line.strip()),
+    None,
+)
+verdict = (
+    lines[first_nonempty_index].strip()
+    if first_nonempty_index is not None
+    else ""
+)
+
+for raw in lines:
     heading_match = re.match(r"^\s*(#{1,6})\s+", raw)
     heading_level = len(heading_match.group(1)) if heading_match else None
     header = severity_header(raw)
     if header:
+        saw_severity = True
         flush()
-        severity, title = header
-        current = [] if severity in {"P1", "HIGH"} else None
-        current_level = heading_level if current is not None else None
+        severity, title, header_level = header
+        current = [] if severity in CRITICAL else None
+        current_level = header_level if current is not None else None
         if current is not None and title:
             current.append(title)
     elif heading_level and current is not None:
-        # Un titre plus profond que le header de severite courant est un
-        # sous-titre du finding -> on l ajoute AU bloc (sinon "## P1" puis
-        # "### ..." vide le bloc et perd le finding = faux negatif de stall).
-        # Un titre de niveau egal ou moins profond ferme le bloc (nouvelle
-        # section de meme rang).
-        if current_level is None or heading_level <= current_level:
+        # Apres un token nu "P1", le premier titre Markdown est le titre du
+        # finding, pas une nouvelle section : on le conserve puis utilise son
+        # niveau comme frontiere pour les titres suivants.
+        if current_level is None and not any(line.strip() for line in current):
+            current.append(raw)
+            current_level = heading_level
+        elif current_level is None or heading_level <= current_level:
             flush()
         else:
             current.append(raw)
@@ -364,24 +422,33 @@ if blocks:
     sys.stdout.write(
         json.dumps(blocks, ensure_ascii=False, separators=(",", ":"))
     )
+elif verdict in FAIL_VERDICTS and not saw_severity:
+    body = lines[first_nonempty_index + 1:]
+    while body and not body[0].strip():
+        body.pop(0)
+    while body and not body[-1].strip():
+        body.pop()
+    if body:
+        sys.stdout.write(
+            json.dumps(
+                ["\n".join(body)],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
 PY
 }
 
-# stall_signature : SHA-256 du texte des findings P1/High extraits (via
-# extract_p1_high_findings, sortie tableau JSON frontieres preservees). C est la
-# signature EFFECTIVEMENT stockee dans last_audit_${PHASE}.sha256 et comparee par
-# audit_same_as_previous. L usage d une FONCTION UNIQUE pour stocker ET comparer
-# garantit la coherence byte-exacte de la paire ecriture/lecture (lecon D-013-ter
-# : un ecart entre les deux -> faux negatif de stall). Renvoie vide (rc 0) si le
-# rapport ne contient AUCUN finding P1/High (etat distinct -> pas de stall
-# possible) ; rc 1 si le parser echoue (propage a l appelant).
+# stall_signature : SHA-256 du payload de stall ci-dessus. Renvoie vide (rc 0)
+# pour un rapport sans finding critique exploitable ; rc 2 si le parser echoue.
 stall_signature() {
   local f="$1" extracted
   [ -s "$f" ] || return 0
-  extracted="$(extract_p1_high_findings "$f")" || return 1
+  extracted="$(extract_p1_high_findings "$f")" || return 2
   [ -n "$extracted" ] || return 0
   printf '%s' "$extracted" |
-    python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'
+    python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())' ||
+    return 2
 }
 
 # --- D-013 (post-post-mortem 30/07 : FIX 3 trop brutal) : redirection
@@ -664,7 +731,7 @@ BUILD_PROMPT_P1='PHASE P1 — Sharp Core minimal (le checkpoint P0 est fige et v
 
 REVIEW_HEADER='Tu es un reviewer independant (jamais le builder) de Run 4, factory de Jocelyn. Review UNIQUEMENT le dernier commit du repo courant. Cherche : bugs reels reproduits, donnees inventees non tracees fichier:ligne, violations des INTERDITS ABSOLUS du master order. Tu disposes uniquement des outils Read/Grep/Glob (lecture seule) ; le diff du dernier commit t est fourni ci-dessous. Commence ta reponse par PASS ou FIX_NEEDED en premiere ligne, puis la liste des findings avec fichier:ligne si FIX_NEEDED, vide si PASS. Sois concis, ceci est une review de tranche, pas un audit complet.'
 
-FINAL_AUDIT_PROMPT='Tu es un reviewer independant de Run 4, factory de Jocelyn. Review CIBLEE et RAPIDE, PAS un audit exhaustif du repo entier : verifie UNIQUEMENT les items enumeres explicitement dans la note de phase ci-dessus (rien d autre). Pour chaque item : le comportement demande est-il reellement implemente et couvert par un test qui echoue si on le casse (pas juste un test cosmetique) ? Ne cherche PAS de nouveaux sujets hors de cette liste (pas de nouvelle exhaustivite sur validation/erreurs/concurrence/cas limites non demandes) -- ce n est pas le role de cet audit, ca ralentit le run sans ajouter de valeur. Seule exception autorisee hors liste : si un item de la liste ci-dessus a une consequence factuelle directe sur reports/RUN4_FINAL_REPORT.md (ex: chiffre invente), le signaler. Tu disposes uniquement des outils Read/Grep/Glob (lecture seule). Rends un rapport COURT dont la PREMIERE LIGNE est EXACTEMENT le token de verdict exige par la note de phase ci-dessus (rien d autre sur cette ligne), puis UNIQUEMENT les findings sur les items de la liste, avec fichier:ligne. Si tout est ferme, la reponse est le token PASS suivi de rien.'
+FINAL_AUDIT_PROMPT='Tu es un reviewer independant de Run 4, factory de Jocelyn. Review CIBLEE et RAPIDE, PAS un audit exhaustif du repo entier : verifie UNIQUEMENT les items enumeres explicitement dans la note de phase ci-dessus (rien d autre). Pour chaque item : le comportement demande est-il reellement implemente et couvert par un test qui echoue si on le casse (pas juste un test cosmetique) ? Ne cherche PAS de nouveaux sujets hors de cette liste (pas de nouvelle exhaustivite sur validation/erreurs/concurrence/cas limites non demandes) -- ce n est pas le role de cet audit, ca ralentit le run sans ajouter de valeur. Seule exception autorisee hors liste : si un item de la liste ci-dessus a une consequence factuelle directe sur reports/RUN4_FINAL_REPORT.md (ex: chiffre invente), le signaler. Tu disposes uniquement des outils Read/Grep/Glob (lecture seule). Rends un rapport COURT dont la PREMIERE LIGNE est EXACTEMENT le token de verdict exige par la note de phase ci-dessus (rien d autre sur cette ligne). Si le verdict est FAIL, groupe chaque finding sous une severite explicite P0, P1, High, P2, P3 ou P4 (formats recommandes : "## P1", "[P1] Titre" ou "- [P1] Titre"), puis donne fichier:ligne. Le pilote accepte aussi un FAIL non etiquete en fallback defensif, mais les severites explicites rendent la detection de stall plus precise. Si tout est ferme, la reponse est le token PASS suivi de rien.'
 
 # --- D-005 : applique le backoff infra courant puis continue la boucle. ---
 # Renvoie le délai (s) choisi pour n-ième échec (sans dormir) — testable sans sleep réel.
@@ -761,7 +828,7 @@ main() {
 
   local infra_fails=0 audit_repairs=0
   local ST rc i DIFF DIFF_TRUNC REVIEW_PROMPT PID_CLAUDE PID_CODEX
-  local PHASE PHASE_NOTE MAX_REPAIR CUR_PROMPT INJ_RC INJ_ERR TOKEN WT_DIRTY WT_STATE WT_DIFF_SHA
+  local PHASE PHASE_NOTE MAX_REPAIR CUR_PROMPT INJ_RC INJ_ERR TOKEN FAIL_TOKEN WT_DIRTY WT_STATE WT_DIFF_SHA
   local PREV_ST
   local STALL_FILE REDIRECT_FLAG STALL_RC EXTRACTED REDIRECT_PROMPT
   # P0 finding 6 : état consommé au démarrage (post-resume). Sert de référence
@@ -789,10 +856,12 @@ main() {
       if [ "$PHASE" = "P0" ]; then
         PHASE_NOTE="AUDIT DE PHASE P0 UNIQUEMENT : verifie que les 6 findings P0 (source-tag/evidence, finding vide fail-closed, ecriture concurrente bootstrap, credit fd comportemental, claim ablation honnete, machine a etats) sont fermes par des tests reels. PRECISION SCOPE (evite un faux P1 -- desambiguisation 30/07) : RECEIPTS_DIR, resume_receipt.json, checkpoint_p0/, sha256_file() et verify_checkpoint_p0() dans run_run4_autonomous.sh sont l ORCHESTRATION DU DRIVER lui-meme (prevue des le preflight initial 43aa069, approuvee, necessaire pour gater la transition P0->P1) -- ce N EST PAS le Sharp Core P1. Le Sharp Core P1 reel = les 4 fonctions listees dans BUILD_PROMPT_P1 (gate receipt de TACHE via factory/bin/run_gate.py, verdict reviewer artefact codex_review_verdict.json, outil promote de LECON, injection fail-closed) : verifie leur ABSENCE dans factory/bin/ (ls factory/bin/ ne doit lister aucun run_gate.py ni outil promote) comme preuve que le perimetre P1 n a pas ete franchi -- ne compte PAS l orchestration driver comme une violation. PREMIERE LIGNE de ta reponse : EXACTEMENT PHASE_P0_PASS si les 6 items sont fermes ET qu aucun outil Sharp Core P1 n existe dans factory/bin/, sinon EXACTEMENT PHASE_P0_FAIL suivi des findings."
         TOKEN="PHASE_P0_PASS"
+        FAIL_TOKEN="PHASE_P0_FAIL"
         MAX_REPAIR="$MAX_P0_REPAIR"
       else
         PHASE_NOTE="AUDIT DE PHASE P1 : le checkpoint P0 est fige. Verifie les 4 fonctions Sharp Core (gate receipt reel, verdict codex artefact, promotion automatique verifiante, injection fail-closed) et les tests adversariaux associes. PREMIERE LIGNE de ta reponse : EXACTEMENT PHASE_P1_PASS si tout est branche et prouve, sinon EXACTEMENT PHASE_P1_FAIL suivi des findings."
         TOKEN="PHASE_P1_PASS"
+        FAIL_TOKEN="PHASE_P1_FAIL"
         MAX_REPAIR="$MAX_P1_REPAIR"
       fi
       echo "[$(date -u +%FT%TZ)] iter $i: GLM se declare pret -> audit final phase $PHASE (Codex seul, reviewer independant, lecture seule -- Claude retire de la boucle de review sur demande explicite Jocelyn, economie de quota)" >> "$LOG"
@@ -819,10 +888,24 @@ $FINAL_AUDIT_PROMPT" > "$AUDIT_CODEX" 2>>"$LOG" \
         apply_backoff "$infra_fails"
         continue
       fi
-      # codex exec a rendu une sortie exploitable (pas du bruit infra) -> le
-      # compteur d'echecs infra (consecutifs) est remis a 0.
-      infra_fails=0
+      # Une sortie vide est une panne du reviewer, pas un vrai audit FAIL. Sans
+      # cette garde elle consommerait le budget audit_repairs et pourrait finir
+      # en STATE=FAIL alors qu'aucun verdict n'a ete rendu.
+      if [ ! -s "$AUDIT_CODEX" ]; then
+        infra_fails=$((infra_fails+1))
+        echo "[$(date -u +%FT%TZ)] iter $i: audit Codex vide -> infra_fail, aucun round de repair consomme (infra_fails=$infra_fails/$MAX_INFRA_FAILS)" >> "$LOG"
+        if [ "$infra_fails" -gt "$MAX_INFRA_FAILS" ]; then
+          echo "WAITING_INFRA" > "$STATE_FILE"
+          echo "[$(date -u +%FT%TZ)] $MAX_INFRA_FAILS audits vides consecutifs -> STATE=WAITING_INFRA -> arret" >> "$LOG"
+          exit 0
+        fi
+        apply_backoff "$infra_fails"
+        continue
+      fi
       if phase_audit_ok "$AUDIT_CODEX" "$TOKEN"; then
+        # Verdict PASS syntaxiquement exploitable : la sequence d'echecs infra
+        # est bien interrompue.
+        infra_fails=0
         if [ "$PHASE" = "P0" ]; then
           mkdir -p "$RECEIPTS_DIR/checkpoint_p0"
           cp "$AUDIT_CODEX" "$RECEIPTS_DIR/checkpoint_p0/" 2>>"$LOG"
@@ -850,6 +933,21 @@ $FINAL_AUDIT_PROMPT" > "$AUDIT_CODEX" 2>>"$LOG" \
         echo "[$(date -u +%FT%TZ)] audit P1 OK (Codex seul, PRET A MERGER) -> STATE=WAITING_HUMAN_BOSS_GO -> arret pilote" >> "$LOG"
         exit 0
       fi
+      # Un audit non-PASS doit tout de meme respecter le contrat FAIL exact.
+      # Une sortie non vide mais sans PHASE_P*_FAIL est inexploitable : la
+      # router comme infra evite de faire reparer a GLM du bruit ou une erreur
+      # de protocole, et preserve le budget de repair.
+      if ! phase_audit_has_token "$AUDIT_CODEX" "$FAIL_TOKEN"; then
+        infra_fails=$((infra_fails+1))
+        echo "[$(date -u +%FT%TZ)] iter $i: verdict audit Codex invalide (attendu $TOKEN ou $FAIL_TOKEN en premiere ligne) -> infra_fail, aucun round de repair consomme (infra_fails=$infra_fails/$MAX_INFRA_FAILS)" >> "$LOG"
+        if [ "$infra_fails" -gt "$MAX_INFRA_FAILS" ]; then
+          echo "WAITING_INFRA" > "$STATE_FILE"
+          echo "[$(date -u +%FT%TZ)] $MAX_INFRA_FAILS verdicts audit invalides consecutifs -> STATE=WAITING_INFRA -> arret" >> "$LOG"
+          exit 0
+        fi
+        apply_backoff "$infra_fails"
+        continue
+      fi
       # --- D-013 (post-post-mortem 30/07 : FIX 3 trop brutal) : detection de
       # stall en 2 TEMPS, bornee a MAXIMUM 1 redirection chirurgicale vers GLM.
       # FIX 3 faisait FAIL IMMEDIAT des le 1er stall (2 audits identiques) -- un
@@ -873,8 +971,44 @@ $FINAL_AUDIT_PROMPT" > "$AUDIT_CODEX" 2>>"$LOG" \
       # 1 tentative par sequence de stall (le flag l interdit physiquement). ---
       STALL_FILE="$RECEIPTS_DIR/last_audit_${PHASE}.sha256"
       REDIRECT_FLAG="$RECEIPTS_DIR/redirect_attempt_${PHASE}.used"
-      STALL_RC=1
-      audit_same_as_previous "$STALL_FILE" "$AUDIT_CODEX" && STALL_RC=0
+      # Round 3 : calcule la signature UNE SEULE fois. La meme valeur est
+      # comparee ci-dessous puis stockee atomiquement plus bas. Un echec du
+      # parser est une panne infra distincte : il ne passe jamais par
+      # stall_action("normal"), ne purge donc jamais redirect_attempt comme un
+      # faux "progres reel", et ne consomme aucun round de repair.
+      if STALL_SIG="$(stall_signature "$AUDIT_CODEX")"; then
+        infra_fails=0
+      else
+        infra_fails=$((infra_fails+1))
+        echo "[$(date -u +%FT%TZ)] iter $i: audit Codex illisible (parser stall rc!=0) -> infra_fail, etat stall/redirect preserve (infra_fails=$infra_fails/$MAX_INFRA_FAILS)" >> "$LOG"
+        if [ "$infra_fails" -gt "$MAX_INFRA_FAILS" ]; then
+          echo "WAITING_INFRA" > "$STATE_FILE"
+          echo "[$(date -u +%FT%TZ)] $MAX_INFRA_FAILS audits illisibles consecutifs -> STATE=WAITING_INFRA -> arret" >> "$LOG"
+          exit 0
+        fi
+        apply_backoff "$infra_fails"
+        continue
+      fi
+      if audit_signature_same_as_previous "$STALL_FILE" "$STALL_SIG"; then
+        STALL_RC=0
+      else
+        STALL_RC=$?
+      fi
+      # Une absence de fichier au premier round est un non-stall normal (rc=1).
+      # En revanche, un fichier present mais vide/illisible/malforme est un etat
+      # persiste corrompu (rc=2), jamais un progres : conserver le flag de
+      # redirection et le SHA, puis retenter sous le budget infra.
+      if [ "$STALL_RC" -eq 2 ]; then
+        infra_fails=$((infra_fails+1))
+        echo "[$(date -u +%FT%TZ)] iter $i: signature stall precedente invalide -> infra_fail, etat stall/redirect preserve (infra_fails=$infra_fails/$MAX_INFRA_FAILS)" >> "$LOG"
+        if [ "$infra_fails" -gt "$MAX_INFRA_FAILS" ]; then
+          echo "WAITING_INFRA" > "$STATE_FILE"
+          echo "[$(date -u +%FT%TZ)] $MAX_INFRA_FAILS signatures stall invalides consecutives -> STATE=WAITING_INFRA -> arret" >> "$LOG"
+          exit 0
+        fi
+        apply_backoff "$infra_fails"
+        continue
+      fi
       case "$(stall_action "$STALL_RC" "$REDIRECT_FLAG")" in
         redirect)
           # 1er stall de la sequence : redirection chirurgicale UNE fois vers GLM.
@@ -933,20 +1067,13 @@ $FINAL_AUDIT_PROMPT" > "$AUDIT_CODEX" 2>>"$LOG" \
       # interrompue laisserait un sha partiel/vide -> audit_same_as_previous
       # faussé (faux négatif de stall). Échec -> on purge le stall file (prochain
       # round repart propre, pas de sha corrompu) + log explicite.
-      # D-013-quater : le SHA consigné est celui de la signature P1/High
-      # (stall_signature), PAS du rapport entier -- la détection de stall ne
-      # porte plus que sur les findings critiques. Si le rapport courant est
-      # sans P1/High, stall_signature est vide -> on consigne vide (rounds sans
-      # finding critique = jamais stalled, par construction d'audit_same_as_previous).
-      # Un échec de calcul du parser (rc 1) est traité comme l'échec d'écriture :
-      # purge du stall file + log (on ne consigne JAMAIS une signature
-      # incalculable, le prochain round repart propre).
-      if STALL_SIG="$(stall_signature "$AUDIT_CODEX")" &&
-         atomic_write_exact "$STALL_FILE" "$STALL_SIG"; then
+      # Round 3 : STALL_SIG a deja ete calculee et validee AVANT stall_action.
+      # On stocke exactement la valeur comparee (aucun second parsing divergent).
+      if atomic_write_exact "$STALL_FILE" "$STALL_SIG"; then
         :
       else
         purge_file_logged "$STALL_FILE" "last_audit_${PHASE}.sha256"
-        echo "[$(date -u +%FT%TZ)] phase $PHASE : echec calcul/ecriture last_audit sha -> stall file purge" >> "$LOG"
+        echo "[$(date -u +%FT%TZ)] phase $PHASE : echec ecriture last_audit sha -> stall file purge" >> "$LOG"
       fi
       audit_repairs=$((audit_repairs+1))
       if [ "$audit_repairs" -gt "$MAX_REPAIR" ]; then

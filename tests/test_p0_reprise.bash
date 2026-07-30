@@ -76,8 +76,8 @@ chk "kind_empty_illegal"   "$(state_kind '')"                     "illegal"
 # legal_transition : autorite unique des TRANSITIONS
 chk "tr_legal_R_to_READY"  "$(legal_transition RUNNING READY_FOR_FINAL_AUDIT)" "legal"
 chk "tr_legal_READY_to_GO" "$(legal_transition READY_FOR_FINAL_AUDIT WAITING_HUMAN_BOSS_GO)" "legal"
+chk "tr_legal_READY_to_INFRA" "$(legal_transition READY_FOR_FINAL_AUDIT WAITING_INFRA)" "legal"
 chk "tr_illegal_R_to_GO"   "$(legal_transition RUNNING WAITING_HUMAN_BOSS_GO)"  "illegal"
-chk "tr_illegal_READY_to_INFRA" "$(legal_transition READY_FOR_FINAL_AUDIT WAITING_INFRA)" "illegal"
 chk "tr_illegal_bogus"     "$(legal_transition BOGUS RUNNING)"                 "illegal"
 
 # Garde REEL de production : fail-closed, jamais de reparation silencieuse.

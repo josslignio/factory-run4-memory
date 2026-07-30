@@ -113,17 +113,17 @@ chk "tr_run_to_ready"        "$(legal_transition RUNNING READY_FOR_FINAL_AUDIT)"
 chk "tr_run_to_infra"        "$(legal_transition RUNNING WAITING_INFRA)"                       "legal"
 chk "tr_run_to_memfail"      "$(legal_transition RUNNING MEMORY_SYSTEM_FAIL)"                  "legal"
 chk "tr_ready_to_running"    "$(legal_transition READY_FOR_FINAL_AUDIT RUNNING)"               "legal"
+chk "tr_ready_to_infra"      "$(legal_transition READY_FOR_FINAL_AUDIT WAITING_INFRA)"         "legal"
 chk "tr_ready_to_bossgo"     "$(legal_transition READY_FOR_FINAL_AUDIT WAITING_HUMAN_BOSS_GO)"  "legal"
 chk "tr_ready_to_fail"       "$(legal_transition READY_FOR_FINAL_AUDIT FAIL)"                  "legal"
 chk "tr_fail_to_running"     "$(legal_transition FAIL RUNNING)"                                "legal"
 # transitions ILLÉGALES (cœur du finding : un builder NE PEUT PAS écrire un
-# état terminal depuis RUNNING, ni sauter audit->infra, ni repartir d'un
+# état terminal depuis RUNNING, ni sauter audit->memory-fail, ni repartir d'un
 # terminal sans RESUME_AFTER_FAIL explicite) :
 chk "tr_run_to_bossgo_BAD"       "$(legal_transition RUNNING WAITING_HUMAN_BOSS_GO)"            "illegal"
 chk "tr_run_to_done_BAD"         "$(legal_transition RUNNING DONE)"                             "illegal"
 chk "tr_run_to_whuman_BAD"       "$(legal_transition RUNNING WAITING_HUMAN)"                    "illegal"
 chk "tr_run_to_fail_BAD"         "$(legal_transition RUNNING FAIL)"                             "illegal"
-chk "tr_ready_to_infra_BAD"      "$(legal_transition READY_FOR_FINAL_AUDIT WAITING_INFRA)"      "illegal"
 chk "tr_ready_to_memfail_BAD"    "$(legal_transition READY_FOR_FINAL_AUDIT MEMORY_SYSTEM_FAIL)" "illegal"
 chk "tr_ready_to_done_BAD"       "$(legal_transition READY_FOR_FINAL_AUDIT DONE)"               "illegal"
 chk "tr_fail_to_ready_BAD"       "$(legal_transition FAIL READY_FOR_FINAL_AUDIT)"               "illegal"
@@ -151,9 +151,9 @@ chk "prod_guard_identity_exit0" "$?" "0"
 # pas un arrêt muet).
 ( enforce_legal_transition_or_die RUNNING WAITING_HUMAN_BOSS_GO )
 chk "prod_guard_illegal_transition_exit1" "$?" "1"
-# transition illégale : READY_FOR_FINAL_AUDIT -> WAITING_INFRA (saut interdit).
+# transition légale : l'audit final épuise ses retries infra.
 ( enforce_legal_transition_or_die READY_FOR_FINAL_AUDIT WAITING_INFRA )
-chk "prod_guard_illegal_ready_to_infra_exit1" "$?" "1"
+chk "prod_guard_legal_ready_to_infra_exit0" "$?" "0"
 # état illégal depuis n'importe où : BOGUS -> RUNNING.
 ( enforce_legal_transition_or_die BOGUS RUNNING )
 chk "prod_guard_illegal_from_bogus_exit1" "$?" "1"
@@ -194,7 +194,7 @@ fi
 # UNIQUE s'applique AUSSI aux COMMENTAIRES du pilote, pas seulement à
 # MASTER_ORDER ni aux constantes. L'audit round 2 citait un commentaire du
 # driver (« max 3 échecs » run_run4_autonomous.sh:26) qui contredisait
-# MAX_INFRA_FAILS=10, et un « cap 2 » repair contredisant MAX_*_REPAIR=30 :
+# MAX_INFRA_FAILS=10, et un « cap 2 » repair contredisant le budget courant :
 # contradiction d'autorité À L'INTÉRIEUR du fichier du driver lui-même. On
 # vérifie qu'aucune mention périmée d'un seuil de budget ne subsiste dans le
 # driver (les chaînes exactes citées par l'audit), puis on généralise : tout
@@ -202,7 +202,7 @@ fi
 # un commentaire du driver DOIT valoir la constante correspondante. ---
 for bad in 'max 2 repairs' 'max 3 retries' 'max 3 échecs' 'max 3 echecs' 'cap 2'; do
   if grep -qiF "$bad" "$REPO/run_run4_autonomous.sh"; then
-    fail=$((fail+1)); echo "FAIL: driver contient l'autorité périmée '$bad' (contradictoire avec MAX_*_REPAIR=30 / MAX_INFRA_FAILS=10)"
+    fail=$((fail+1)); echo "FAIL: driver contient l'autorité périmée '$bad' (contradictoire avec les constantes MAX_*_REPAIR / MAX_INFRA_FAILS)"
   else
     pass=$((pass+1))
   fi
@@ -225,13 +225,18 @@ else
     chk "driver_comment_repair_cap_matches_constant($n)" "$n" "$drv_p0"
   done
 fi
+# Les valeurs de l'autorite documentaire doivent egaler les constantes
+# reellement executees (regression du master reste a 30 alors que le driver=6).
+grep -qF "MAX_P0_REPAIR=$drv_p0" "$REPO/MASTER_ORDER_RUN4_MEMORY.md"; chk "master_p0_budget_matches_driver" "$?" "0"
+grep -qF "MAX_P1_REPAIR=$drv_p1" "$REPO/MASTER_ORDER_RUN4_MEMORY.md"; chk "master_p1_budget_matches_driver" "$?" "0"
+grep -qF "MAX_INFRA_FAILS=$drv_infra" "$REPO/MASTER_ORDER_RUN4_MEMORY.md"; chk "master_infra_budget_matches_driver" "$?" "0"
 
 # --- P0 finding 6 (round 16, contre-audit Codex PHASE_P0_FAIL) : l'AUTORITÉ
 # UNIQUE documentée doit être EXTERNE au code ET cohérente. L'audit citait
 # deux contradictions d'autorité désormais corrigées :
 #   (a) MASTER_ORDER § AUTONOMIE énumérait un sous-ensemble de 4 états +
 #       « après 2 repairs », en désaccord avec le § MACHINE À ÉTATS (8 états,
-#       budgets de 30) — seconde autorité contradictoire.
+#       budgets exécutés) — seconde autorité contradictoire.
 #   (b) le driver étiquetait la garde mémoire « P1.4 cote driver » alors que
 #       le § MACHINE À ÉTATS (point « Mémoire de leçons ») en fait une garde
 #       P0 — seconde autorité contradictoire.
@@ -297,7 +302,7 @@ done
 # missing field supports_reasoning_summaries » + boucle sur finding identique).
 # Regression reelle : le bruit d'erreur CLI fuyait DANS AUDIT_CODEX/REVIEW_CODEX
 # et etait compte comme un VRAI audit/review non-PASS -> audit_repairs++ (round
-# de repair reel consomme pour du simple bruit infra), jusqu'a 29/30 rounds et
+# de repair reel consomme pour du simple bruit infra), jusqu'a des dizaines de rounds et
 # plusieurs heures / quota Codex perdus. Ces tests prouvent que desormais :
 # (FIX 2/a) un output contenant le bruit CLI -> infra_fail, audit_repairs intact ;
 # (FIX 3/b) deux audits IDENTIQUES consecutifs -> FAIL immediat (avant plafond).
@@ -400,9 +405,9 @@ chk "fix3_different_audit_not_stalled" "$?" "1"
 rm -f "$STALL_TEST"
 audit_same_as_previous "$STALL_TEST" "$TMP/audit_r1"
 chk "fix3_no_prev_file_not_stalled" "$?" "1"
-# Preuve structurelle : main() appelle le VRAI predicat et ecrit FAIL + message
-# exact, AVANT tout 'audit_repairs=$((audit_repairs+1))' (FAIL prioritaire sur budget).
-stall_call=$(grep -nF 'audit_same_as_previous "$STALL_FILE" "$AUDIT_CODEX"' "$DRV" | head -1 | cut -d: -f1)
+# Preuve structurelle : main() appelle le VRAI comparateur de signature et ecrit
+# FAIL + message exact, AVANT tout increment audit_repairs (FAIL prioritaire).
+stall_call=$(grep -nF 'audit_signature_same_as_previous "$STALL_FILE" "$STALL_SIG"' "$DRV" | head -1 | cut -d: -f1)
 [ -n "$stall_call" ] && [ "$stall_call" -lt "$inc_line" ]
 chk "fix3_stall_call_before_audit_repairs_inc" "$?" "0"
 # D-013 : message EXACT de FAIL fail-closed APRES redirection chirurgicale
@@ -871,9 +876,9 @@ grep -qF 'cur="$(stall_signature "$cur_file")"' "$DRV" \
 if grep -qF '[ "$prev" = "$(sha256_file "$cur_file")" ]' "$DRV"; then
   fail=$((fail+1)); echo "FAIL: d013q audit_same_as_previous compare encore le rapport entier (sha256_file)"
 else pass=$((pass+1)); fi
-# audit_same_as_previous propage l echec du parser (rc 1 de stall_signature) :
-grep -qF 'cur="$(stall_signature "$cur_file")" || return 1' "$DRV" \
-  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013q audit_same_as_previous ne propage pas l echec du parser (|| return 1)"; }
+# audit_same_as_previous distingue l echec parser (rc 2) du non-stall normal (rc 1) :
+grep -qF 'cur="$(stall_signature "$cur_file")" || return 2' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013q audit_same_as_previous ne distingue pas l echec parser (return 2)"; }
 # le site d ecriture du SHA consigne stall_signature (P1/High) via la variable
 # STALL_SIG (calcul puis ecriture atomique separates, propagation de l echec) :
 grep -qF 'STALL_SIG="$(stall_signature "$AUDIT_CODEX")"' "$DRV" \
@@ -984,15 +989,15 @@ printf 'PHASE_P0_FAIL\n\n[P1] Titre du finding\n\n- finding bracket factory/d.py
 extract_p1_high_findings "$QD/md_p1"  | grep -qF 'finding markdown factory/a.py:1'; chk "d013q_fix_md_p1_content" "$?" "0"
 extract_p1_high_findings "$QD/md_high" | grep -qF 'high markdown factory/c.py:3';    chk "d013q_fix_md_high_content" "$?" "0"
 extract_p1_high_findings "$QD/brk_p1"  | grep -qF 'finding bracket factory/d.py:4';  chk "d013q_fix_bracket_p1_content" "$?" "0"
-# un en-tete markdown SANS severite (ex: "## Synthese") ne cree pas de bloc P1 :
-printf 'PHASE_P0_FAIL\n\n## Synthese\n\n- pas un finding de severite\n' > "$QD/md_nosev"
+# sans verdict PHASE_*_FAIL, un titre Markdown sans severite ne cree aucun payload :
+printf '## Synthese\n\n- pas un finding de severite\n' > "$QD/md_nosev"
 [ -z "$(extract_p1_high_findings "$QD/md_nosev")" ]; chk "d013q_fix_md_non_severity_not_extracted" "$?" "0"
 
 # --- D-013-quater FIX round 2 (revue Codex) : 2 nouveaux correctifs P1. ---
 # (a2-fix) [P1] "## Highlights" ne doit PAS matcher "High"+"lights" (prefixe
 #     libre). Sinon signature critique non vide sans finding reel -> faux
 #     positif de stall/FAIL. Extraction DOIT rester vide.
-printf 'PHASE_P0_FAIL\n\n## Highlights\n\n- texte non-finding quelconque\n' > "$QD/highlights"
+printf 'P2\n\n## Highlights\n\n- texte non-finding quelconque\n' > "$QD/highlights"
 HL="$(extract_p1_high_findings "$QD/highlights")"
 [ -z "$HL" ]; chk "d013q_fix2_highlights_not_high" "$?" "0"
 # variante : "## Highlander" et "High" isole nu reconnu (controle frontieres) :
@@ -1035,15 +1040,162 @@ nsep_fused=$(printf '%s' "$EX_FUSED" | tr -cd ',' | wc -c | tr -d ' ')
 # contre-preuve : deux fois le meme rapport -> signature identique (deterministe).
 [ "$(stall_signature "$QD/two_blocks")" = "$(stall_signature "$QD/two_blocks")" ]; chk "d013q_fix_boundaries_deterministic" "$?" "0"
 
-# (c-fix) ECHEC du parser propage rc=1 jusqu a l appelant (on ne decide JAMAIS
-#     d un stall sur une signature incalculable). Fichier UTF-8 invalide ->
-#     read_text leve une exception -> extract rc!=0 -> stall_signature rc=1.
+# (c-fix) ECHEC du parser propage avec un rc DISTINCT (2) jusqu a l appelant.
+# Fichier UTF-8 invalide -> read_text leve -> extract rc=1 -> signature/audit rc=2.
 printf '\xff\xfe\xfd octets invalides\nP1\n- x\n' > "$QD/bad_utf8"
 extract_p1_high_findings "$QD/bad_utf8" 2>/dev/null; chk "d013q_fix_extract_failure_rc" "$?" "1"
-stall_signature "$QD/bad_utf8" 2>/dev/null; chk "d013q_fix_signature_failure_rc" "$?" "1"
-# audit_same_as_previous propage aussi cet echec (rc 1 = non stalled, fail-closed) :
+stall_signature "$QD/bad_utf8" 2>/dev/null; chk "d013q_fix_signature_failure_rc" "$?" "2"
+# audit_same_as_previous propage aussi ce rc distinct (jamais confondu avec progres) :
 SF_BAD="$QD/last_audit_bad.sha256"; printf '%s' "$(stall_signature "$QD/r1_fn")" > "$SF_BAD"
-audit_same_as_previous "$SF_BAD" "$QD/bad_utf8" 2>/dev/null; chk "d013q_fix_audit_propagates_parser_failure" "$?" "1"
+audit_same_as_previous "$SF_BAD" "$QD/bad_utf8" 2>/dev/null; chk "d013q_fix_audit_propagates_parser_failure" "$?" "2"
+
+# ====================================================================
+# D-013-quater FIX ROUND 3 : contrat de sortie reel, formats Markdown,
+# prose "High", titre apres token nu, P0 critique, et erreur parser infra.
+# ====================================================================
+
+# (r3-1) FALLBACK contractuel : PHASE_P0_FAIL suivi directement de findings
+# fichier:ligne, sans aucun header de severite, produit une signature stable.
+printf 'PHASE_P0_FAIL\n\n- factory/bin/direct.py:17 : blocage sans etiquette\n' > "$QD/unlabeled_r1"
+cp "$QD/unlabeled_r1" "$QD/unlabeled_r2"
+UF1="$(extract_p1_high_findings "$QD/unlabeled_r1")"
+printf '%s' "$UF1" | grep -qF '["- factory/bin/direct.py:17 : blocage sans etiquette"]'
+chk "d013q_r3_unlabeled_payload_canonical_array" "$?" "0"
+printf '%s' "$UF1" | grep -qF 'factory/bin/direct.py:17'; chk "d013q_r3_unlabeled_payload_content" "$?" "0"
+USIG="$(stall_signature "$QD/unlabeled_r1")"
+[ -n "$USIG" ]; chk "d013q_r3_unlabeled_signature_nonempty" "$?" "0"
+USF="$QD/last_audit_unlabeled.sha256"; printf '%s' "$USIG" > "$USF"
+audit_same_as_previous "$USF" "$QD/unlabeled_r2"; chk "d013q_r3_unlabeled_repeat_stalls" "$?" "0"
+# Une modification du finding non etiquete reste un progres reel (signature diff).
+printf 'PHASE_P0_FAIL\n\n- factory/bin/direct.py:18 : autre blocage\n' > "$QD/unlabeled_changed"
+[ "$(stall_signature "$QD/unlabeled_r1")" != "$(stall_signature "$QD/unlabeled_changed")" ]
+chk "d013q_r3_unlabeled_change_not_same_signature" "$?" "0"
+
+# Le fallback n'est active QUE par le verdict contractuel exact de phase.
+printf 'FIX_NEEDED\n\n- factory/bin/direct.py:17 : sans token phase\n' > "$QD/unlabeled_wrong_token"
+[ -z "$(stall_signature "$QD/unlabeled_wrong_token")" ]; chk "d013q_r3_fallback_requires_phase_fail" "$?" "0"
+# Le garde de protocole main distingue aussi PASS/FAIL exacts et ne repare pas
+# silencieusement un token avec whitespace INTERNE.
+phase_audit_has_token "$QD/unlabeled_r1" "PHASE_P0_FAIL"; chk "d013q_r3_fail_token_exact" "$?" "0"
+printf 'PHASE_ P0_FAIL\n- finding\n' > "$QD/token_internal_space"
+phase_audit_has_token "$QD/token_internal_space" "PHASE_P0_FAIL"; chk "d013q_r3_fail_token_internal_space_rejected" "$?" "1"
+
+# (r3-1b) P2 explicite desactive le fallback : P2-only reste sans signature,
+# meme si le rapport contient ensuite une phrase ordinaire commencant par High.
+printf 'PHASE_P0_FAIL\n\nP2\n\n- detail cosmetique\n\nHigh confidence: les checks passent.\n' > "$QD/p2_high_prose"
+[ -z "$(stall_signature "$QD/p2_high_prose")" ]; chk "d013q_r3_p2_high_prose_no_signature" "$?" "0"
+
+# (r3-2) "High confidence" n'est jamais un header ; les formes structurelles
+# restent reconnues (separateur explicite, bracket/bullet/gras).
+printf 'High confidence: texte ordinaire hors audit.\n' > "$QD/high_confidence_plain"
+[ -z "$(extract_p1_high_findings "$QD/high_confidence_plain")" ]; chk "d013q_r3_high_prose_not_header" "$?" "0"
+printf '## High: panne critique\n\n- factory/h.py:3\n' > "$QD/high_colon"
+printf '%s' "$(extract_p1_high_findings "$QD/high_colon")" | grep -qF 'panne critique'
+chk "d013q_r3_high_colon_header" "$?" "0"
+printf 'PHASE_P0_FAIL\n\n- **[P1] Crash liste gras**\n\n- factory/bold.py:4\n' > "$QD/bullet_bold"
+printf '%s' "$(extract_p1_high_findings "$QD/bullet_bold")" | grep -qF 'Crash liste gras'
+chk "d013q_r3_bullet_bold_header" "$?" "0"
+printf '### P1 Titre sans deux-points\n\n- factory/numbered.py:5\n' > "$QD/p1_space_title"
+printf '%s' "$(extract_p1_high_findings "$QD/p1_space_title")" | grep -qF 'Titre sans deux-points'
+chk "d013q_r3_p1_space_title_header" "$?" "0"
+
+# (r3-3) Token nu suivi d'un titre Markdown : le premier titre appartient au
+# finding et ne flush pas le bloc vide.
+printf 'P1\n\n### Empty input crashes\n\nDetails factory/nested.py:8.\n' > "$QD/bare_nested"
+BN="$(extract_p1_high_findings "$QD/bare_nested")"
+printf '%s' "$BN" | grep -qF '### Empty input crashes'; chk "d013q_r3_bare_nested_title_kept" "$?" "0"
+printf '%s' "$BN" | grep -qF 'Details factory/nested.py:8.'; chk "d013q_r3_bare_nested_body_kept" "$?" "0"
+
+# P0 est plus critique que P1 : il doit participer au stall au lieu d'etre
+# silencieusement traite comme une frontiere non critique.
+printf 'PHASE_P1_FAIL\n\n[P0] Corruption de donnees\n\n- factory/critical.py:1\n' > "$QD/p0_critical"
+P0PAY="$(extract_p1_high_findings "$QD/p0_critical")"
+printf '%s' "$P0PAY" | grep -qF 'Corruption de donnees'; chk "d013q_r3_p0_payload" "$?" "0"
+[ -n "$(stall_signature "$QD/p0_critical")" ]; chk "d013q_r3_p0_signature_nonempty" "$?" "0"
+
+# (r3-4) main calcule UNE signature, intercepte l'erreur parser AVANT
+# stall_action, la route en infra et preserve explicitement l'etat redirect.
+n_main_sig=$(grep -cF 'STALL_SIG="$(stall_signature "$AUDIT_CODEX")"' "$DRV")
+chk "d013q_r3_main_single_signature_calculation" "$n_main_sig" "1"
+parse_line=$(grep -nF 'if STALL_SIG="$(stall_signature "$AUDIT_CODEX")"; then' "$DRV" | head -1 | cut -d: -f1)
+action_line=$(grep -nF 'case "$(stall_action "$STALL_RC" "$REDIRECT_FLAG")" in' "$DRV" | head -1 | cut -d: -f1)
+[ -n "$parse_line" ] && [ -n "$action_line" ] && [ "$parse_line" -lt "$action_line" ]
+chk "d013q_r3_parser_guard_before_stall_action" "$?" "0"
+grep -qF 'audit Codex illisible (parser stall rc!=0) -> infra_fail, etat stall/redirect preserve' "$DRV"
+chk "d013q_r3_parser_failure_logged_as_infra" "$?" "0"
+# Le rc=2 n'est pas consommable par la table normal/progres : main intercepte
+# par un continue dans la branche d'erreur avant tout reset de flag.
+guard_block=$(sed -n "${parse_line},${action_line}p" "$DRV")
+printf '%s' "$guard_block" | grep -qF 'apply_backoff "$infra_fails"'; chk "d013q_r3_parser_infra_backoff" "$?" "0"
+printf '%s' "$guard_block" | grep -qF 'continue'; chk "d013q_r3_parser_infra_continue" "$?" "0"
+# Les deux autres sorties non exploitables du reviewer final sont aussi infra,
+# jamais des rounds de repair : fichier vide et token de verdict invalide.
+empty_guard=$(grep -nF 'audit Codex vide -> infra_fail, aucun round de repair consomme' "$DRV" | head -1 | cut -d: -f1)
+bad_token_guard=$(grep -nF 'verdict audit Codex invalide (attendu $TOKEN ou $FAIL_TOKEN en premiere ligne) -> infra_fail' "$DRV" | head -1 | cut -d: -f1)
+[ -n "$empty_guard" ] && [ "$empty_guard" -lt "$inc_line" ]; chk "d013q_r3_empty_audit_infra_before_budget" "$?" "0"
+[ -n "$bad_token_guard" ] && [ "$bad_token_guard" -lt "$inc_line" ]; chk "d013q_r3_bad_verdict_infra_before_budget" "$?" "0"
+
+# ====================================================================
+# D-013-quater FIX ROUND 4 : canonicalisation label/fallback et corruption
+# du SHA precedent routee en infra sans reset du flag de redirection.
+# ====================================================================
+
+# (r4-1) Le label de severite est une presentation, pas le finding. Le meme
+# contenu avec puis sans "P1" doit produire le meme payload/signature, afin
+# qu'une variation de format du reviewer apres redirection reste un stall.
+printf 'PHASE_P0_FAIL\n\nP1\n\n- factory/bin/direct.py:17 : blocage sans etiquette\n' > "$QD/labeled_same_as_fallback"
+LFSIG="$(stall_signature "$QD/labeled_same_as_fallback")"
+[ "$LFSIG" = "$USIG" ]; chk "d013q_r4_labeled_unlabeled_same_signature" "$?" "0"
+[ "$(extract_p1_high_findings "$QD/labeled_same_as_fallback")" = "$UF1" ]
+chk "d013q_r4_labeled_unlabeled_same_payload" "$?" "0"
+R4FLAG="$QD/r4_format_redirect.used"; : > "$R4FLAG"
+R4SHA="$QD/r4_format.sha256"; printf '%s' "$LFSIG" > "$R4SHA"
+audit_signature_same_as_previous "$R4SHA" "$USIG"
+chk "d013q_r4_format_change_detected_as_stall" "$?" "0"
+chk "d013q_r4_format_change_after_redirect_fails" "$(stall_action 0 "$R4FLAG")" "fail"
+
+# (r4-2) Seule l'ABSENCE du fichier precedent est un premier round (rc=1).
+# Tout fichier present mais vide, malforme ou non-regulier est un etat corrompu
+# (rc=2), jamais un faux progres susceptible de purger redirect_attempt.
+R4MISSING="$QD/r4_missing.sha256"
+audit_signature_same_as_previous "$R4MISSING" "$USIG"
+chk "d013q_r4_missing_previous_is_first_round" "$?" "1"
+R4EMPTY="$QD/r4_empty.sha256"; : > "$R4EMPTY"
+audit_signature_same_as_previous "$R4EMPTY" "$USIG"
+chk "d013q_r4_empty_previous_is_infra" "$?" "2"
+R4BAD="$QD/r4_bad.sha256"; printf 'not-a-sha256\n' > "$R4BAD"
+audit_signature_same_as_previous "$R4BAD" "$USIG"
+chk "d013q_r4_malformed_previous_is_infra" "$?" "2"
+R4DIR="$QD/r4_sha_directory"; mkdir "$R4DIR"
+audit_signature_same_as_previous "$R4DIR" "$USIG"
+chk "d013q_r4_nonregular_previous_is_infra" "$?" "2"
+rmdir "$R4DIR"
+R4DANGLING="$QD/r4_dangling.sha256"; ln -s "$QD/absent_target" "$R4DANGLING"
+audit_signature_same_as_previous "$R4DANGLING" "$USIG"
+chk "d013q_r4_dangling_previous_is_infra" "$?" "2"
+rm -f "$R4DANGLING"
+R4UPPER="$QD/r4_upper.sha256"; printf '%s' "$USIG" | tr '[:lower:]' '[:upper:]' > "$R4UPPER"
+audit_signature_same_as_previous "$R4UPPER" "$USIG"
+chk "d013q_r4_uppercase_valid_sha_matches" "$?" "0"
+
+# La production intercepte explicitement rc=2 avant stall_action et continue
+# dans la branche infra, en preservant les deux fichiers d'etat.
+compare_line=$(grep -nF 'if audit_signature_same_as_previous "$STALL_FILE" "$STALL_SIG"; then' "$DRV" | head -1 | cut -d: -f1)
+corrupt_guard_line=$(grep -nF 'if [ "$STALL_RC" -eq 2 ]; then' "$DRV" | head -1 | cut -d: -f1)
+action_line=$(grep -nF 'case "$(stall_action "$STALL_RC" "$REDIRECT_FLAG")" in' "$DRV" | head -1 | cut -d: -f1)
+[ -n "$compare_line" ] && [ -n "$corrupt_guard_line" ] && [ -n "$action_line" ] \
+  && [ "$compare_line" -lt "$corrupt_guard_line" ] && [ "$corrupt_guard_line" -lt "$action_line" ]
+chk "d013q_r4_corrupt_guard_before_stall_action" "$?" "0"
+corrupt_guard_block=$(sed -n "${corrupt_guard_line},${action_line}p" "$DRV")
+printf '%s' "$corrupt_guard_block" | grep -qF 'signature stall precedente invalide -> infra_fail, etat stall/redirect preserve'
+chk "d013q_r4_corrupt_previous_logged_as_infra" "$?" "0"
+printf '%s' "$corrupt_guard_block" | grep -qF 'apply_backoff "$infra_fails"'
+chk "d013q_r4_corrupt_previous_backoff" "$?" "0"
+printf '%s' "$corrupt_guard_block" | grep -qF 'continue'
+chk "d013q_r4_corrupt_previous_continue" "$?" "0"
+if printf '%s' "$corrupt_guard_block" | grep -qF 'purge_file_logged'; then
+  fail=$((fail+1)); echo "FAIL: d013q_r4 la garde de corruption purge un etat stall/redirect"
+else pass=$((pass+1)); fi
 
 # --- (5) REGRESSION EXPLICITE : aucun fichier last_audit_${PHASE}.sha256 n est
 #     jamais ecrit ou supprime en dehors de atomic_write_exact / purge_file_logged

@@ -627,6 +627,68 @@ réversible, fail-closed, puis CONTINUE — master order §AUTONOMIE TOTALE).
     `purge_file_logged`, `enter/exit_scoped_purge`, `extract_findings`,
     machine à états, FIX1/2/3, D-001..D-013-ter **tous byte-identiques** au
     commit précédent. `bash -n` + `git diff --check` verts.
+- **D-013-quater FIX round 3 (relecture finale du chemin complet)** :
+  1. **Contrat FAIL sans sévérité** — le prompt autorisait
+     `PHASE_P*_FAIL` suivi directement de findings `fichier:ligne`. En l'absence
+     de `P1`/`High`, l'ancienne extraction était vide et le même blocage ne
+     pouvait jamais staller. Le payload utilise maintenant un fallback
+     canonique à un bloc (`["..."]`) sur le corps après le verdict, mais seulement
+     lorsqu'**aucun** header de sévérité connu n'est présent. Un rapport
+     explicitement P2-only reste donc sans signature : aucun retour du faux
+     positif corrigé par D-013-quater.
+  2. **Formats structurés sans faux `High`** — le parseur reconnaît tokens nus,
+     titres (`P1: titre`, `P1 titre`), headings, labels, listes et emphase
+     Markdown (`## P1`, `[P1]`, `- **[P1] ...**`). `High` avec titre exige un
+     séparateur structurel ; une phrase `High confidence: ...` ne devient
+     jamais une sévérité. Le premier sous-titre après un token nu `P1` reste
+     dans son bloc. `P0`, plus grave que P1, est inclus dans les sévérités
+     critiques.
+  3. **Une seule signature par audit** — `main` calcule `STALL_SIG` une fois,
+     puis passe exactement ces mêmes octets à
+     `audit_signature_same_as_previous` et à `atomic_write_exact`. Il n'existe
+     plus deux parsings susceptibles de diverger entre comparaison et stockage.
+  4. **Erreur parser réellement distincte** — `stall_signature` /
+     `audit_same_as_previous` renvoient rc=2 sur rapport illisible, distinct du
+     rc=1 « non stalled ». `main` intercepte l'erreur avant `stall_action`, la
+     route vers le budget/backoff infra et conserve `redirect_attempt` ainsi
+     que le stall file : aucun faux « progrès réel », aucune deuxième
+     redirection rendue possible par un reset accidentel.
+  5. **Protocole reviewer fail-closed** — audit Codex vide ou première ligne
+     différente des tokens PASS/FAIL attendus = incident infra, zéro
+     `audit_repairs` consommé. Le prompt demande désormais des sévérités
+     explicites tout en conservant le fallback défensif.
+  6. **Autorités réconciliées après relecture globale** — le chemin audit
+     écrivait déjà `READY_FOR_FINAL_AUDIT → WAITING_INFRA`, mais
+     `legal_transition` et ses tests l'interdisaient. Cette transition infra
+     est maintenant légale et documentée dans le master order. Le master order
+     annonçait aussi encore 30 repairs alors que les constantes exécutées
+     avaient été redescendues à 6 : il est synchronisé sur
+     `MAX_P0_REPAIR=6`, `MAX_P1_REPAIR=6`, `MAX_INFRA_FAILS=10`, avec trois
+     checks croisés empêchant une nouvelle divergence.
+  - **Vérification ciblée** : **288 checks bash verts** dans
+    `test_driver_helpers.bash` (0 FAIL), dont fallback non étiqueté, P2-only,
+    prose `High`, formats Markdown, sous-titre après token nu, P0 critique,
+    rc=2 parser, calcul unique, garde infra avant budget, transition
+    audit→infra et cohérence des budgets code/documentation. Validation globale :
+    **155 pytest verts**, **34/34 checks `test_p0_reprise.bash`**, `bash -n` et
+    `git diff --check` verts sous Bash macOS 3.2.
+- **D-013-quater FIX round 4 (revue finale indépendante)** :
+  1. **Même finding, présentation différente** — le fallback non étiqueté
+     utilisait un objet JSON alors qu'un bloc P1 explicite utilisait un tableau.
+     Ajouter ou retirer seulement le label changeait donc le SHA, simulait un
+     progrès et pouvait réarmer une deuxième redirection. Les deux chemins
+     produisent maintenant le même tableau canonique à un élément ; le même
+     contenu `P1 → sans label` reste un stall et échoue immédiatement si la
+     redirection a déjà été tentée.
+  2. **SHA précédent corrompu** — l'absence du fichier reste le premier round
+     normal (rc=1), mais un fichier présent vide, illisible, non régulier ou
+     hors format SHA-256 renvoie désormais rc=2. `main` intercepte ce rc avant
+     `stall_action`, applique le budget/backoff infra et préserve strictement
+     le SHA ainsi que `redirect_attempt` : aucune corruption d'état ne peut
+     être interprétée comme un progrès ni réarmer une redirection.
+  - **Vérification ciblée** : **303 checks bash verts** (0 FAIL), incluant les
+    deux sens label/fallback, le flag déjà posé, l'absence normale du SHA et les
+    états vide, malformé, non régulier, lien pendant ou SHA valide en majuscules.
 - **Réversible** : oui — restaurer `sha256_file "$cur_file"` dans
   `audit_same_as_previous` et `sha256_file "$AUDIT_CODEX"` au site d'écriture
   restore le comportement précédent (comparaison sur le rapport entier) sans

@@ -291,7 +291,6 @@ SEVERITIES = r"P[0-4]|HIGH|MEDIUM|LOW|INFO|MINOR"
 
 def severity_header(raw):
     text = raw.strip()
-    markdown = bool(re.match(r"^#{1,6}\s+", text))
     text = re.sub(r"^#{1,6}\s*", "", text)
 
     match = re.match(
@@ -302,22 +301,28 @@ def severity_header(raw):
     if match:
         return match.group(1).upper(), (match.group(2) or "").strip()
 
-    match = re.match(rf"^({SEVERITIES})(.*)$", text, re.IGNORECASE)
+    # Frontiere de mot explicite apres le token de severite (fin de chaine,
+    # espace, ':' , '\u2014' ou '-' suivi d'un espace) : evite qu'un titre
+    # markdown tel que "## Highlights" ne matche "High"+"lights" (faux positif
+    # de stall/FAIL sur une signature critique sans finding reel).
+    match = re.match(
+        rf"^({SEVERITIES})(?=$|\s|[:\u2014]|-(?=\s))(.*)$",
+        text,
+        re.IGNORECASE,
+    )
     if not match:
         return None
 
     rest = match.group(2)
-    if rest.strip() and not markdown and not re.match(r"^\s*[:\u2014-]", rest):
-        return None
-
     title = re.sub(r"^\s*[:\u2014-]?\s*", "", rest)
     return match.group(1).upper(), title
 
 blocks = []
 current = None
+current_level = None
 
 def flush():
-    global current
+    global current, current_level
     if current is None:
         return
     while current and not current[0].strip():
@@ -327,17 +332,29 @@ def flush():
     if current:
         blocks.append("\n".join(current))
     current = None
+    current_level = None
 
 for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    heading_match = re.match(r"^\s*(#{1,6})\s+", raw)
+    heading_level = len(heading_match.group(1)) if heading_match else None
     header = severity_header(raw)
     if header:
         flush()
         severity, title = header
         current = [] if severity in {"P1", "HIGH"} else None
+        current_level = heading_level if current is not None else None
         if current is not None and title:
             current.append(title)
-    elif re.match(r"^\s*#{1,6}\s+", raw):
-        flush()
+    elif heading_level and current is not None:
+        # Un titre plus profond que le header de severite courant est un
+        # sous-titre du finding -> on l ajoute AU bloc (sinon "## P1" puis
+        # "### ..." vide le bloc et perd le finding = faux negatif de stall).
+        # Un titre de niveau egal ou moins profond ferme le bloc (nouvelle
+        # section de meme rang).
+        if current_level is None or heading_level <= current_level:
+            flush()
+        else:
+            current.append(raw)
     elif current is not None:
         current.append(raw)
 

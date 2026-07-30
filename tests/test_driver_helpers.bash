@@ -988,6 +988,36 @@ extract_p1_high_findings "$QD/brk_p1"  | grep -qF 'finding bracket factory/d.py:
 printf 'PHASE_P0_FAIL\n\n## Synthese\n\n- pas un finding de severite\n' > "$QD/md_nosev"
 [ -z "$(extract_p1_high_findings "$QD/md_nosev")" ]; chk "d013q_fix_md_non_severity_not_extracted" "$?" "0"
 
+# --- D-013-quater FIX round 2 (revue Codex) : 2 nouveaux correctifs P1. ---
+# (a2-fix) [P1] "## Highlights" ne doit PAS matcher "High"+"lights" (prefixe
+#     libre). Sinon signature critique non vide sans finding reel -> faux
+#     positif de stall/FAIL. Extraction DOIT rester vide.
+printf 'PHASE_P0_FAIL\n\n## Highlights\n\n- texte non-finding quelconque\n' > "$QD/highlights"
+HL="$(extract_p1_high_findings "$QD/highlights")"
+[ -z "$HL" ]; chk "d013q_fix2_highlights_not_high" "$?" "0"
+# variante : "## Highlander" et "High" isole nu reconnu (controle frontieres) :
+printf '## Highlander\n\n- encore un faux positif potentiel\n' > "$QD/highlander"
+[ -z "$(extract_p1_high_findings "$QD/highlander")" ]; chk "d013q_fix2_highlander_not_high" "$?" "0"
+printf 'High\n\n- vrai high nu factory/h.sh:9\n' > "$QD/high_bare"
+HB="$(extract_p1_high_findings "$QD/high_bare")"
+[ -n "$HB" ]; chk "d013q_fix2_high_bare_still_detected" "$?" "0"
+printf '%s' "$HB" | grep -qF 'vrai high nu factory/h.sh:9'; chk "d013q_fix2_high_bare_content" "$?" "0"
+# (b2-fix) [P1] un sous-titre PLUS profond que le header de severite ("## P1"
+#     puis "### ...") ne doit PAS vider le bloc : le contenu qui suit est un
+#     finding reel a extraire (sinon faux negatif -> stall jamais declenche).
+printf '## P1\n\n### Empty input crashes\n\nThe extractor fails on empty input factory/e.py:7.\n' > "$QD/subtitle"
+SB="$(extract_p1_high_findings "$QD/subtitle")"
+[ -n "$SB" ]; chk "d013q_fix2_subtitle_block_not_emptied" "$?" "0"
+printf '%s' "$SB" | grep -qF 'The extractor fails on empty input factory/e.py:7.'; chk "d013q_fix2_subtitle_desc_extracted" "$?" "0"
+printf '%s' "$SB" | grep -qF '### Empty input crashes'; chk "d013q_fix2_subtitle_kept_in_block" "$?" "0"
+# controle : un titre de meme rang ("##") ferme bien le bloc P1 (nouvelle section) :
+printf '## P1\n\n- finding A factory/a.py:1\n\n## Autre section\n\n- ne doit pas fuir factory/z.py:9\n' > "$QD/samerank"
+SR="$(extract_p1_high_findings "$QD/samerank")"
+printf '%s' "$SR" | grep -qF 'finding A factory/a.py:1'; chk "d013q_fix2_samerank_keeps_finding" "$?" "0"
+if printf '%s' "$SR" | grep -qF 'ne doit pas fuir factory/z.py:9'; then
+  fail=$((fail+1)); echo "FAIL: d013q_fix2 un titre de meme rang laisse fuiter le contenu hors-bloc"
+else pass=$((pass+1)); fi
+
 # (b-fix) FRONTIERES preservees : deux blocs P1 distincts "A" puis "B" produisent
 #     une signature DIFFERENTE d un seul bloc P1 fusionne "A\nB" (sinon un vrai
 #     changement de structure des findings serait masque en stall). La sortie

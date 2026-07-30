@@ -547,8 +547,8 @@ réversible, fail-closed, puis CONTINUE — master order §AUTONOMIE TOTALE).
   pilote ne touche que les 2 hunks du périmètre (corps du prédicat + nouvelles
   fonctions + site d'écriture).
 - **Vérification réelle** : **155 pytest verts** (inchangés) +
-  **252 checks bash verts** dans `test_driver_helpers.bash` (les 211 existants
-  + **41 checks `d013q`**, 0 FAIL) ; **34 checks bash verts** dans
+  **261 checks bash verts** dans `test_driver_helpers.bash` (les 211 existants
+  + **50 checks `d013q`**, 0 FAIL) ; **34 checks bash verts** dans
   `test_p0_reprise.bash` (34 PASS, 0 FAIL). Les nouveaux tests couvrent les 5
   scénarios exigés : (1) **faux négatif corrigé** — 2 rapports au même finding
   P1/High mais texte différent ailleurs → stall détecté (signature P1/High
@@ -596,8 +596,37 @@ réversible, fail-closed, puis CONTINUE — master order §AUTONOMIE TOTALE).
     un stall sur une signature incalculable (fail-closed : purge du stall file +
     log). Périmètre strict inchangé : seuls `extract_p1_high_findings`,
     `stall_signature`, `audit_same_as_previous`, le site d'écriture et la locale
-    `STALL_SIG` sont touchés (helpers D-013-ter, `stall_action`,
-    `build_cur_prompt`, machine à états, FIX1/2/3, D-001..D-013-ter préservés).
+     `STALL_SIG` sont touchés (helpers D-013-ter, `stall_action`,
+     `build_cur_prompt`, machine à états, FIX1/2/3, D-001..D-013-ter préservés).
+- **D-013-quater FIX round 2 (2ᵉ revue Codex : 2 corrections P1 + 3 validations)** :
+  1. **[P1] `## Highlights` interprété comme `High`** — la regex acceptait
+     `HIGH` comme simple *préfixe* de n'importe quel titre markdown
+     (`## Highlights` = `High`+`lights`) → signature critique non vide sans
+     finding réel → **faux positif** de stall/FAIL. `severity_header` exige
+     désormais une **frontière de mot explicite** après le token
+     (`$`/espace/`:`/`—`/`-` + espace) : `^({SEVERITIES})(?=$|\s|[:\u2014]|-(?=\s))(.*)$`,
+     et l'exception `not markdown` (qui contournait la règle pour les titres)
+     est supprimée. `## Highlights` / `## Highlander` → extraction vide.
+  2. **[P1] sous-titre d'un bloc P1 vide le finding** — avec `## P1` puis
+     `### Empty input crashes` (sous-titre *plus profond* que le header), le
+     sous-titre déclenchait un `flush()` sur un bloc encore vide → le contenu
+     critique suivant n'était jamais extrait → **faux négatif** (stall jamais
+     déclenché). Le parser conserve désormais le niveau markdown
+     (`current_level`) du header de sévérité : un titre *plus profond* est
+     **ajouté au bloc** (sous-titre du finding), un titre de niveau égal ou
+     moins profond ferme seul le bloc (nouvelle section de même rang).
+  - **3 validations (non-régressions, déjà conformes, vérifiées sans
+    réécriture)** : (3) `## P1` / `[P1] Titre` / `### High` reconnus comme
+    headers valides ; (4) deux blocs `P1→A`+`P1→B` → signature différente d'un
+    bloc fusionné `P1→A+B` (frontières JSON) ; (5) compte
+    `test_p0_reprise.bash` = 34 PASS / 0 FAIL confirmé.
+  - **Périmètre** : seul `extract_p1_high_findings` (`severity_header` + boucle
+    de parsing) est modifié dans le driver — confirmé par hash des corps :
+    `stall_signature`, `audit_same_as_previous`, `stall_action`,
+    `build_cur_prompt`, `commit_redirect`, `atomic_write_exact`,
+    `purge_file_logged`, `enter/exit_scoped_purge`, `extract_findings`,
+    machine à états, FIX1/2/3, D-001..D-013-ter **tous byte-identiques** au
+    commit précédent. `bash -n` + `git diff --check` verts.
 - **Réversible** : oui — restaurer `sha256_file "$cur_file"` dans
   `audit_same_as_previous` et `sha256_file "$AUDIT_CODEX"` au site d'écriture
   restore le comportement précédent (comparaison sur le rapport entier) sans

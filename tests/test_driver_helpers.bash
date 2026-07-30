@@ -15,6 +15,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 STATE_FILE="$TMP/state"
 LOG="$TMP/log"
+PHASE_FILE="$TMP/phase"
 : > "$LOG"
 
 pass=0; fail=0
@@ -34,6 +35,30 @@ chk "read_state_ws" "$(read_state)" "RUNNING"
 chk "read_state_empty" "$(read_state)" ""
 rm -f "$STATE_FILE"
 chk "read_state_missing" "$(read_state)" ""
+
+# --- P0 finding 6 (audit FAIL 27/07, fail-open) : read_state NE DOIT PAS
+# réparer silencieusement un état malformé. L'ancien ${raw//[[:space:]]/}
+# retirait TOUT whitespace -> "RUN NING" (espace interne) devenait "RUNNING"
+# -> state_kind renvoyait 'build' (fail-open). On exige désormais que l'espace
+# interne soit PRÉSERVÉ -> state_kind tranche 'illegal' -> fail-closed. ---
+printf "RUN NING\n" > "$STATE_FILE"
+chk "read_state_preserves_internal_ws" "$(read_state)" "RUN NING"
+chk "kind_internal_ws_is_illegal" "$(state_kind "$(read_state)")" "illegal"
+# idem via le VRAI garde de production : un état à espace interne fait exit 1.
+( enforce_legal_transition_or_die RUNNING "$(read_state)" )
+chk "prod_guard_internal_ws_state_exit1" "$?" "1"
+
+# --- P0 finding 6 (audit FAIL 27/07) : read_phase NE DOIT PAS réparer "P 1"
+# en "P1" (fail-open -> entrée en P1 sans checkpoint valide). L'ancien
+# `tr -d ' \r\n'` retirait l'espace interne -> "P1" accepté à tort. ---
+printf "P 1\n" > "$PHASE_FILE"
+read_phase >/dev/null
+chk "read_phase_rejects_internal_ws" "$?" "1"
+printf "P0\n" > "$PHASE_FILE"
+chk "read_phase_accepts_trimmed_P0" "$(read_phase)" "P0"
+printf "  P1 \n" > "$PHASE_FILE"
+chk "read_phase_trims_borders_only" "$(read_phase)" "P1"
+
 
 # --- D-005 : backoff_secs 30/120/300, capped, floor ---
 chk "backoff_1" "$(backoff_secs 1)" "30"

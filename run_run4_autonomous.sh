@@ -78,15 +78,32 @@ read_state() {
   if [ -f "$STATE_FILE" ]; then
     raw=$(<"$STATE_FILE")
   fi
-  raw=${raw//[[:space:]]/}                 # retire tout whitespace
-  raw=${raw#CAMPAIGN_STATE=}               # tolère un préfixe (ne matche jamais un état inconnu)
+  # D-003 : tolère un éventuel préfixe "CAMPAIGN_STATE=" laissé par GLM ET les
+  # espaces de BORD (trailing newline, indentation). MAIS (P0 finding 6 / audit
+  # fail-open 27/07) on ne retire PLUS les espaces INTERNES : un état malformé
+  # comme "RUN NING" ne doit PAS être réparé silencieusement en "RUNNING" — sinon
+  # state_kind ne le voit jamais comme illegal (fail-open). L'ancien
+  # `${raw//[[:space:]]/}` retirait TOUT whitespace -> normalisation silencieuse.
+  # On trime donc UNIQUEMENT les bords (idiom POSIX), on strippe le préfixe, et
+  # on laisse state_kind trancher sur la valeur exacte. Testé par
+  # tests/test_driver_helpers.bash (entrées malformées incluses).
+  raw="${raw#"${raw%%[![:space:]]*}"}"      # trim leading whitespace
+  raw=${raw#CAMPAIGN_STATE=}                # tolère un préfixe (D-003)
+  raw="${raw#"${raw%%[![:space:]]*}"}"      # re-trim leading (ex: "= RUNNING")
+  raw="${raw%"${raw##*[![:space:]]}"}"      # trim trailing whitespace
   printf '%s' "$raw"
 }
 
 # --- Contre-relecture GPT 29/07 : lecture stricte de la phase (jamais de reinit silencieuse). ---
 read_phase() {
   local p
-  p=$(cat "$PHASE_FILE" 2>/dev/null | tr -d ' \r\n')
+  p=$(cat "$PHASE_FILE" 2>/dev/null)
+  # P0 finding 6 / audit fail-open 27/07 : on ne retire PLUS les espaces internes
+  # (l'ancien `tr -d ' \r\n'` réparait silencieusement "P 1" en "P1", autorisant
+  # l'entrée en P1 sans checkpoint valide). On trime UNIQUEMENT les bords :
+  # "P 1" reste "P 1" -> ne matche pas P0|P1 -> return 1 (fail-closed).
+  p="${p#"${p%%[![:space:]]*}"}"
+  p="${p%"${p##*[![:space:]]}"}"
   case "$p" in
     P0|P1) printf '%s' "$p"; return 0 ;;
     *) return 1 ;;

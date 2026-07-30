@@ -764,6 +764,48 @@ audit_ok() {
   return 1
 }
 
+# --- Garde mémoire fail-closed AVANT tout appel agent (AUTORITÉ UNIQUE :
+# MASTER_ORDER § MACHINE À ÉTATS, point « Mémoire de leçons »). C'est une
+# garde P0 de la machine à états, applicable à CHAQUE itération builder
+# toutes phases confondues — PAS une fonction P1. Le brief P1 point 4 ne fait
+# qu'AJOUTER le test formel de ce hook (« le hook driver existe deja »).
+#
+# Extraction en fonction (30/07, round 2 Codex) : le précédent test
+# test_injection_failclosed.bash ne faisait que `grep` le source puis RÉPLIQUAIT
+# le contrat dans une fonction locale driver_contract() — il n'exécutait JAMAIS
+# le hook réel. Une régression du branchement/arrêt (par ex. exit 0 au lieu de
+# exit 1, ou STATE_FILE non écrit) laissait le test vert. Désormais le test
+# source le pilote et appelle CETTE fonction directement (en subshell pour
+# capturer l'exit) : toute régression du hook casse le test.
+#
+# Lit STATE_FILE/RECEIPTS_DIR/LOG de la portée appelante. Sort (exit 1) et
+# écrit MEMORY_SYSTEM_FAIL dans STATE_FILE si :
+#   - l'injecteur factory/bin/lesson_injector.py est absent ;
+#   - ou son rc n'est ni 0 ni (2 avec stderr vide).
+# $1 = numéro d'itération (pour le log).
+memory_preflight_or_die() {
+  local _mpf_iter="${1:-0}" _mpf_inj_err _mpf_inj_rc
+  if [ ! -f "factory/bin/lesson_injector.py" ]; then
+    echo "MEMORY_SYSTEM_FAIL" > "$STATE_FILE"
+    echo "[$(date -u +%FT%TZ)] iter $_mpf_iter: lesson_injector.py INTROUVABLE -> STATE=MEMORY_SYSTEM_FAIL -> arret" >> "$LOG"
+    exit 1
+  fi
+  _mpf_inj_err="$RECEIPTS_DIR/injector_stderr.$$"
+  python3 factory/bin/lesson_injector.py "healthcheck driver preflight" --format quiet >/dev/null 2>"$_mpf_inj_err"
+  _mpf_inj_rc=$?
+  # Contrat strict (contre-relecture GPT) : rc=0, OU rc=2 AVEC stderr vide (=
+  # MEMORY_VALID_NO_MATCH, seul cas rc=2 legitime). Un rc=2 avec stderr
+  # (erreur argparse/CLI) ou tout autre rc = panne -> MEMORY_SYSTEM_FAIL.
+  if [ "$_mpf_inj_rc" -eq 0 ] || { [ "$_mpf_inj_rc" -eq 2 ] && [ ! -s "$_mpf_inj_err" ]; }; then
+    rm -f "$_mpf_inj_err" 2>/dev/null
+    return 0
+  fi
+  cat "$_mpf_inj_err" >> "$LOG" 2>/dev/null
+  echo "MEMORY_SYSTEM_FAIL" > "$STATE_FILE"
+  echo "[$(date -u +%FT%TZ)] iter $_mpf_iter: lesson_injector rc=$_mpf_inj_rc avec stderr non vide ou rc inattendu -> STATE=MEMORY_SYSTEM_FAIL -> arret" >> "$LOG"
+  exit 1
+}
+
 main() {
   cd "$REPO" || { echo "Repo $REPO introuvable — crée-le et colle MASTER_ORDER_RUN4_MEMORY.md dedans d'abord." >&2; exit 1; }
   mkdir -p reports factory/campaigns memory
@@ -828,7 +870,7 @@ main() {
 
   local infra_fails=0 audit_repairs=0
   local ST rc i DIFF DIFF_TRUNC REVIEW_PROMPT PID_CLAUDE PID_CODEX
-  local PHASE PHASE_NOTE MAX_REPAIR CUR_PROMPT INJ_RC INJ_ERR TOKEN FAIL_TOKEN WT_DIRTY WT_STATE WT_DIFF_SHA
+  local PHASE PHASE_NOTE MAX_REPAIR CUR_PROMPT TOKEN FAIL_TOKEN WT_DIRTY WT_STATE WT_DIFF_SHA
   local PREV_ST
   local STALL_FILE REDIRECT_FLAG STALL_RC EXTRACTED REDIRECT_PROMPT
   # P0 finding 6 : état consommé au démarrage (post-resume). Sert de référence
@@ -1100,31 +1142,12 @@ $FINAL_AUDIT_PROMPT" > "$AUDIT_CODEX" 2>>"$LOG" \
   # --- Garde mémoire fail-closed AVANT tout appel agent (AUTORITÉ UNIQUE :
   # MASTER_ORDER § MACHINE À ÉTATS, point « Mémoire de leçons »). C'est une
   # garde P0 de la machine à états, applicable à CHAQUE itération builder
-  # toutes phases confondues — PAS une fonction P1. L'ancien commentaire la
-  # présentait comme un livrable P1 du driver : SECONDE autorité contradictoire
-  # (le prompt P1 point 4 ne fait qu'AJOUTER le test formel de ce hook déjà
-  # existant : « le hook driver existe deja ») ; corrigé pour que la SEULE
-  # autorité des états/gardes soit MASTER_ORDER § MACHINE À ÉTATS. ---
-  # rc=0 (leçons trouvees) et rc=2 (memoire valide, aucune leçon pertinente) sont sains ;
-  # rc=1 (store corrompu/schema invalide) ou injecteur manquant = MEMORY_SYSTEM_FAIL.
-  if [ ! -f "factory/bin/lesson_injector.py" ]; then
-    echo "MEMORY_SYSTEM_FAIL" > "$STATE_FILE"
-    echo "[$(date -u +%FT%TZ)] iter $i: lesson_injector.py INTROUVABLE -> STATE=MEMORY_SYSTEM_FAIL -> arret" >> "$LOG"
-    exit 1
-  fi
-  INJ_ERR="$RECEIPTS_DIR/injector_stderr.$$"
-  python3 factory/bin/lesson_injector.py "healthcheck driver preflight" --format quiet >/dev/null 2>"$INJ_ERR"
-  INJ_RC=$?
-  # Contrat strict (contre-relecture GPT) : rc=0, OU rc=2 AVEC stderr vide (= MEMORY_VALID_NO_MATCH,
-  # seul cas rc=2 legitime de l injecteur). Un rc=2 avec stderr (erreur argparse/CLI) = panne.
-  if [ "$INJ_RC" -eq 0 ] || { [ "$INJ_RC" -eq 2 ] && [ ! -s "$INJ_ERR" ]; }; then
-    rm -f "$INJ_ERR" 2>/dev/null
-  else
-    cat "$INJ_ERR" >> "$LOG" 2>/dev/null
-    echo "MEMORY_SYSTEM_FAIL" > "$STATE_FILE"
-    echo "[$(date -u +%FT%TZ)] iter $i: lesson_injector rc=$INJ_RC avec stderr non vide ou rc inattendu -> STATE=MEMORY_SYSTEM_FAIL -> arret" >> "$LOG"
-    exit 1
-  fi
+  # toutes phases confondues — PAS une fonction P1. Le brief P1 point 4 ne fait
+  # qu'AJOUTER le test formel de ce hook (« le hook driver existe deja »).
+  # Implémentation extraite dans memory_preflight_or_die (cf. doc de cette
+  # fonction) : le test formalise le hook en APPELANT la fonction réelle du
+  # pilote, pas en grep+réplique locale.
+  memory_preflight_or_die "$i"
   PHASE=$(read_phase) || { echo "[$(date -u +%FT%TZ)] phase invalide dans $PHASE_FILE -> arret fail-closed (aucune reinit silencieuse)" >> "$LOG"; exit 1; }
   # D-013-bis : CUR_PROMPT est construit par build_cur_prompt, qui PREPEND le
   # contenu d une eventuelle redirection chirurgicale D-013 (fichier

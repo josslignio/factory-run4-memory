@@ -157,5 +157,41 @@ else
   pass=$((pass+1))
 fi
 
+# --- P0 finding 6 (round 3, contre-audit Codex PHASE_P0_FAIL) : l'AUTORITÉ
+# UNIQUE s'applique AUSSI aux COMMENTAIRES du pilote, pas seulement à
+# MASTER_ORDER ni aux constantes. L'audit round 2 citait un commentaire du
+# driver (« max 3 échecs » run_run4_autonomous.sh:26) qui contredisait
+# MAX_INFRA_FAILS=10, et un « cap 2 » repair contredisant MAX_*_REPAIR=30 :
+# contradiction d'autorité À L'INTÉRIEUR du fichier du driver lui-même. On
+# vérifie qu'aucune mention périmée d'un seuil de budget ne subsiste dans le
+# driver (les chaînes exactes citées par l'audit), puis on généralise : tout
+# seuil numérique « max N échecs » (infra) ou « cap N » (repair) présent dans
+# un commentaire du driver DOIT valoir la constante correspondante. ---
+for bad in 'max 2 repairs' 'max 3 retries' 'max 3 échecs' 'max 3 echecs' 'cap 2'; do
+  if grep -qiF "$bad" "$REPO/run_run4_autonomous.sh"; then
+    fail=$((fail+1)); echo "FAIL: driver contient l'autorité périmée '$bad' (contradictoire avec MAX_*_REPAIR=30 / MAX_INFRA_FAILS=10)"
+  else
+    pass=$((pass+1))
+  fi
+done
+# Generalisation : tout « max <N> échecs » dans le driver doit egaliser
+# MAX_INFRA_FAILS ; tout « cap <N> » repair doit egaliser MAX_P0_REPAIR.
+drv_infra_mentions=$(grep -oiE 'max[[:space:]]+[0-9]+[[:space:]]+échecs' "$REPO/run_run4_autonomous.sh" | grep -oE '[0-9]+' || true)
+if [ -z "$drv_infra_mentions" ]; then
+  pass=$((pass+1))   # aucune mention infra explicite : pas de contradiction possible
+else
+  for n in $drv_infra_mentions; do
+    chk "driver_comment_infra_threshold_matches_constant($n)" "$n" "$drv_infra"
+  done
+fi
+drv_cap_mentions=$(grep -oiE 'cap[[:space:]]+[0-9]+' "$REPO/run_run4_autonomous.sh" | grep -oE '[0-9]+' || true)
+if [ -z "$drv_cap_mentions" ]; then
+  pass=$((pass+1))   # aucune mention « cap N » : pas de contradiction possible
+else
+  for n in $drv_cap_mentions; do
+    chk "driver_comment_repair_cap_matches_constant($n)" "$n" "$drv_p0"
+  done
+fi
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

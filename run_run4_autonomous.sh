@@ -22,8 +22,16 @@
 #   D-002 (Claude#2): reviewers en lecture seule technique (--allowedTools Read/Grep/Glob
 #                     pour claude, -s read-only pour codex), diff embarqué dans le prompt.
 #   D-003 (Claude#1): contrat d'état cohérent (prompt = valeur seule ; lecteur tolérant au préfixe).
-#   D-004 (Codex#2) : audit final gating — P1 -> retour RUNNING (cap 2) au lieu de WAITING_HUMAN_BOSS_GO.
-#   D-005 (Codex#3) : backoff infra 30/120/300s, max 3 échecs -> WAITING_INFRA.
+#   D-004 (Codex#2) : audit final gating — non-PASS -> retour RUNNING (round de
+#                     repair) au lieu de WAITING_HUMAN_BOSS_GO. Budget repair
+#                     courant = MAX_P0_REPAIR=30 / MAX_P1_REPAIR=30 (relevé 30/07
+#                     Jocelyn ; plus bas à l'origine). AUTORITÉ UNIQUE : § MACHINE
+#                     À ÉTATS du MASTER_ORDER + constantes ci-dessous.
+#   D-005 (Codex#3) : backoff infra 30/120/300s -> WAITING_INFRA. Seuil courant
+#                     = MAX_INFRA_FAILS=10 (relevé 30/07 Jocelyn ; plus bas à
+#                     l'origine). AUTORITÉ UNIQUE : § MACHINE À ÉTATS du
+#                     MASTER_ORDER + constante ci-dessous. Aucune valeur de
+#                     budget ailleurs ne doit contredire ces constantes.
 
 set -u
 REPO="${RUN4_REPO:-$HOME/factory-run4-memory}"   # surchargeable : RUN4_REPO=/chemin/worktree-conductor

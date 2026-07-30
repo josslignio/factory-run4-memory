@@ -349,6 +349,34 @@ class TestNoEnvOrFlagForcing(PromoteHarness):
         self.assertEqual(r.returncode, 2, r.stderr)
         self.assertEqual(self._mem_lines(), [])
 
+    def test_env_verdict_cannot_override_file_verdict_FAIL(self):
+        # Preuve PRECISE de l'invariant « verdict uniquement par artefact
+        # persiste » sur le CONSOMMATEUR promote (audit P1 round-repair).
+        # Contrairement a test_env_var_cannot_force_promotion (qui retire
+        # AUSSI le gate receipt et n'isole donc pas le verdict), ICI tous les
+        # artefacts sont valides et SEUL le verdict FICHIER vaut FAIL. On
+        # pollue l'environnement avec VERDICT=PASS (et variantes plausibles) :
+        # promote DOIT refuser (le fichier est l'autorite). Si promote lisait
+        # l'environnement pour le verdict, il promouvrait (rc=0) et ce test
+        # echouerait -> c'est une VRAIE regression test de l'invariant.
+        self._setup_valid(verdict=_verdict(verdict="FAIL"))
+        env = {"VERDICT": "PASS", "CODEX_VERDICT": "PASS",
+               "PROMOTE_VERDICT": "PASS", "REVIEW_VERDICT": "PASS",
+               "FORCE_VERDICT": "PASS"}
+        r = self._cli(env_extra=env)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("REFUS", r.stderr)
+        self.assertEqual(self._mem_lines(), [],
+                         "une env-var verdict ne doit JAMAIS promouvoir")
+
+    def test_env_verdict_cannot_override_file_verdict_NEEDS_FIX(self):
+        # Variante du precedent : verdict fichier = NEEDS_FIX (non-PASS) avec
+        # VERDICT=PASS dans l'env. Refus attendu (env ignore, fichier autorite).
+        self._setup_valid(verdict=_verdict(verdict="NEEDS_FIX"))
+        r = self._cli(env_extra={"VERDICT": "PASS", "CODEX_VERDICT": "PASS"})
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertEqual(self._mem_lines(), [])
+
     def test_cli_project_flag_does_not_force_promotion(self):
         # --project precise l'autorite du projet attendu, mais ne FORCE pas la
         # promotion : si le receipt est absent, refus quand meme.

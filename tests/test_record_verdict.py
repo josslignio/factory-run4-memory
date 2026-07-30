@@ -178,14 +178,25 @@ class TestFileIsOnlyProof(_TmpDir):
 
     def test_env_var_does_not_change_loaded_verdict(self):
         self._write(verdict="FAIL")
-        # On pollue l'environnement : ça ne doit RIEN changer à la lecture.
-        env = dict(os.environ, VERDICT="PASS", CODEX_VERDICT="PASS",
-                   REVIEW_VERDICT="PASS")
-        # load_verdict ne prend aucun env : le fichier reste l'autorité.
-        self.assertEqual(rv.load_verdict(self.out)["verdict"], "FAIL")
-        # Symétrique : on efface l'env, le verdict lu ne change pas.
-        for k in ("VERDICT", "CODEX_VERDICT", "REVIEW_VERDICT"):
-            env.pop(k, None)
+        # On POLLUE REELLEMENT os.environ du processus (audit P1 round-repair :
+        # l'ancien test construisait un dict sans jamais l'appliquer, donc ne
+        # prouvait rien). Si load_verdict consultait une variable d'env pour le
+        # verdict, elle s'imposerait ici et l'assertion casserait (PASS attendu
+        # au lieu de FAIL). load_verdict ne lit QUE le fichier -> 'FAIL' tient.
+        saved = {}
+        for k in ("VERDICT", "CODEX_VERDICT", "REVIEW_VERDICT", "PROMOTE_VERDICT"):
+            saved[k] = os.environ.get(k)
+            os.environ[k] = "PASS"
+        try:
+            self.assertEqual(rv.load_verdict(self.out)["verdict"], "FAIL")
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        # Symetrique : l'env epure ne change rien non plus (deja verifie par le
+        # finally, on reconfirme explicitement la valeur lue).
         self.assertEqual(rv.load_verdict(self.out)["verdict"], "FAIL")
 
     def test_only_persisted_file_can_speak(self):

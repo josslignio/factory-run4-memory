@@ -9,8 +9,8 @@ Valide factory/bin/lesson_injector.py sur critères OBJECTIFS :
     remontent et pas d'autres ») ;
   - score, tri (score puis severity puis id), tie-break stable ;
   - formats text/json/quiet ;
-  - CLI : arg positionnel, --task-file, stdin, rc=2 si rien ne matche,
-    rc=1 si tâche vide / mémoire absente.
+  - CLI : arg positionnel, --task-file, stdin, rc=0 si sain (match OU
+    non-match), rc=1 si tâche vide / mémoire absente (contrat P1 fail-closed).
 
 Usage : python3 tests/test_lesson_injector.py
 Stdlib uniquement.
@@ -294,7 +294,7 @@ class TestRender(unittest.TestCase):
 
 class TestCli(unittest.TestCase):
     """ Intégration CLI : arg positionnel, --task-file, stdin, codes de
-    retour (0 ok, 2 vide, 1 erreur). """
+    retour (0 sain match OU non-match, 1 panne ; 2 argparse). """
 
     def _capture(self, argv, stdin_text=None):
         """Invoque inj.main avec argv, capture stdout/stderr/rc."""
@@ -343,11 +343,19 @@ class TestCli(unittest.TestCase):
         ids = set(out.strip().splitlines())
         self.assertTrue(EXPECTED_BROAD.issubset(ids))
 
-    def test_no_match_returns_2(self):
-        rc, _, _ = self._capture(
+    def test_no_match_returns_0(self):
+        # Contrat P1 fail-closed : rc!=0 = panne système UNIQUEMENT. Un run
+        # sain (mémoire lisible) sans leçon pertinente est un SUCCÈS (rc=0) ;
+        # la sortie vide signale le non-match. Renvoyer rc!=0 forcerait le
+        # préflight driver à un MEMORY_SYSTEM_FAIL intempestif sur mémoire
+        # saine (audit P1 round 5 : l'ancien rc=2 était ambigu avec argparse).
+        rc, out, _ = self._capture(
             ["tâche sans aucun rapport avec les leçons", "--format", "quiet"])
-        self.assertEqual(rc, 2,
-                         "rien à injecter doit renvoyer rc=2 (fail-closed)")
+        self.assertEqual(rc, 0,
+                         "non-match sur mémoire saine doit renvoyer rc=0 "
+                         "(sain), PAS rc=2 (qui forcerait un arrêt driver)")
+        self.assertEqual(out.strip(), "",
+                         "non-match en --format quiet produit une sortie vide")
 
     def test_empty_task_returns_1(self):
         rc, _, err = self._capture(["   "])

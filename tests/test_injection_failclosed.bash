@@ -2,9 +2,9 @@
 # Tests de l'INJECTION FAIL-CLOSED — master order Run 4, PHASE P1, fonction 4.
 #
 # Prouve que le driver appelle `lesson_injector.py ... --format quiet` AVANT
-# chaque tâche builder et s'arrête en MEMORY_SYSTEM_FAIL si rc!=0 (et pas
-# rc=2-clean). Le hook driver EXISTE DÉJÀ (garde P0 de la machine à états) ;
-# ce fichier AJOUTE le test formel qui le prouve (point 4 du brief P1).
+# chaque tâche builder et s'arrête en MEMORY_SYSTEM_FAIL si rc!=0 (contrat
+# STRICT, AUCUN carve-out). Le hook driver EXISTE DÉJÀ (garde P0 de la machine
+# à états) ; ce fichier AJOUTE le test formel qui le prouve (point 4 du brief P1).
 #
 # TROIS niveaux de preuve, du plus faible au plus fort :
 #
@@ -15,8 +15,8 @@
 #
 #   2. COMPORTEMENTAL injecteur : le VRAI lesson_injector.py renvoie rc=1 sur
 #      une mémoire corrompue (déclencheur attendu par la branche driver), rc=0
-#      ou rc=2-clean sur mémoire saine. Preuve que l'injecteur réel tient son
-#      contrat (la fonction driver s'appuie dessus).
+#      sur mémoire saine (match OU non-match, contrat strict P1). Preuve que
+#      l'injecteur réel tient son contrat (la fonction driver s'appuie dessus).
 #
 #   3. COMPORTEMENTAL FONCTION DRIVER RÉELLE (round 2 Codex 30/07, fix du
 #      defect « test ne lançait jamais le pilote réel ») : on source le
@@ -67,8 +67,10 @@ grep -qF 'memory_preflight_or_die()' "$DRV" \
   && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: fonction memory_preflight_or_die absente"; }
 grep -qF 'echo "MEMORY_SYSTEM_FAIL" > "$STATE_FILE"' "$DRV" \
   && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: écriture MEMORY_SYSTEM_FAIL absente"; }
-# (c) la branche EXIT 1 sur échec (arrêt, pas de continuation silencieuse) :
-grep -qE 'rc=.*avec stderr non vide ou rc inattendu.*MEMORY_SYSTEM_FAIL.*arret' "$DRV" \
+# (c) la branche EXIT 1 sur échec (arrêt, pas de continuation silencieuse).
+#     Log strict (audit P1 round 5) : mentionne le rc, la panne système,
+#     MEMORY_SYSTEM_FAIL et l'arrêt — plus l'ancien wording « stderr non vide ».
+grep -qE 'rc=\$_mpf_inj_rc \(!=0.*MEMORY_SYSTEM_FAIL.*arret' "$DRV" \
   && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: log + exit MEMORY_SYSTEM_FAIL absent"; }
 # (c.bis) exit 1 explicite après chaque MEMORY_SYSTEM_FAIL : on extrait les
 # lignes 'arret' et on vérifie que la ligne qui suit dans le source est
@@ -87,9 +89,15 @@ for i, ln in enumerate(src):
 sys.exit(0 if seen > 0 and hits == seen else 1)
 PY
 if [ "$?" = "0" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: exit 1 après MEMORY_SYSTEM_FAIL absent"; fi
-# (d) le contrat rc=0 OU (rc=2 ET stderr vide) est bien la condition saine :
-grep -qF '[ "$_mpf_inj_rc" -eq 0 ] || { [ "$_mpf_inj_rc" -eq 2 ] && [ ! -s "$_mpf_inj_err" ]; }' "$DRV" \
-  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: contrat rc=0 || (rc=2 && stderr vide) absent"; }
+# (d) le contrat STRICT rc=0 (AUCUN carve-out rc=2) est la condition saine.
+#     Audit P1 round 5 (Codex) : l'ancien grep exigeait le carve-out
+#     rc=2 && stderr-vide, entérinant le contournement au lieu de le détecter.
+grep -qF 'if [ "$_mpf_inj_rc" -eq 0 ]; then' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: contrat strict rc=0 absent"; }
+# (d.bis) AUCUN carve-out rc=2 ne doit subsister dans la condition saine du
+#         driver : sa présence = audit P1 round 5 non fermé.
+! grep -qF '[ "$_mpf_inj_rc" -eq 2 ]' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: carve-out rc=2 toujours present dans le driver (audit P1 round 5 non ferme)"; }
 # (e) injecteur manquant -> MEMORY_SYSTEM_FAIL (jamais de repli silencieux) :
 grep -qE 'if \[ ! -f "factory/bin/lesson_injector.py" \]' "$DRV" \
   && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: garde injecteur-manquant absente"; }
@@ -107,15 +115,12 @@ grep -qE 'Garde m.moire fail-closed AVANT tout appel agent' "$DRV" \
 #    On utilise --memory pour pointer sur des mémoires de test (la mémoire
 #    réelle du repo n'est JAMAIS touchée par cette section).
 # ====================================================================
-# (a) mémoire SAINE : le préflight healthcheck doit renvoyer 0 ou 2-clean.
+# (a) mémoire SAINE : le préflight healthcheck doit renvoyer rc=0 (contrat
+#     strict injecteur : mémoire saine -> rc=0, match OU non-match).
 ERR_OK="$TMP/inj_ok_stderr"
 python3 "$INJ" "healthcheck driver preflight" --format quiet --memory memory/lessons.jsonl >/dev/null 2>"$ERR_OK"
 RC_OK=$?
-if [ "$RC_OK" -eq 0 ] || { [ "$RC_OK" -eq 2 ] && [ ! -s "$ERR_OK" ]; }; then
-  pass=$((pass+1))
-else
-  fail=$((fail+1)); echo "FAIL: mémoire saine -> injector rc=$RC_OK (attendu 0 ou 2-clean)"
-fi
+chk "sane_memory_rc0" "$RC_OK" "0"
 
 # (b) mémoire CORROMPUE : l'injecteur doit renvoyer rc=1 (le déclencheur exact
 #     de MEMORY_SYSTEM_FAIL côté driver). Stderr non vide.
@@ -226,9 +231,15 @@ run_real_preflight "rc127" "MEMORY_SYSTEM_FAIL" "1"
 write_stub 42 "weird rc\n"
 run_real_preflight "rc42" "MEMORY_SYSTEM_FAIL" "1"
 
-# (e) STUB rc=2 SANS stderr (MEMORY_VALID_NO_MATCH, cas légitime) -> RUNNING + exit 0.
+# (e) STUB rc=2 SANS stderr -> MEMORY_SYSTEM_FAIL + exit 1 (contrat STRICT).
+#     Audit P1 round 5 (Codex) FERMÉ : l'ancien contrat acceptait rc=2+stderr-
+#     vide et continuait (RUNNING) ; c'était précisément le contournement que
+#     l'audit a signalé comme non-détecté (le test l'entérinait). Désormais TOUT
+#     rc!=0 arrête. NB : avec le contrat injecteur strict (commit jumeau), un
+#     non-match sain renvoie rc=0 (jamais rc=2) ; rc=2 n'est plus un état
+#     injecteur légitime, et le driver le traite — à juste titre — comme panne.
 write_stub 2 ""
-run_real_preflight "rc2_clean" "RUNNING" "0"
+run_real_preflight "rc2_clean" "MEMORY_SYSTEM_FAIL" "1"
 
 # (f) STUB rc=0 SANS stderr (leçons trouvées) -> RUNNING + exit 0.
 write_stub 0 ""

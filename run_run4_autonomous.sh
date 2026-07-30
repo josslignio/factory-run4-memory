@@ -781,7 +781,7 @@ audit_ok() {
 # Lit STATE_FILE/RECEIPTS_DIR/LOG de la portée appelante. Sort (exit 1) et
 # écrit MEMORY_SYSTEM_FAIL dans STATE_FILE si :
 #   - l'injecteur factory/bin/lesson_injector.py est absent ;
-#   - ou son rc n'est ni 0 ni (2 avec stderr vide).
+#   - ou son rc != 0 (contrat STRICT P1 fonction 4 : rc!=0 = panne système).
 # $1 = numéro d'itération (pour le log).
 memory_preflight_or_die() {
   local _mpf_iter="${1:-0}" _mpf_inj_err _mpf_inj_rc
@@ -793,16 +793,22 @@ memory_preflight_or_die() {
   _mpf_inj_err="$RECEIPTS_DIR/injector_stderr.$$"
   python3 factory/bin/lesson_injector.py "healthcheck driver preflight" --format quiet >/dev/null 2>"$_mpf_inj_err"
   _mpf_inj_rc=$?
-  # Contrat strict (contre-relecture GPT) : rc=0, OU rc=2 AVEC stderr vide (=
-  # MEMORY_VALID_NO_MATCH, seul cas rc=2 legitime). Un rc=2 avec stderr
-  # (erreur argparse/CLI) ou tout autre rc = panne -> MEMORY_SYSTEM_FAIL.
-  if [ "$_mpf_inj_rc" -eq 0 ] || { [ "$_mpf_inj_rc" -eq 2 ] && [ ! -s "$_mpf_inj_err" ]; }; then
+  # Contrat STRICT (brief P1 fonction 4 verbatim : « s arrete en
+  # MEMORY_SYSTEM_FAIL si rc!=0 ») : TOUT rc != 0 = panne système ->
+  # MEMORY_SYSTEM_FAIL + exit 1. AUCUN carve-out. L'injecteur renvoie rc=0
+  # sur mémoire saine (match OU non-match), rc!=0 uniquement sur panne
+  # (mémoire absente/illisible, schéma invalide, argparse/CLI cassée).
+  # Audit P1 round 5 (Codex) fermé : l'ancien carve-out « rc=2 && stderr vide »
+  # laissait un rc=2 continuer -> ne détectait pas la régression ; ce test
+  # l'entérinait. Le contrat strict + le contrat injecteur rc!=0=panne
+  # (commit jumeau factory/bin/lesson_injector.py) ferment le défaut pour de bon.
+  if [ "$_mpf_inj_rc" -eq 0 ]; then
     rm -f "$_mpf_inj_err" 2>/dev/null
     return 0
   fi
   cat "$_mpf_inj_err" >> "$LOG" 2>/dev/null
   echo "MEMORY_SYSTEM_FAIL" > "$STATE_FILE"
-  echo "[$(date -u +%FT%TZ)] iter $_mpf_iter: lesson_injector rc=$_mpf_inj_rc avec stderr non vide ou rc inattendu -> STATE=MEMORY_SYSTEM_FAIL -> arret" >> "$LOG"
+  echo "[$(date -u +%FT%TZ)] iter $_mpf_iter: lesson_injector rc=$_mpf_inj_rc (!=0, panne système) -> STATE=MEMORY_SYSTEM_FAIL -> arret" >> "$LOG"
   exit 1
 }
 

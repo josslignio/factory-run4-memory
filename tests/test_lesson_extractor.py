@@ -33,6 +33,26 @@ from lesson_extractor import (  # noqa: E402
     build_lesson,
     extract_lessons,
 )
+
+
+def _purge_tmp(path):
+    """Nettoyage NON récursif (règle 7 absolue : INTERDIT rm/shutil récursif
+    ou large). Supprime uniquement les FICHIERS directs de `path` (un seul
+    niveau) puis tente os.rmdir (no-op sûr si non vide)."""
+    try:
+        for name in os.listdir(path):
+            full = os.path.join(path, name)
+            if os.path.isfile(full) and not os.path.islink(full):
+                try:
+                    os.unlink(full)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    try:
+        os.rmdir(path)
+    except OSError:
+        pass
 from lesson_schema import (  # noqa: E402
     validate_lesson,
     LessonError,
@@ -187,9 +207,9 @@ class TestAppendIntegration(unittest.TestCase):
         self.addCleanup(self._cleanup)
 
     def _cleanup(self):
-        # Nettoyage LOCAL uniquement (règle : pas de rm récursif large).
-        import shutil
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        # Nettoyage LOCAL uniquement, NON récursif (règle 7 : pas de rm/shutil
+        # récursif large). _purge_tmp supprime les fichiers directs puis rmdir.
+        _purge_tmp(self.tmp)
 
     def test_append_then_collision_refused(self):
         base = Path(self.tmp) / "lessons.jsonl"
@@ -248,8 +268,7 @@ class TestOutConcurrentSerialization(unittest.TestCase):
         self.addCleanup(self._cleanup)
 
     def _cleanup(self):
-        import shutil
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        _purge_tmp(self.tmp)
 
     def test_two_concurrent_out_same_ids_one_wins_one_refuses(self):
         import subprocess

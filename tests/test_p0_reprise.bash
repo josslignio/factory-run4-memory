@@ -31,7 +31,16 @@ if grep -qiE "import hashlib|hmac|prev_hash|next_hash|chain_hash|merkle" "$RUNNE
   fail=$((fail+1)); echo "FAIL: 5g runner construit un chainage crypto"
 else pass=$((pass+1)); fi
 # Execution REELLE du runner (env overrides -> fichiers committes intacts).
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+TMP="$(mktemp -d)"
+_cleanup_tmp() {  # NON recursif (regle 7 absolue) : fichiers directs + rmdir.
+  [ -n "${1:-}" ] && [ -d "$1" ] || return 0
+  local f
+  for f in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+    [ -f "$f" ] && rm -f "$f"
+  done
+  rmdir "$1" 2>/dev/null || true
+}
+trap '_cleanup_tmp "${TMP:-}"; _cleanup_tmp "${TMP2:-}"' EXIT
 RL="$TMP/runlog.txt"
 RUN_ABLATION_LOG="$RL" RUN_ABLATION_JSON_A="$TMP/a.json" RUN_ABLATION_JSON_B="$TMP/b.json" \
   bash "$RUNNER" >/dev/null 2>&1

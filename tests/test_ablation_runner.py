@@ -32,14 +32,36 @@ ARM_A = REPO / "ablation" / "arm_a_lock_manager.py"
 ARM_B = REPO / "ablation" / "arm_b_lock_manager.py"
 
 
+def _purge_tmp(path):
+    """Nettoyage NON récursif (règle 7 absolue : INTERDIT rm/shutil récursif
+    ou large). Supprime uniquement les FICHIERS directs de `path` (un seul
+    niveau, sans descendre dans d'éventuels sous-répertoires, sans suivre de
+    lien) puis tente os.rmdir (no-op sûr si non vide). Les tmp de test ne
+    contiennent que des fichiers plats : ce nettoyage suffit sans enfreindre
+    la règle."""
+    try:
+        for name in os.listdir(path):
+            full = os.path.join(path, name)
+            if os.path.isfile(full) and not os.path.islink(full):
+                try:
+                    os.unlink(full)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    try:
+        os.rmdir(path)
+    except OSError:
+        pass
+
+
 class TestAblationRunner(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="run4_abl_runner_")
         self.addCleanup(self._cleanup)
 
     def _cleanup(self):
-        import shutil
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        _purge_tmp(self.tmp)
 
     def _run(self):
         # Redirige TOUTES les sorties vers le temp dir : journal + 2 JSON.

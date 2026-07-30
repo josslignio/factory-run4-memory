@@ -12,7 +12,15 @@ cd "$REPO"
 source ./run_run4_autonomous.sh
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+_cleanup_tmp() {  # NON recursif (regle 7 absolue) : fichiers directs + rmdir.
+  [ -n "${1:-}" ] && [ -d "$1" ] || return 0
+  local f
+  for f in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+    [ -f "$f" ] && rm -f "$f"
+  done
+  rmdir "$1" 2>/dev/null || true
+}
+trap '_cleanup_tmp "$TMP"' EXIT
 STATE_FILE="$TMP/state"
 LOG="$TMP/log"
 PHASE_FILE="$TMP/phase"

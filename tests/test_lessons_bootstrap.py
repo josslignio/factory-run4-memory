@@ -14,6 +14,7 @@ Valide memory/lessons.jsonl sur critères OBJECTIFS (pas d'opinion) :
 Usage : python3 tests/test_lessons_bootstrap.py
 Stdlib uniquement. Aucune dépendance externe.
 """
+import os
 import re
 import sys
 import unittest
@@ -27,6 +28,26 @@ LESSONS_FILE = REPO / "memory" / "lessons.jsonl"
 EXPECTED_MIN = 15
 REPO_TAG_RE = re.compile(r"factory-run3-lab@", re.IGNORECASE)
 FILE_LINE_RE = re.compile(r":[0-9]+(\D|$)")
+
+
+def _purge_tmp(path):
+    """Nettoyage NON récursif (règle 7 absolue : INTERDIT rm/shutil récursif
+    ou large). Supprime uniquement les FICHIERS directs de `path` (un seul
+    niveau) puis tente os.rmdir (no-op sûr si non vide)."""
+    try:
+        for name in os.listdir(path):
+            full = os.path.join(path, name)
+            if os.path.isfile(full) and not os.path.islink(full):
+                try:
+                    os.unlink(full)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    try:
+        os.rmdir(path)
+    except OSError:
+        pass
 
 
 class TestLessonsBootstrap(unittest.TestCase):
@@ -155,8 +176,7 @@ class TestBootstrapConcurrentSerialization(unittest.TestCase):
         self.addCleanup(self._cleanup)
 
     def _cleanup(self):
-        import shutil
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        _purge_tmp(self.tmp)
 
     def test_two_concurrent_bootstrap_same_dest_no_corruption(self):
         # MULTIPROCESSUS RÉEL : deux CLI bootstrap en parallèle (Popen

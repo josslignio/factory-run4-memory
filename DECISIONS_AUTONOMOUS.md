@@ -189,3 +189,41 @@ réversible, fail-closed, puis CONTINUE — master order §AUTONOMIE TOTALE).
   fichier vide/absent est un resserrement de sécurité, pas un changement
   sémantique pour les usages légitimes — le bootstrap utilise son propre
   `write_jsonl` sans logique de collision).
+
+## D-011 — Reprise P0 (post-FAIL) : re-vérification INDÉPENDANTE des 6 items, gate posée
+- **Contexte** : reprise « PHASE P0 UNIQUEMENT » après un FAIL. Les 6 items du
+  cœur P0 étaient déjà implémentés et commités sur `run4/build` (HEAD a
+  `CAMPAIGN_STATE=READY_FOR_FINAL_AUDIT`, le working tree avait été remis à
+  `RUNNING` par la boucle de repair du pilote). `main` reste `UNCHANGED`
+  (`43aa069` preflight).
+- **Ambiguïté** : faut-il faire confiance aux tests existants ou re-vérifier ?
+- **Décision (la plus sûre)** : re-vérification INDÉPENDANTE de CHAQUE item,
+  en sondant directement les scénarios exacts énumérés par la consigne (sans
+  faire confiance aux assertions des tests en place), via un harnais jetable
+  exécutant le vrai code produit.
+  - **Item 1 (`--source-tag`)** : vide→rc≠0, espaces→rc≠0, source remplacée
+    avec evidence ancienne→`ExtractionError`, source+evidence cohérentes→rc=0.
+  - **Item 2 (bloc `[FINDING]` vide)** : 1 valide→rc=0, 1 vide→rc≠0,
+    1 valide+1 vide→rc≠0 (fail-closed).
+  - **Item 3 (`bootstrap_lessons.write_jsonl`)** : 2 sous-processus réels
+    parallèles sur le même `--out`→rc=0 les deux (aucun deadlock via
+    `wait(timeout)`), 18 leçons valides (ni JSON partiel ni perte), aucun
+    `.tmp` résiduel, comptage `/dev/fd` stable sur 8 écritures (aucun fd
+    ouvert), `FileNotFoundError` capturé dans `main()`→rc=1 propre.
+  - **Item 4 (`ablation_checker` L-16)** : mutant `except OSError: return
+    False` sans `close`→L-16 `present` (DEFECT) ; version sûre (filet large
+    + `os.close`)→L-16 `absent`. La mesure comportementale (pas le texte)
+    tranche.
+  - **Item 5 (`RUN4_ABLATION_AB.md`)** : « append-only par convention
+    d'écriture », « NON tamper-evident », « NON scellé cryptographiquement »,
+    « aucun chaînage cryptographique construit » ; aucun Merkle/hash-chain
+    prétendu.
+  - **Item 6 (machine à états)** : `MASTER_ORDER` déclare l'« AUTORITÉ
+    UNIQUE », état invalide→fail-closed (« ne répare jamais silencieusement »),
+    pilote implémente `state_kind` (93/93 checks bash).
+- **Vérification réelle** : 22/22 checks indépendants + 137 pytest + 93/93
+  bash verts. Aucune fonctionnalité P1 (Sharp Core / receipt / promotion auto)
+  introduite dans `factory/bin`.
+- **Réversible** : oui (aucune modification de code produit cette reprise ;
+  seul le `CAMPAIGN_STATE` est reposé sur sa valeur de gate `READY_FOR_FINAL_AUDIT`,
+  déjà présente dans HEAD).

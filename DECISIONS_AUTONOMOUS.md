@@ -547,18 +547,17 @@ réversible, fail-closed, puis CONTINUE — master order §AUTONOMIE TOTALE).
   pilote ne touche que les 2 hunks du périmètre (corps du prédicat + nouvelles
   fonctions + site d'écriture).
 - **Vérification réelle** : **155 pytest verts** (inchangés) +
-  **238 checks bash verts** dans `test_driver_helpers.bash` (les 211 existants
-  + **27 nouveaux checks `d013q`**, 0 FAIL) ; `test_p0_reprise.bash` = 32 PASS /
-  2 FAIL **pré-existants** (chainage crypto / section autorité unique —
-  **sans rapport** avec D-013-quater, non introduits par ce changement). Les
-  nouveaux tests couvrent les 5 scénarios exigés : (1) **faux négatif corrigé**
-  — 2 rapports au même finding P1/High mais texte différent ailleurs → stall
-  détecté (signature P1/High identique), avec contre-preuve que l'ancien SHA du
-  rapport entier l'aurait manqué ; (2) **faux positif corrigé** — 2 rapports à
-  findings P2 identiques mais aucun P1/High → **pas** de stall/FAIL ; (3) cas
-  nominal — 2 rapports à finding P1/High différent → pas de stall ; (4)
-  multi-findings — plusieurs P1/High concaténés de façon **stable et
-  déterministe** entre deux appels, ordre d'apparition respecté, P2/P3 écartés ;
+  **252 checks bash verts** dans `test_driver_helpers.bash` (les 211 existants
+  + **41 checks `d013q`**, 0 FAIL) ; **34 checks bash verts** dans
+  `test_p0_reprise.bash` (34 PASS, 0 FAIL). Les nouveaux tests couvrent les 5
+  scénarios exigés : (1) **faux négatif corrigé** — 2 rapports au même finding
+  P1/High mais texte différent ailleurs → stall détecté (signature P1/High
+  identique), avec contre-preuve que l'ancien SHA du rapport entier l'aurait
+  manqué ; (2) **faux positif corrigé** — 2 rapports à findings P2 identiques
+  mais aucun P1/High → **pas** de stall/FAIL ; (3) cas nominal — 2 rapports à
+  finding P1/High différent → pas de stall ; (4) multi-findings — plusieurs
+  P1/High émis en tableau JSON **stable et déterministe** entre deux appels,
+  ordre d'apparition respecté, P2/P3 écartés ;
   (5) **régression explicite** — aucun `last_audit_${PHASE}.sha256` écrit ou
   supprimé hors `atomic_write_exact`/`purge_file_logged` (garde étendue à
   l'écriture, pas seulement à la suppression).
@@ -567,6 +566,38 @@ réversible, fail-closed, puis CONTINUE — master order §AUTONOMIE TOTALE).
   structurels greppant `$DRV` doivent donc être lancés avec
   `RUN4_REPO="$PWD"` (override documenté ligne 37) pour pointer sur le driver
   du worktree ; les tests comportementaux sourcent toujours le driver local.
+  **Locale** : le contenu du repo étant français (accents), les tests greppant
+  des caractères multi-octets (ex. `test_p0_reprise.bash` items 5d/6a) exigent
+  une locale UTF-8 (`LC_ALL=en_US.UTF-8`) — en locale POSIX/`C`, le `.` de grep
+  matche un octet et rate les accents (faux échec). Lancer la suite avec
+  `LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 RUN4_REPO="$PWD"`.
+- **D-013-quater FIX (revue Codex du commit, 3 correctifs ciblés)** :
+  1. **[P1] en-têtes de sévérité non reconnus** — le parser n'acceptait qu'une
+     ligne *exactement* égale à `P1`/`High`. Codex produit légitimement `## P1`,
+     `[P1] Titre`, `### High` → signature vide → finding critique récurrent
+     jamais détecté. Désormais `extract_p1_high_findings` (parser Python)
+     reconnaît les formes nue, titre markdown (`#{1,6}`) et étiquette entre
+     crochets (`[P1]`/`[High]`, avec séparateur `:`/`—`/`-` et titre optionnel).
+  2. **[P2] frontières de blocs perdues** — les en-têtes étaient supprimés
+     avant concaténation, donc `P1→A` + `P1→B` produisaient la même signature
+     qu'un seul `P1→A+B` (vrai changement de structure masqué en stall). La
+     sortie est désormais un **tableau JSON** (un élément par bloc, frontières
+     préservées) → signatures distinctes.
+  3. **[P3] compte `test_p0_reprise.bash`** — la version initiale annonçait à
+     tort « 32 PASS / 2 FAIL pré-existants » (en réalité un artefact de locale
+     POSIX : les contenus `Aucun chaînage cryptographique` et `MACHINE À ÉTATS —
+     AUTORITÉ` sont bien présents). Corrigé en **34 PASS, 0 FAIL** (locale
+     UTF-8).
+  - **Propagation d'échec** : un échec du parser (fichier illisible / UTF-8
+    invalide) remonte désormais en rc=1 — `stall_signature` →
+    `cur="$(stall_signature …)" || return 1` dans `audit_same_as_previous`, et
+    site d'écriture `if STALL_SIG="$(stall_signature …)" && atomic_write_exact …`
+    (variable `STALL_SIG` ajoutée aux locales de `main`). On ne décide JAMAIS
+    un stall sur une signature incalculable (fail-closed : purge du stall file +
+    log). Périmètre strict inchangé : seuls `extract_p1_high_findings`,
+    `stall_signature`, `audit_same_as_previous`, le site d'écriture et la locale
+    `STALL_SIG` sont touchés (helpers D-013-ter, `stall_action`,
+    `build_cur_prompt`, machine à états, FIX1/2/3, D-001..D-013-ter préservés).
 - **Réversible** : oui — restaurer `sha256_file "$cur_file"` dans
   `audit_same_as_previous` et `sha256_file "$AUDIT_CODEX"` au site d'écriture
   restore le comportement précédent (comparaison sur le rapport entier) sans

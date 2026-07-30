@@ -238,8 +238,10 @@ audit_same_as_previous() {
   # P1/High extraits du rapport (stall_signature), PAS sur le rapport entier.
   # Si le rapport courant ne contient AUCUN finding P1/High, pas de stall
   # possible : l absence de finding critique est un etat distinct (D-013 vise un
-  # blocage CRITIQUE recurrent, pas une stagnation cosmetique sur du P2).
-  cur="$(stall_signature "$cur_file")"
+  # blocage CRITIQUE recurrent, pas une stagnation cosmetique sur du P2). Un
+  # echec du parser (rc 1) est propage (on ne decide JAMAIS d un stall sur une
+  # signature incalculable).
+  cur="$(stall_signature "$cur_file")" || return 1
   [ -n "$cur" ] || return 1
   [ "$prev" = "$cur" ]
 }
@@ -262,42 +264,107 @@ audit_same_as_previous() {
 
 # extract_p1_high_findings : extrait DETERMINISTEMENT les blocs de findings de
 # severite P1 ou High d un rapport d audit Codex. Un en-tete de severite est
-# une ligne dont le contenu (hors whitespace de bordure) vaut EXACTEMENT "P1"
-# ou "High" (insensible a la casse) ; les autres en-tetes connus (P2/P3/P4/
-# Medium/Low/Info/Minor) ferment le bloc courant. Les lignes situees entre un
-# en-tete P1/High et le prochain en-tete de severite (ou la fin du rapport)
-# forment le bloc P1/High. Plusieurs blocs P1/High sont concatenes dans l ordre
-# d apparition (stable, deterministe : meme entree -> meme sortie). Renvoie
-# vide si aucun finding P1/High n est present. Teste reellement par
-# tests/test_driver_helpers.bash.
+# reconnu dans toutes les formes legitimement produites par Codex : "P1" / "High"
+# nus, mais aussi "## P1", "### High" (titres markdown) ou "[P1] Titre" /
+# "[High] ..." (etiquettes entre crochets, avec optionnellement un separateur
+# ':'/'—'/'-' et un titre). Les autres severites (P0/P2/P3/P4/Medium/Low/Info/
+# Minor) ferment le bloc courant. Plusieurs blocs P1/High sont emis comme un
+# TABLEAU JSON de chaines (une par bloc, frontieres PRESERVEES) dans l ordre
+# d apparition (stable, deterministe : meme entree -> meme sortie). Conserver
+# les frontieres entre blocs evite que deux blocs distincts "P1->A" et "P1->B"
+# produisent la meme signature qu un seul bloc "P1->A+B" (masquerait un vrai
+# changement de structure en stall). Renvoie vide si aucun finding P1/High.
+# Echec du parser (fichier illisible, UTF-8 invalide) -> rc!=0 propage a l
+# appelant (stall_signature -> audit_same_as_previous / site d ecriture).
+# Teste reellement par tests/test_driver_helpers.bash.
 extract_p1_high_findings() {
   local f="$1"
   [ -s "$f" ] || return 0
-  awk '
-    {
-      line=$0
-      gsub(/^[[:space:]]+|[[:space:]]+$/,"",line)
-      tok=toupper(line)
-      if (tok=="P1" || tok=="HIGH") { cur=1; next }
-      if (tok=="P2" || tok=="P3" || tok=="P4" || tok=="MEDIUM" || tok=="LOW" || tok=="INFO" || tok=="MINOR") { cur=0; next }
-      if (cur) print $0
-    }
-  ' "$f" 2>/dev/null || return 0
+
+  python3 - "$f" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+SEVERITIES = r"P[0-4]|HIGH|MEDIUM|LOW|INFO|MINOR"
+
+def severity_header(raw):
+    text = raw.strip()
+    markdown = bool(re.match(r"^#{1,6}\s+", text))
+    text = re.sub(r"^#{1,6}\s*", "", text)
+
+    match = re.match(
+        rf"^\[({SEVERITIES})\](?:\s*[:\u2014-]?\s*(.*))?$",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        return match.group(1).upper(), (match.group(2) or "").strip()
+
+    match = re.match(rf"^({SEVERITIES})(.*)$", text, re.IGNORECASE)
+    if not match:
+        return None
+
+    rest = match.group(2)
+    if rest.strip() and not markdown and not re.match(r"^\s*[:\u2014-]", rest):
+        return None
+
+    title = re.sub(r"^\s*[:\u2014-]?\s*", "", rest)
+    return match.group(1).upper(), title
+
+blocks = []
+current = None
+
+def flush():
+    global current
+    if current is None:
+        return
+    while current and not current[0].strip():
+        current.pop(0)
+    while current and not current[-1].strip():
+        current.pop()
+    if current:
+        blocks.append("\n".join(current))
+    current = None
+
+for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    header = severity_header(raw)
+    if header:
+        flush()
+        severity, title = header
+        current = [] if severity in {"P1", "HIGH"} else None
+        if current is not None and title:
+            current.append(title)
+    elif re.match(r"^\s*#{1,6}\s+", raw):
+        flush()
+    elif current is not None:
+        current.append(raw)
+
+flush()
+
+if blocks:
+    sys.stdout.write(
+        json.dumps(blocks, ensure_ascii=False, separators=(",", ":"))
+    )
+PY
 }
 
 # stall_signature : SHA-256 du texte des findings P1/High extraits (via
-# extract_p1_high_findings). C est la signature EFFECTIVEMENT stockee dans
-# last_audit_${PHASE}.sha256 et comparee par audit_same_as_previous. L usage
-# d une FONCTION UNIQUE pour stocker ET comparer garantit la coherence
-# byte-exacte de la paire ecriture/lecture (lecon D-013-ter : un ecart entre
-# les deux -> faux negatif de stall). Renvoie vide si le rapport ne contient
-# AUCUN finding P1/High (etat distinct -> pas de stall possible).
+# extract_p1_high_findings, sortie tableau JSON frontieres preservees). C est la
+# signature EFFECTIVEMENT stockee dans last_audit_${PHASE}.sha256 et comparee par
+# audit_same_as_previous. L usage d une FONCTION UNIQUE pour stocker ET comparer
+# garantit la coherence byte-exacte de la paire ecriture/lecture (lecon D-013-ter
+# : un ecart entre les deux -> faux negatif de stall). Renvoie vide (rc 0) si le
+# rapport ne contient AUCUN finding P1/High (etat distinct -> pas de stall
+# possible) ; rc 1 si le parser echoue (propage a l appelant).
 stall_signature() {
   local f="$1" extracted
   [ -s "$f" ] || return 0
-  extracted="$(extract_p1_high_findings "$f")"
+  extracted="$(extract_p1_high_findings "$f")" || return 1
   [ -n "$extracted" ] || return 0
-  printf '%s' "$extracted" | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'
+  printf '%s' "$extracted" |
+    python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'
 }
 
 # --- D-013 (post-post-mortem 30/07 : FIX 3 trop brutal) : redirection
@@ -619,7 +686,7 @@ main() {
   [ -f "$STATE_FILE" ] || echo RUNNING > "$STATE_FILE"
 
   # --- Contre-relecture GPT 29/07 : verrou atomique = SEULE autorite anti-double-pilote. ---
-  local ST0 OTHERS RESUME_PHASE
+  local ST0 OTHERS RESUME_PHASE STALL_SIG
   if ! acquire_lock; then exit 1; fi
   trap cleanup EXIT
   trap 'exit 143' TERM INT HUP
@@ -854,11 +921,15 @@ $FINAL_AUDIT_PROMPT" > "$AUDIT_CODEX" 2>>"$LOG" \
       # porte plus que sur les findings critiques. Si le rapport courant est
       # sans P1/High, stall_signature est vide -> on consigne vide (rounds sans
       # finding critique = jamais stalled, par construction d'audit_same_as_previous).
-      if atomic_write_exact "$STALL_FILE" "$(stall_signature "$AUDIT_CODEX")"; then
+      # Un échec de calcul du parser (rc 1) est traité comme l'échec d'écriture :
+      # purge du stall file + log (on ne consigne JAMAIS une signature
+      # incalculable, le prochain round repart propre).
+      if STALL_SIG="$(stall_signature "$AUDIT_CODEX")" &&
+         atomic_write_exact "$STALL_FILE" "$STALL_SIG"; then
         :
       else
         purge_file_logged "$STALL_FILE" "last_audit_${PHASE}.sha256"
-        echo "[$(date -u +%FT%TZ)] phase $PHASE : echec ecriture last_audit sha -> stall file purge, detection de stall reinitialisee au prochain round" >> "$LOG"
+        echo "[$(date -u +%FT%TZ)] phase $PHASE : echec calcul/ecriture last_audit sha -> stall file purge" >> "$LOG"
       fi
       audit_repairs=$((audit_repairs+1))
       if [ "$audit_repairs" -gt "$MAX_REPAIR" ]; then

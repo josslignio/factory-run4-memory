@@ -871,8 +871,12 @@ grep -qF 'cur="$(stall_signature "$cur_file")"' "$DRV" \
 if grep -qF '[ "$prev" = "$(sha256_file "$cur_file")" ]' "$DRV"; then
   fail=$((fail+1)); echo "FAIL: d013q audit_same_as_previous compare encore le rapport entier (sha256_file)"
 else pass=$((pass+1)); fi
-# le site d ecriture du SHA consigne stall_signature (P1/High), PAS sha256_file du rapport :
-grep -qF 'atomic_write_exact "$STALL_FILE" "$(stall_signature "$AUDIT_CODEX")"' "$DRV" \
+# audit_same_as_previous propage l echec du parser (rc 1 de stall_signature) :
+grep -qF 'cur="$(stall_signature "$cur_file")" || return 1' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013q audit_same_as_previous ne propage pas l echec du parser (|| return 1)"; }
+# le site d ecriture du SHA consigne stall_signature (P1/High) via la variable
+# STALL_SIG (calcul puis ecriture atomique separates, propagation de l echec) :
+grep -qF 'STALL_SIG="$(stall_signature "$AUDIT_CODEX")"' "$DRV" \
   && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013q le site d ecriture du SHA n utilise pas stall_signature"; }
 if grep -qF 'atomic_write_exact "$STALL_FILE" "$(sha256_file "$AUDIT_CODEX")"' "$DRV"; then
   fail=$((fail+1)); echo "FAIL: d013q le site d ecriture consigne encore le rapport entier"
@@ -949,11 +953,67 @@ if printf '%s\n' "$EXM" | grep -qF 'mineur ignore'; then
   fail=$((fail+1)); echo "FAIL: d013q multi extrait un bloc P2 (doit etre ecarte)"
 else pass=$((pass+1)); fi
 # l ordre d apparition est respecte (stable) : a.py avant b.py avant c.py.
-a=$(printf '%s\n' "$EXM" | grep -nF 'a.py:1' | head -1 | cut -d: -f1)
-b=$(printf '%s\n' "$EXM" | grep -nF 'b.py:2' | head -1 | cut -d: -f1)
-c=$(printf '%s\n' "$EXM" | grep -nF 'c.py:3' | head -1 | cut -d: -f1)
-[ -n "$a" ] && [ -n "$b" ] && [ -n "$c" ] && [ "$a" -lt "$b" ] && [ "$b" -lt "$c" ]
+# La sortie JSON est mono-ligne : on compare les positions (index de caractere)
+# de chaque marqueur dans la chaine extraite, pas les numeros de ligne.
+a=$(printf '%s' "$EXM" | awk -v m='a.py:1' '{print index($0,m)}')
+b=$(printf '%s' "$EXM" | awk -v m='b.py:2' '{print index($0,m)}')
+c=$(printf '%s' "$EXM" | awk -v m='c.py:3' '{print index($0,m)}')
+[ "$a" -gt 0 ] && [ "$b" -gt 0 ] && [ "$c" -gt 0 ] && [ "$a" -lt "$b" ] && [ "$b" -lt "$c" ]
 chk "d013q_multi_stable_appearance_order" "$?" "0"
+
+# --- D-013-quater FIX (revue Codex du commit precedent) : 3 correctifs cibles.
+#     (a) [P1] le parser ne reconnaissait qu'une ligne EXACTEMENT "P1"/"High" ->
+#         "## P1", "[P1] Titre", "### High" donnaient une signature vide et un
+#         finding critique recurrent ne declenchait jamais redirect/FAIL.
+#     (b) [P2] les en-tetes etaient supprimes avant concatenation -> deux blocs
+#         distincts "P1->A"+"P1->B" produisaient la MEME signature qu un seul
+#         bloc "P1->A+B" (perte des frontieres, vrai changement masque en stall).
+#     (c) un echec du parser n etait pas propage -> on pouvait decider un stall
+#         sur une signature incalculable. Desormais rc=1 remonte a l appelant. ---
+
+# (a-fix) en-tetes markdown / entre crochets reconnus (sinon signature vide ->
+#     finding critique recurrent jamais detecte). Preuve REELLE sur les 3 formes
+#     legitimes produites par Codex.
+printf 'PHASE_P0_FAIL\n\n## P1\n\n- finding markdown factory/a.py:1\n' > "$QD/md_p1"
+printf 'PHASE_P0_FAIL\n\n### High\n\n- high markdown factory/c.py:3\n' > "$QD/md_high"
+printf 'PHASE_P0_FAIL\n\n[P1] Titre du finding\n\n- finding bracket factory/d.py:4\n' > "$QD/brk_p1"
+[ -n "$(extract_p1_high_findings "$QD/md_p1")" ];  chk "d013q_fix_md_p1_detected"     "$?" "0"
+[ -n "$(extract_p1_high_findings "$QD/md_high")" ]; chk "d013q_fix_md_high_detected"   "$?" "0"
+[ -n "$(extract_p1_high_findings "$QD/brk_p1")" ];  chk "d013q_fix_bracket_p1_detected" "$?" "0"
+# chaque forme extrait bien le finding (pas juste un en-tete vide) :
+extract_p1_high_findings "$QD/md_p1"  | grep -qF 'finding markdown factory/a.py:1'; chk "d013q_fix_md_p1_content" "$?" "0"
+extract_p1_high_findings "$QD/md_high" | grep -qF 'high markdown factory/c.py:3';    chk "d013q_fix_md_high_content" "$?" "0"
+extract_p1_high_findings "$QD/brk_p1"  | grep -qF 'finding bracket factory/d.py:4';  chk "d013q_fix_bracket_p1_content" "$?" "0"
+# un en-tete markdown SANS severite (ex: "## Synthese") ne cree pas de bloc P1 :
+printf 'PHASE_P0_FAIL\n\n## Synthese\n\n- pas un finding de severite\n' > "$QD/md_nosev"
+[ -z "$(extract_p1_high_findings "$QD/md_nosev")" ]; chk "d013q_fix_md_non_severity_not_extracted" "$?" "0"
+
+# (b-fix) FRONTIERES preservees : deux blocs P1 distincts "A" puis "B" produisent
+#     une signature DIFFERENTE d un seul bloc P1 fusionne "A\nB" (sinon un vrai
+#     changement de structure des findings serait masque en stall). La sortie
+#     JSON conserve les frontieres (un element par bloc).
+printf 'P1\n\n- finding A factory/a.py:1\n\nP1\n\n- finding B factory/b.py:2\n' > "$QD/two_blocks"
+printf 'P1\n\n- finding A factory/a.py:1\n- finding B factory/b.py:2\n' > "$QD/fused_block"
+EX_TWO="$(extract_p1_high_findings "$QD/two_blocks")"
+EX_FUSED="$(extract_p1_high_findings "$QD/fused_block")"
+# deux blocs -> tableau JSON a 2 elements (1 virgule) ; fusionne -> 1 element (0).
+nsep_two=$(printf '%s' "$EX_TWO" | tr -cd ',' | wc -c | tr -d ' ')
+nsep_fused=$(printf '%s' "$EX_FUSED" | tr -cd ',' | wc -c | tr -d ' ')
+[ "$nsep_two" -gt "$nsep_fused" ]; chk "d013q_fix_boundaries_more_elements_two" "$?" "0"
+# les signatures DIFFERENT (changement de structure reellement detecte) :
+[ "$(stall_signature "$QD/two_blocks")" != "$(stall_signature "$QD/fused_block")" ]; chk "d013q_fix_boundaries_signatures_differ" "$?" "0"
+# contre-preuve : deux fois le meme rapport -> signature identique (deterministe).
+[ "$(stall_signature "$QD/two_blocks")" = "$(stall_signature "$QD/two_blocks")" ]; chk "d013q_fix_boundaries_deterministic" "$?" "0"
+
+# (c-fix) ECHEC du parser propage rc=1 jusqu a l appelant (on ne decide JAMAIS
+#     d un stall sur une signature incalculable). Fichier UTF-8 invalide ->
+#     read_text leve une exception -> extract rc!=0 -> stall_signature rc=1.
+printf '\xff\xfe\xfd octets invalides\nP1\n- x\n' > "$QD/bad_utf8"
+extract_p1_high_findings "$QD/bad_utf8" 2>/dev/null; chk "d013q_fix_extract_failure_rc" "$?" "1"
+stall_signature "$QD/bad_utf8" 2>/dev/null; chk "d013q_fix_signature_failure_rc" "$?" "1"
+# audit_same_as_previous propage aussi cet echec (rc 1 = non stalled, fail-closed) :
+SF_BAD="$QD/last_audit_bad.sha256"; printf '%s' "$(stall_signature "$QD/r1_fn")" > "$SF_BAD"
+audit_same_as_previous "$SF_BAD" "$QD/bad_utf8" 2>/dev/null; chk "d013q_fix_audit_propagates_parser_failure" "$?" "1"
 
 # --- (5) REGRESSION EXPLICITE : aucun fichier last_audit_${PHASE}.sha256 n est
 #     jamais ecrit ou supprime en dehors de atomic_write_exact / purge_file_logged

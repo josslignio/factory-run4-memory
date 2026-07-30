@@ -227,3 +227,36 @@ réversible, fail-closed, puis CONTINUE — master order §AUTONOMIE TOTALE).
 - **Réversible** : oui (aucune modification de code produit cette reprise ;
   seul le `CAMPAIGN_STATE` est reposé sur sa valeur de gate `READY_FOR_FINAL_AUDIT`,
   déjà présente dans HEAD).
+
+## D-012 — Reprise P0 (post-FAIL), round 2 : re-vérification INDÉPENDANTE re-confirmée, gate READY_FOR_FINAL_AUDIT
+- **Contexte** : nouvelle reprise « PHASE P0 UNIQUEMENT » après FAIL. `CAMPAIGN_STATE`
+  commité = `READY_FOR_FINAL_AUDIT` (HEAD) ; le working tree avait de nouveau été
+  remis à `RUNNING` par la boucle de repair du pilote. Aucun des 6 items n'avait
+  de source/test modifié dans le working tree (tous déjà commités, cf. D-011).
+- **Décision (la plus sûre)** : ne PAS faire confiance aux assertions de tests,
+  re-sonder CHAQUE item en exécutant le vrai code produit (harnais jetable) :
+  - Item 1 (`--source-tag`) : vide→rc≠0, espaces→rc≠0, U+200B invisible→rc≠0,
+    source remplacée avec evidence ancienne→`ExtractionError`, source+evidence
+    cohérentes→rc=0 (tag + préfixe evidence réécrits + re-validation).
+  - Item 2 (bloc `[FINDING]` vide) : 1 valide→ok, 1 vide→`ExtractionError`,
+    1 valide+1 vide→`ExtractionError` (fail-closed sur TOUTE l'extraction).
+  - Item 3 (`bootstrap_lessons.write_jsonl`) : 3 sous-processus réels ×30 iters
+    sur le même `--out`→0 deadlock/exception/perte/JSON partiel/tmp résiduel,
+    18 leçons valides ; fd `/dev/ff` stable (delta 0) sur 50 écritures mono-process ;
+    `FileNotFoundError` capturé dans `main()`→rc=1 propre (sans traceback).
+  - Item 4 (`ablation_checker` L-16) : mutant `except OSError: return False` sans
+    `close`→mesure comportementale `False`→L-16 `present` (DEFECT) ; version sûre→
+    `True`→`absent`. La mesure exécute le source (pas le texte) qui tranche.
+  - Item 5 (`RUN4_ABLATION_AB.md`) : « append-only par convention d'écriture »,
+    « NON tamper-evident », « NON cryptographiquement scellé », « aucun chaînage
+    cryptographique construit » ; aucun hash-chain/Merkle dans le runner ; le
+    runner s'exécute réellement (rc=0, bras A/B tracés).
+  - Item 6 (machine à états) : `MASTER_ORDER` = « AUTORITÉ UNIQUE » (8 états
+    listés), garde `enforce_legal_transition_or_die` fail-closed (illégal→rc=1,
+    pas de réparation silencieuse ; espaces internes→illégal).
+- **Vérification réelle** : 6/6 items confirmés + **155 pytest verts** +
+  **127 checks bash verts** (93 driver + 34 P0-reprise). Aucun outil Sharp Core
+  P1 dans `factory/bin/` (`ls` = ablation_checker/bootstrap_lessons/lesson_extractor/
+  lesson_injector/lesson_schema, aucun `run_gate.py` ni `promote`).
+- **Réversible** : oui (aucune modification de code produit ; `CAMPAIGN_STATE`
+  reposé sur `READY_FOR_FINAL_AUDIT` = valeur déjà commitée à HEAD).

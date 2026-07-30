@@ -1,3 +1,62 @@
-FIX_NEEDED
+AUDIT_REPAIR_NEEDED (phase P0, round 11)
+--- Claude audit ---
+# PAS PRET
 
-- `factory/campaigns/CAMPAIGN_STATE:1` — état `READY_FOR_FINAL_AUDIT` non autorisé. Le master order n’autorise que `RUNNING`, `WAITING_INFRA`, `FAIL` ou `WAITING_HUMAN_BOSS_GO`; l’état final requis est `WAITING_HUMAN_BOSS_GO` (`MASTER_ORDER_RUN4_MEMORY.md:10,56`).
+## Résumé
+
+L'architecture est solide et le chiffre d'ablation A/B (A=5 défauts/1 P1 → B=2 défauts/0 P1) est **réel, tracé et reproductible** — je l'ai re-dérivé à la main, règle par règle, contre le code source actuel des deux bras, et j'obtiens exactement les mêmes statuts `present`/`absent` que `ablation/ABLATION_RUN_LOG.txt`, `ablation/arm_{a,b}_measurements.json` et le tableau de `reports/RUN4_FINAL_REPORT.md:36`. Le durcissement round-2 du détecteur (`rule_L01`/`rule_L12` scope-aware sur `acquire_lock`/hook post-fork) est bien présent dans le code actuel et corrige effectivement les faux-négatifs relevés lors des rounds précédents. Mais plusieurs défauts réels et non corrigés subsistent ailleurs dans le code produit, plus un problème de gate de campagne non refermé — d'où le verdict négatif.
+
+Note méthodologique : conformément au mandat (Read/Grep/Glob, lecture seule), je n'ai pas exécuté `pytest` ni le CLI ; les 92 `def test_` sont un décompte statique cohérent avec le chiffre annoncé, pas une exécution vérifiée par moi. La vérification des chiffres A/B, elle, a été faite par retraçage manuel complet des 8 règles contre le code réel — pas une simple lecture des JSON archivés.
+
+## P1
+
+- **`factory/bin/ablation_checker.py:457-459` (`check_file`)** — `path.read_text(encoding="utf-8")` n'est protégé par aucun `try/except`. Un fichier source non-UTF8 ou illisible (permissions) lève une exception non capturée, alors que le module documente explicitement « rc=0 toujours (le checker ne fail pas ; il mesure) » (`ablation_checker.py:27-28`). Ce détecteur est le cœur de la preuve A/B (master order §4) : une exécution qui plante silencieusement sur un artefact malformé contredit sa propre garantie et n'est couverte par aucun test (`tests/test_ablation_checker.py` ne teste que des sources bien formés).
+
+## P2
+
+- **`factory/bin/bootstrap_lessons.py:447,452`** (`write_jsonl`) — utilise un nom `.tmp` **fixe** (`out_path.with_suffix(".tmp")`), sans `flock`, contrairement au pattern `mkstemp`+`flock` déjà appliqué et testé dans `lesson_extractor.py:_write_jsonl_fresh` (`lesson_extractor.py:361-399`, couvert par `tests/test_lesson_extractor.py::TestOutConcurrentSerialization`, preuve par sous-processus réels). Deux `bootstrap_lessons.py --out` concurrents sur la même destination ouvrent chacun `open(tmp, "w")` sur le même chemin (troncature + écritures non sérialisées sur le même inode) : risque réel de contenu interverti/corrompu avant le `os.replace` final. Aucun test ne couvre ce cas (`tests/test_lessons_bootstrap.py` ne teste que l'idempotence single-process, ligne 104-115).
+
+- **`factory/bin/bootstrap_lessons.py:479-481`** (`main`) — l'appel à `write_jsonl(LESSONS, out)` n'est entouré d'aucun `try/except` ; toute `OSError` (disque plein, permission refusée, remplacement échoué) remonte en traceback nue au lieu du `rc=1` contrôlé que le reste de la codebase garantit désormais partout ailleurs (cf. `lesson_extractor.py:497-517`, `lesson_injector.py:279-292`).
+
+- **`factory/bin/lesson_extractor.py:477-480`** (`main`, application `--source-tag`) — `l["source"] = args.source_tag` s'exécute **après** que `build_lesson()`/`validate_lesson()` (appelées dans `extract_lessons`) ont déjà tourné, sans reconstruire `evidence` (qui embarque le `source` d'origine en préfixe, cf. `evidence_core = f"{source_ref}:{file_path}:{line_no}"` à `lesson_extractor.py:302`) ni re-valider la leçon. Résultat : toute leçon écrite avec `--source-tag non-vide` a un champ `source` qui contredit le préfixe tracé dans `evidence` — incohérence de données qui viole l'esprit de la règle 4 du master order (traçabilité). Non testé (`--source-tag` absent de `tests/test_lesson_extractor.py`).
+
+- **`factory/bin/lesson_schema.py:66-68`** (`DATE_RE`) — valide uniquement la **forme** ISO8601 (comptage de chiffres), pas la validité calendaire : `"2026-13-45"` ou `"2026-02-31T29:99:00Z"` passent `validate_lesson()` sans erreur. `reports/RUN4_FINAL_REPORT.md:13` affirme « la date est maintenant réellement validée ISO8601 » — l'affirmation est surévaluée par rapport à ce que le regex garantit réellement.
+
+- **`factory/campaigns/CAMPAIGN_STATE:1`** — contient actuellement `READY_FOR_FINAL_AUDIT`, une valeur absente de l'énumération que `MASTER_ORDER_RUN4_MEMORY.md:10` qualifie explicitement de « non négociable » (« Les SEULS arrêts autorisés sont... `RUNNING`, `WAITING_INFRA`, `FAIL`, `WAITING_HUMAN_BOSS_GO` »), et `MASTER_ORDER_RUN4_MEMORY.md:56` exige `WAITING_HUMAN_BOSS_GO` comme état terminal avant tout GO humain. `DECISIONS_AUTONOMOUS.md` (D-001 à D-009) ne contient aucune entrée documentant explicitement l'ajout de cet état intermédiaire au pilote (`run_run4_autonomous.sh:124-147`) — seul D-003 est cité par un round de review antérieur pour le justifier, mais D-003 ne traite que du strip d'un préfixe `CAMPAIGN_STATE=`, pas de l'ajout d'un 5ᵉ état. Ce n'est pas un défaut fonctionnel (le pilote ne fait jamais de halte réelle sur cette valeur, il enchaîne directement l'audit), mais c'est une déviation non tracée d'une règle explicitement marquée non-négociable — à documenter formellement dans `DECISIONS_AUTONOMOUS.md` avant merge, par cohérence avec la propre discipline du projet.
+
+## P3
+
+- **`factory/bin/lesson_injector.py:253,259`** (arguments `--top`/`--min-score`) — acceptent des entiers négatifs sans validation ; `select_lessons` (`lesson_injector.py:175`, `if top_n > 0`) traite silencieusement `--top -1` comme illimité, alors que seul `0` est censé jouer ce rôle contractuel.
+
+- **`DECISIONS_AUTONOMOUS.md:96` et `:116`** — deux entrées distinctes portent le même identifiant `## D-008` (« Stop-words pour `_split_triggers` » et « Repair audit round 1 ») ; erreur de numérotation mineure dans le registre censé faire autorité.
+
+- **`reports/RUN4_FINAL_AUDIT_CLAUDE.md` et `reports/RUN4_FINAL_AUDIT_CODEX.md`** (contenu committé à HEAD, `git show HEAD:...`) — stale : dernière écriture au commit `5e72f8f`, **avant** le durcissement `db8fcc7` qui a corrigé `rule_L01`/`rule_L12`. Ces fichiers committés affirment encore que ces règles sont « toujours non corrigées », ce qui ne correspond plus au code actuel (vérifié ligne par ligne ci-dessus). C'est exactement l'anti-pattern documenté par la propre leçon `L-20260727T150500Z-18` du bootstrap (« un rapport qui décrit une implémentation obsolète... induit en erreur toute review ultérieure ») — ironique vu que ce projet construit précisément un système censé apprendre de ce genre de défaut.
+
+- **`reports/RUN4_ABLATION_AB.md:8,143`** (mention « append-only » de `ablation/ABLATION_RUN_LOG.txt`) — aucun script ne force ce comportement (pas de `flock`, pas d'ouverture `O_APPEND`, pas de garde) ; le fichier actuel est bien composé de 2 blocs distincts cohérents avec un append manuel discipliné, mais rien n'empêche un futur run d'écraser le fichier par erreur (`>` au lieu de `>>`). Convention documentée, pas garantie par le code.
+
+## Ce qui est solide (pour situer le verdict)
+
+`lesson_schema.py`, `lesson_extractor.py` (sérialisation `--out`/`--append` par flock+mkstemp, vérifiée en lecture et couverte par un vrai test multi-process), `lesson_injector.py` (scoring déterministe, stopwords, tie-break testés), le bootstrap de 18 leçons (cohérent à l'octet près entre `bootstrap_lessons.py` et `memory/lessons.jsonl`, toutes tracées `factory-run3-lab@fix-lock-flock-checkpoint-sha256:<file>:<line>`), et surtout le **détecteur d'ablation round-2** (`rule_L01`/`rule_L12` scope-aware sur `acquire_lock` et le hook `after_in_child`) sont cohérents, testés, et le chiffre A/B qu'ils produisent est réel — pas inventé. Les problèmes bloquants sont localisés (bootstrap non sérialisé, `--source-tag` incohérent, validation de date incomplète, gate de campagne non documenté), pas une remise en cause de l'architecture.
+
+--- Codex audit ---
+PHASE_P0_FAIL
+
+### P1
+
+- Changement P1 introduit avant checkpoint : le pilote implémente déjà les receipts et la promotion automatique P0→P1, en contradiction directe avec le périmètre P0-only. [run_run4_autonomous.sh](/Users/jocelyngrosjean/factory-run4-memory/run_run4_autonomous.sh:52), [run_run4_autonomous.sh](/Users/jocelyngrosjean/factory-run4-memory/run_run4_autonomous.sh:313), [run_run4_autonomous.sh](/Users/jocelyngrosjean/factory-run4-memory/run_run4_autonomous.sh:391), [run_run4_autonomous.sh](/Users/jocelyngrosjean/factory-run4-memory/run_run4_autonomous.sh:405)
+
+- Une autre capacité explicitement P1 est déjà active avant le checkpoint : préflight d’injection fail-closed et état `MEMORY_SYSTEM_FAIL`. [run_run4_autonomous.sh](/Users/jocelyngrosjean/factory-run4-memory/run_run4_autonomous.sh:437)
+
+- Le chiffre A/B n’est pas prouvé comme issu d’une exécution réelle du code actuellement audité : le seul journal est une recopie manuelle, non scellée, sans script producteur ; le rapport l’admet lui-même. Le dernier bloc est rattaché au commit `db8fcc7`, alors que le code courant a continué d’évoluer. [reports/RUN4_ABLATION_AB.md](/Users/jocelyngrosjean/factory-run4-memory/reports/RUN4_ABLATION_AB.md:172), [reports/RUN4_ABLATION_AB.md](/Users/jocelyngrosjean/factory-run4-memory/reports/RUN4_ABLATION_AB.md:190), [ablation/ABLATION_RUN_LOG.txt](/Users/jocelyngrosjean/factory-run4-memory/ablation/ABLATION_RUN_LOG.txt:186)
+
+### P2
+
+- La validation prétend vérifier une date ISO-8601, mais le regex accepte des dates calendaires impossibles (`2026-99-99`, `2026-02-31`, heure `29:99`). Cela laisse entrer des données invalides dans `memory/lessons.jsonl`. [lesson_schema.py](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/lesson_schema.py:66), [lesson_schema.py](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/lesson_schema.py:107)
+
+- Un `lessons.jsonl` non UTF-8 produit un `UnicodeDecodeError` non capturé dans l’injecteur, contrairement à son contrat d’erreur contrôlée. [lesson_schema.py](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/lesson_schema.py:127), [lesson_injector.py](/Users/jocelyngrosjean/factory-run4-memory/factory/bin/lesson_injector.py:81)
+
+### P3
+
+- Le rapport final présente un bilan de tests obsolète (`92 pytest`, `13/13 bash`) alors que le journal de décision revendique ensuite `133 pytest`, `66/66 bash`. Un rapport final ne doit pas conserver une preuve de test contradictoire. [RUN4_FINAL_REPORT.md](/Users/jocelyngrosjean/factory-run4-memory/reports/RUN4_FINAL_REPORT.md:55), [DECISIONS_AUTONOMOUS.md](/Users/jocelyngrosjean/factory-run4-memory/DECISIONS_AUTONOMOUS.md:186)
+
+Les correctifs P0 1, 2, 3, 4 et 6 sont bien implémentés avec tests ciblés : source-tag cohérent, bloc vide refusé, sous-processus concurrents bootstrap, mutants FD exécutés sous faux OS/fcntl, et garde de transition appelée par le pilote. Toutefois le passage de phase P1 déjà codé et l’absence de preuve d’exécution A/B liée au code courant interdisent le PASS.

@@ -230,11 +230,74 @@ codex_cache_bug_in_file() {
 # reellement (meme discipline que enforce_legal_transition_or_die : le test
 # appelle le VRAI predicat de production, pas une copie locale). ---
 audit_same_as_previous() {
-  local prev_sha_file="$1" cur_file="$2" prev=""
+  local prev_sha_file="$1" cur_file="$2" prev="" cur=""
   [ -f "$prev_sha_file" ] || return 1
   prev=$(cat "$prev_sha_file" 2>/dev/null)
   [ -n "$prev" ] || return 1
-  [ "$prev" = "$(sha256_file "$cur_file")" ]
+  # D-013-quater : la comparaison de stall porte sur la signature des findings
+  # P1/High extraits du rapport (stall_signature), PAS sur le rapport entier.
+  # Si le rapport courant ne contient AUCUN finding P1/High, pas de stall
+  # possible : l absence de finding critique est un etat distinct (D-013 vise un
+  # blocage CRITIQUE recurrent, pas une stagnation cosmetique sur du P2).
+  cur="$(stall_signature "$cur_file")"
+  [ -n "$cur" ] || return 1
+  [ "$prev" = "$cur" ]
+}
+
+# --- D-013-quater (granularite de la detection de stall) : la signature de
+# stall etait calculee sur le RAPPORT ENTIER (sha256_file $AUDIT_CODEX) ->
+# (1) FAUX NEGATIF : un meme finding P1/High persistant mais noye dans un
+# rapport qui change par ailleurs (reformulation, autre finding P2, timestamp)
+# -> SHA differant -> pas de stall -> boucle jusqu au plafond MAX_*_REPAIR (29
+# rounds observes), exactement le mode d echec que D-013 devait corriger ;
+# (2) FAUX POSITIF : 2 rapports identiques sans AUCUN P1/High -> stall/FAIL
+# cosmetique sur du bruit P2 alors que rien de critique n est bloque.
+# Desormais la signature ne porte QUE sur les findings P1/High extraits.
+# Perimetre strict (RIEN d autre touche) : extract_p1_high_findings +
+# stall_signature + audit_same_as_previous + le site d ecriture du SHA. Ni
+# stall_action, ni build_cur_prompt, ni FIX1/2/3, ni D-001..D-013-ter, ni la
+# machine a etats ne sont modifies. La robustesse crash-safe de D-013-ter
+# (atomic_write_exact / purge_file_logged) est preservee integralement : seul
+# le CONTENU hache change. ---
+
+# extract_p1_high_findings : extrait DETERMINISTEMENT les blocs de findings de
+# severite P1 ou High d un rapport d audit Codex. Un en-tete de severite est
+# une ligne dont le contenu (hors whitespace de bordure) vaut EXACTEMENT "P1"
+# ou "High" (insensible a la casse) ; les autres en-tetes connus (P2/P3/P4/
+# Medium/Low/Info/Minor) ferment le bloc courant. Les lignes situees entre un
+# en-tete P1/High et le prochain en-tete de severite (ou la fin du rapport)
+# forment le bloc P1/High. Plusieurs blocs P1/High sont concatenes dans l ordre
+# d apparition (stable, deterministe : meme entree -> meme sortie). Renvoie
+# vide si aucun finding P1/High n est present. Teste reellement par
+# tests/test_driver_helpers.bash.
+extract_p1_high_findings() {
+  local f="$1"
+  [ -s "$f" ] || return 0
+  awk '
+    {
+      line=$0
+      gsub(/^[[:space:]]+|[[:space:]]+$/,"",line)
+      tok=toupper(line)
+      if (tok=="P1" || tok=="HIGH") { cur=1; next }
+      if (tok=="P2" || tok=="P3" || tok=="P4" || tok=="MEDIUM" || tok=="LOW" || tok=="INFO" || tok=="MINOR") { cur=0; next }
+      if (cur) print $0
+    }
+  ' "$f" 2>/dev/null || return 0
+}
+
+# stall_signature : SHA-256 du texte des findings P1/High extraits (via
+# extract_p1_high_findings). C est la signature EFFECTIVEMENT stockee dans
+# last_audit_${PHASE}.sha256 et comparee par audit_same_as_previous. L usage
+# d une FONCTION UNIQUE pour stocker ET comparer garantit la coherence
+# byte-exacte de la paire ecriture/lecture (lecon D-013-ter : un ecart entre
+# les deux -> faux negatif de stall). Renvoie vide si le rapport ne contient
+# AUCUN finding P1/High (etat distinct -> pas de stall possible).
+stall_signature() {
+  local f="$1" extracted
+  [ -s "$f" ] || return 0
+  extracted="$(extract_p1_high_findings "$f")"
+  [ -n "$extracted" ] || return 0
+  printf '%s' "$extracted" | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'
 }
 
 # --- D-013 (post-post-mortem 30/07 : FIX 3 trop brutal) : redirection
@@ -786,7 +849,12 @@ $FINAL_AUDIT_PROMPT" > "$AUDIT_CODEX" 2>>"$LOG" \
       # interrompue laisserait un sha partiel/vide -> audit_same_as_previous
       # faussé (faux négatif de stall). Échec -> on purge le stall file (prochain
       # round repart propre, pas de sha corrompu) + log explicite.
-      if atomic_write_exact "$STALL_FILE" "$(sha256_file "$AUDIT_CODEX")"; then
+      # D-013-quater : le SHA consigné est celui de la signature P1/High
+      # (stall_signature), PAS du rapport entier -- la détection de stall ne
+      # porte plus que sur les findings critiques. Si le rapport courant est
+      # sans P1/High, stall_signature est vide -> on consigne vide (rounds sans
+      # finding critique = jamais stalled, par construction d'audit_same_as_previous).
+      if atomic_write_exact "$STALL_FILE" "$(stall_signature "$AUDIT_CODEX")"; then
         :
       else
         purge_file_logged "$STALL_FILE" "last_audit_${PHASE}.sha256"

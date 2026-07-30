@@ -487,3 +487,87 @@ réversible, fail-closed, puis CONTINUE — master order §AUTONOMIE TOTALE).
   la branche `redirect` / la section `opencode` ; retirer un helper ou
   restaurer l'ancienne écriture directe restore le comportement précédent sans
   toucher à la logique de décision ni à la machine à états).
+
+## D-013-quater — Détection de stall spécifique au finding P1/High (au lieu du rapport entier)
+- **Contexte** : la signature de stall (`last_audit_${PHASE}.sha256`, comparée
+  par `audit_same_as_previous` à chaque round d'audit) était calculée sur le
+  **RAPPORT D'AUDIT ENTIER** produit par Codex (`sha256_file "$AUDIT_CODEX"`),
+  pas sur le texte du finding critique. D-013/D-013-ter avaient fiabilisé la
+  **mécanique** (redirection bornée, écritures atomiques crash-safe) mais la
+  **granularité** de la comparaison restait trop grossière.
+- **Problème précis (2 faces)** :
+  1. **FAUX NÉGATIF** — si le même finding P1/High persiste inchangé mais que
+     le rapport change par ailleurs (reformulation, autre finding P2, timestamp,
+     en-tête), le SHA du rapport entier diffère → pas de stall détecté → le run
+     peut reboucler indéfiniment sur le **même problème non résolu** sans jamais
+     déclencher redirect/FAIL. C'est exactement le mode d'échec **« 29 rounds
+     brûlés »** que D-013 visait à corriger, mais qui revenait dès que le
+     rapport n'était pas byte-identique.
+  2. **FAUX POSITIF** — si deux rapports d'audit successifs sont identiques mais
+     ne contiennent **que** des findings P2 (aucun P1/High réel), un stall/FAIL
+     peut se déclencher alors que **rien de critique** n'est réellement bloqué —
+     une stagnation cosmétique sur du P2, pas un blocage critique récurrent.
+- **Décision** : rendre la comparaison de stall **spécifique au(x) finding(s)
+  P1/High**, pas au rapport entier. Deux helpers testables extraits du périmètre
+  stall :
+  1. `extract_p1_high_findings <file>` — extrait **déterministement** les blocs
+     de findings de sévérité **P1 ou High** (un en-tête de sévérité = ligne dont
+     le contenu, hors whitespace de bordure, vaut exactement `P1` ou `High`,
+     insensible à la casse ; les autres en-têtes connus `P2`/`P3`/`P4`/`Medium`/
+     `Low`/`Info`/`Minor` ferment le bloc courant). Plusieurs blocs P1/High sont
+     **concaténés dans l'ordre d'apparition** (stable : même entrée → même
+     sortie). Renvoie vide si aucun P1/High.
+  2. `stall_signature <file>` — SHA-256 du texte extrait par
+     `extract_p1_high_findings`. **Une fonction unique** sert à la fois à
+     **comparer** (dans `audit_same_as_previous`) et à **stocker** (site
+     d'écriture du SHA) → cohérence byte-exacte de la paire écriture/lecture
+     (leçon D-013-ter). Le SHA consigné dans `last_audit_${PHASE}.sha256` est
+     désormais celui de cette signature, pas du rapport entier.
+  - **Comportement choisi en l'absence de P1/High** : `stall_signature` est
+    vide → `audit_same_as_previous` retourne « non stalled » (absence de finding
+    critique = état distinct). D-013 vise à détecter un **blocage CRITIQUE
+    récurrent**, pas une stagnation cosmétique sur du P2 : **aucun stall n'est
+    possible tant qu'aucun P1/High n'est présent**, ce qui neutralise le faux
+    positif (du bruit P2 identique d'un round à l'autre ne déclenche jamais
+    FAIL).
+- **Périmètre strict (rien d'autre touché)** : `extract_p1_high_findings` +
+  `stall_signature` (nouvelles) + `audit_same_as_previous` (corps) + le site
+  d'écriture du SHA. La robustesse crash-safe de D-013-ter est **préservée
+  intégralement** : `atomic_write_exact` / `purge_file_logged` restent les
+  **uniques** voies d'écriture/suppression de `last_audit_${PHASE}.sha256` —
+  seul le **contenu haché** change, pas le mécanisme.
+- **Intact (confirmé par hash des corps de fonctions avant/après)** :
+  `stall_action`, `build_cur_prompt`, `commit_redirect`, `atomic_write_exact`,
+  `purge_file_logged`, `enter_scoped_purge`/`exit_scoped_purge`,
+  `extract_findings`, `build_redirect_prompt`, machine à états
+  (`state_kind`/`legal_transition`/`enforce_legal_transition_or_die`), FIX1
+  (purge cache), FIX2 (`codex_cache_bug_in_file`), D-001 à D-013-ter — **tous
+  byte-identiques** (SHA-256 du corps identique avant/après). Seul
+  `audit_same_as_previous` diffère (dans le périmètre décrit). Le diff du
+  pilote ne touche que les 2 hunks du périmètre (corps du prédicat + nouvelles
+  fonctions + site d'écriture).
+- **Vérification réelle** : **155 pytest verts** (inchangés) +
+  **238 checks bash verts** dans `test_driver_helpers.bash` (les 211 existants
+  + **27 nouveaux checks `d013q`**, 0 FAIL) ; `test_p0_reprise.bash` = 32 PASS /
+  2 FAIL **pré-existants** (chainage crypto / section autorité unique —
+  **sans rapport** avec D-013-quater, non introduits par ce changement). Les
+  nouveaux tests couvrent les 5 scénarios exigés : (1) **faux négatif corrigé**
+  — 2 rapports au même finding P1/High mais texte différent ailleurs → stall
+  détecté (signature P1/High identique), avec contre-preuve que l'ancien SHA du
+  rapport entier l'aurait manqué ; (2) **faux positif corrigé** — 2 rapports à
+  findings P2 identiques mais aucun P1/High → **pas** de stall/FAIL ; (3) cas
+  nominal — 2 rapports à finding P1/High différent → pas de stall ; (4)
+  multi-findings — plusieurs P1/High concaténés de façon **stable et
+  déterministe** entre deux appels, ordre d'apparition respecté, P2/P3 écartés ;
+  (5) **régression explicite** — aucun `last_audit_${PHASE}.sha256` écrit ou
+  supprimé hors `atomic_write_exact`/`purge_file_logged` (garde étendue à
+  l'écriture, pas seulement à la suppression).
+- **Note exécution worktree** : ce workspace est un worktree git ; le driver
+  borne `REPO` à `${RUN4_REPO:-$HOME/factory-run4-memory}` (ligne 37). Les tests
+  structurels greppant `$DRV` doivent donc être lancés avec
+  `RUN4_REPO="$PWD"` (override documenté ligne 37) pour pointer sur le driver
+  du worktree ; les tests comportementaux sourcent toujours le driver local.
+- **Réversible** : oui — restaurer `sha256_file "$cur_file"` dans
+  `audit_same_as_previous` et `sha256_file "$AUDIT_CODEX"` au site d'écriture
+  restore le comportement précédent (comparaison sur le rapport entier) sans
+  toucher à `stall_action`, à la machine à états, ni aux helpers D-013-ter.

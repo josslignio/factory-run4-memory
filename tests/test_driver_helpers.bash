@@ -372,11 +372,14 @@ chk "fix2_infra_inc_between_guard_and_audit_inc" "$?" "0"
 STALL_TEST="$TMP/last_audit_P0.sha256"
 rm -f "$STALL_TEST"
 # round 1 : audit non-PASS, aucun SHA precedent -> pas stalled (cas normal).
-printf 'PHASE_P0_FAIL\nfactory/bin/x.py:42 : bug reel P1 non resolu\n' > "$TMP/audit_r1"
+# D-013-quater : le rapport d'audit utilise le format reel Codex (en-tete de
+# severite "P1" sur sa propre ligne), car la signature de stall porte desormais
+# sur le bloc P1/High extrait (stall_signature), pas sur le rapport entier.
+printf 'PHASE_P0_FAIL\n\nP1\n\n- factory/bin/x.py:42 : bug reel P1 non resolu\n' > "$TMP/audit_r1"
 audit_same_as_previous "$STALL_TEST" "$TMP/audit_r1"
 chk "fix3_round1_not_stalled" "$?" "1"
-# main() consigne le SHA du round courant pour la comparaison suivante :
-printf '%s' "$(sha256_file "$TMP/audit_r1")" > "$STALL_TEST"
+# main() consigne la signature (P1/High) du round courant pour la comparaison suivante :
+printf '%s' "$(stall_signature "$TMP/audit_r1")" > "$STALL_TEST"
 sim_round=1   # round 1 a incremente audit_repairs (cas normal, non stalled)
 # round 2 : GLM n a RIEN change -> audit IDENTIQUE mot pour mot.
 cp "$TMP/audit_r1" "$TMP/audit_r2"
@@ -389,8 +392,8 @@ plafond=$(grep -oE '^MAX_P0_REPAIR=[0-9]+' "$DRV" | head -1 | cut -d= -f2)
 sim_fail_round=3
 [ -n "$plafond" ] && [ "$sim_fail_round" -lt "$plafond" ]
 chk "fix3_fail_at_most_round3_before_plafond($plafond)" "$?" "0"
-# anti-faux-positif : deux audits DIFFERENTS ne declenchent PAS le stall.
-printf 'PHASE_P0_FAIL\nautre finding totalement different fichier:ligne\n' > "$TMP/audit_r3"
+# anti-faux-positif : deux audits avec un finding P1 DIFFERENT ne declenchent PAS le stall.
+printf 'PHASE_P0_FAIL\n\nP1\n\n- factory/bin/x.py:99 : autre finding P1 totalement different\n' > "$TMP/audit_r3"
 audit_same_as_previous "$STALL_TEST" "$TMP/audit_r3"
 chk "fix3_different_audit_not_stalled" "$?" "1"
 # predicat robuste : pas de fichier memoire -> pas stalled (1er round d'une phase).
@@ -468,13 +471,14 @@ grep -qF 'commit_redirect "$RECEIPTS_DIR/pending_redirect_${PHASE}.txt" "$REDIRE
 #     FAIL immediat ; message exact exige present dans le driver. ---
 touch "$TMP/d013_b.used"
 chk "d013_b_stall_flag_fail" "$(stall_action 0 "$TMP/d013_b.used")" "fail"
-# (b) preuve REELLE sur 3 rounds simules avec le VRAI sha256_file + le VRAI
-# predicat audit_same_as_previous, faithful au branchement de main() :
+# (b) preuve REELLE sur 3 rounds simules avec la VRAIE stall_signature (P1/High)
+# + le VRAI predicat audit_same_as_previous, faithful au branchement de main() :
 SF_B="$TMP/last_audit_P0_b.sha256"; rm -f "$SF_B" "$TMP/d013_b.used"
-# round 1 : audit A non-PASS, pas de prev -> non stalled -> consigne sha(A).
-printf 'PHASE_P0_FAIL\nfactory/bin/x.py:42 : bug reel P1 non resolu\n' > "$TMP/d013_r1"
+# round 1 : audit A non-PASS, pas de prev -> non stalled -> consigne signature(A).
+# D-013-quater : format reel Codex (en-tete P1), signature = bloc P1 extrait.
+printf 'PHASE_P0_FAIL\n\nP1\n\n- factory/bin/x.py:42 : bug reel P1 non resolu\n' > "$TMP/d013_r1"
 audit_same_as_previous "$SF_B" "$TMP/d013_r1"; chk "d013_b_r1_not_stalled" "$?" "1"
-printf '%s' "$(sha256_file "$TMP/d013_r1")" > "$SF_B"
+printf '%s' "$(stall_signature "$TMP/d013_r1")" > "$SF_B"
 # round 2 : audit IDENTIQUE -> stalled, PAS de flag -> redirect (on pose le flag).
 cp "$TMP/d013_r1" "$TMP/d013_r2"
 audit_same_as_previous "$SF_B" "$TMP/d013_r2"; chk "d013_b_r2_stalled" "$?" "0"
@@ -494,10 +498,11 @@ chk "d013_c_diffaudit_normal_with_flag" "$(stall_action 1 "$TMP/d013_c.used")" "
 # (c) preuve REELLE : round 3 produit un audit B different de A -> non stalled,
 # le flag (encore present) est reset par main(), nouvelle sequence possible.
 SF_C="$TMP/last_audit_P0_c.sha256"; rm -f "$SF_C" "$TMP/d013_c.used"
-printf 'PHASE_P0_FAIL\nfactory/bin/x.py:42 : bug reel P1 non resolu\n' > "$TMP/d013_c_r1"
-printf '%s' "$(sha256_file "$TMP/d013_c_r1")" > "$SF_C"
+# D-013-quater : format reel Codex (en-tete P1), signature = bloc P1 extrait.
+printf 'PHASE_P0_FAIL\n\nP1\n\n- factory/bin/x.py:42 : bug reel P1 non resolu\n' > "$TMP/d013_c_r1"
+printf '%s' "$(stall_signature "$TMP/d013_c_r1")" > "$SF_C"
 touch "$TMP/d013_c.used"   # round 2 a redirige
-printf 'PHASE_P0_FAIL\nfactory/bin/x.py:42 : PARTIELLEMENT corrige (progres reel)\n' > "$TMP/d013_c_r3"
+printf 'PHASE_P0_FAIL\n\nP1\n\n- factory/bin/x.py:42 : PARTIELLEMENT corrige (progres reel)\n' > "$TMP/d013_c_r3"
 audit_same_as_previous "$SF_C" "$TMP/d013_c_r3"; chk "d013_c_r3_not_stalled_progress" "$?" "1"
 chk "d013_c_r3_action_normal" "$(stall_action 1 "$TMP/d013_c.used")" "normal"
 # main() reset le flag sur progres reel -> une NOUVELLE sequence a droit a sa redirection :
@@ -840,6 +845,140 @@ printf '%s' "$_REGCUR" | grep -qF 'REGRESSION_REDIRECT_SENTINEL'; chk "d013ter_r
 printf '%s' "$_REGCUR" | grep -qF 'PHASE P0 UNIQUEMENT'; chk "d013ter_regression_build_appended" "$?" "0"
 [ -e "$RECEIPTS_DIR/redirect_attempt_P0.used" ]; chk "d013ter_regression_flag_set" "$?" "0"
 RECEIPTS_DIR="$_SAVED_RR"
+
+# ====================================================================
+# D-013-quater (granularite de la detection de stall) : la signature de stall
+# portait sur le RAPPORT ENTIER (sha256_file $AUDIT_CODEX) -> faux negatif (un
+# meme finding P1/High persistant noye dans un rapport qui change par ailleurs
+# -> pas de stall -> boucle jusqu au plafond) ET faux positif (2 rapports
+# identiques sans AUCUN P1/High -> stall/FAIL cosmetique sur du P2). Desormais
+# la signature (stall_signature) ne porte QUE sur les findings P1/High extraits
+# (extract_p1_high_findings). Perimetre strict : ces 2 fonctions +
+# audit_same_as_previous + le site d ecriture du SHA. Ni stall_action, ni
+# build_cur_prompt, ni FIX1/2/3, ni D-001..D-013-ter, ni la machine a etats ne
+# sont modifies (preuve structurelle : sections ci-dessus intactes, 0 nouveau FAIL).
+# ====================================================================
+
+# --- preuves structurelles : les helpers D-013-quater existent dans le driver. ---
+grep -qE '^extract_p1_high_findings\(\)' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013q extract_p1_high_findings non defini"; }
+grep -qE '^stall_signature\(\)' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013q stall_signature non defini"; }
+# audit_same_as_previous compare desormais via stall_signature (P1/High), PAS via
+# sha256_file sur le rapport entier :
+grep -qF 'cur="$(stall_signature "$cur_file")"' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013q audit_same_as_previous n utilise pas stall_signature"; }
+if grep -qF '[ "$prev" = "$(sha256_file "$cur_file")" ]' "$DRV"; then
+  fail=$((fail+1)); echo "FAIL: d013q audit_same_as_previous compare encore le rapport entier (sha256_file)"
+else pass=$((pass+1)); fi
+# le site d ecriture du SHA consigne stall_signature (P1/High), PAS sha256_file du rapport :
+grep -qF 'atomic_write_exact "$STALL_FILE" "$(stall_signature "$AUDIT_CODEX")"' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013q le site d ecriture du SHA n utilise pas stall_signature"; }
+if grep -qF 'atomic_write_exact "$STALL_FILE" "$(sha256_file "$AUDIT_CODEX")"' "$DRV"; then
+  fail=$((fail+1)); echo "FAIL: d013q le site d ecriture consigne encore le rapport entier"
+else pass=$((pass+1)); fi
+
+# --- (1) FAUX NEGATIF CORRIGE : deux rapports avec le MEME finding P1/High mais
+#     un texte different ailleurs (autre finding P2, reformulation) -> la nouvelle
+#     comparaison DOIT detecter un stall (signature P1/High identique). Preuve
+#     par execution REELLE de stall_signature + audit_same_as_previous. ---
+QD="$TMP/d013q"; mkdir -p "$QD"
+printf 'PHASE_P0_FAIL\n\nP1\n\n- factory/bin/x.py:42 : bug reel P1 non resolu\n\nP2\n\n- detail cosmetique round N\n' > "$QD/r1_fn"
+printf 'PHASE_P0_FAIL\n\nP1\n\n- factory/bin/x.py:42 : bug reel P1 non resolu\n\nP2\n\n- AUTRE reformulation differente au round N+1\n' > "$QD/r2_fn"
+# meme bloc P1 -> signature identique malgre un rapport global different :
+[ "$(stall_signature "$QD/r1_fn")" = "$(stall_signature "$QD/r2_fn")" ]; chk "d013q_fn_same_p1_same_sig" "$?" "0"
+# preuve que le rapport global DIFFERE bien (sha du rapport entier !=) :
+[ "$(sha256_file "$QD/r1_fn")" != "$(sha256_file "$QD/r2_fn")" ]; chk "d013q_fn_whole_report_actually_differs" "$?" "0"
+# replay fidele du branchement main() : on consigne signature(r1), puis on
+# compare r2 -> stall detecte (alors qu avec l ancien sha du rapport entier il
+# ne le serait PAS -> c est le faux negatif des 29 rounds, desormais corrige).
+SFN="$QD/last_audit_P0_fn.sha256"; rm -f "$SFN"
+printf '%s' "$(stall_signature "$QD/r1_fn")" > "$SFN"
+audit_same_as_previous "$SFN" "$QD/r2_fn"; chk "d013q_fn_stall_detected_on_same_p1" "$?" "0"
+# contre-preuve : avec l ANCIEN comportement (sha rapport entier) ce cas n etait
+# PAS stalled -> on le montre explicitement pour caracteriser la correction :
+printf '%s' "$(sha256_file "$QD/r1_fn")" > "$SFN"
+audit_same_as_previous "$SFN" "$QD/r2_fn"; chk "d013q_fn_old_behavior_would_miss_it" "$?" "1"
+
+# --- (2) FAUX POSITIF CORRIGE : deux rapports avec des findings P2 IDENTIQUES
+#     mais AUCUN P1/High -> ne doit PAS declencher stall/FAIL (absence de finding
+#     critique = etat distinct, pas un blocage recurrent). ---
+printf 'PHASE_P0_FAIL\n\nP2\n\n- detail cosmetique identique fichier:ligne\n' > "$QD/r1_fp"
+cp "$QD/r1_fp" "$QD/r2_fp"
+# aucun P1/High -> signature vide :
+[ -z "$(stall_signature "$QD/r1_fp")" ]; chk "d013q_fp_no_p1_empty_sig" "$?" "0"
+# replay fidele : main() consigne la signature (vide) au round N, puis compare au
+# round N+1 (P2 identiques) -> PAS stalled (l absence de P1/High neutralise la
+# comparaison, meme si les 2 rapports sont byte-identiques).
+SFP="$QD/last_audit_P0_fp.sha256"; rm -f "$SFP"
+# round N : pas de prev -> non stalled -> main() consigne signature vide.
+audit_same_as_previous "$SFP" "$QD/r1_fp"; chk "d013q_fp_r1_not_stalled" "$?" "1"
+printf '%s' "$(stall_signature "$QD/r1_fp")" > "$SFP"   # consigne vide (comportement main)
+# round N+1 : P2 identiques, signature vide -> prev vide -> PAS stalled.
+audit_same_as_previous "$SFP" "$QD/r2_fp"; chk "d013q_fp_r2_identical_p2_not_stalled" "$?" "1"
+# stall_action reflète bien 'normal' (pas de FAIL) sur ce non-stall :
+rm -f "$QD/fp.used"
+chk "d013q_fp_action_normal_no_fail" "$(stall_action 1 "$QD/fp.used")" "normal"
+
+# --- (3) CAS NOMINAL : deux rapports avec un finding P1/High DIFFERENT -> pas de
+#     stall (progres reel, comportement normal). ---
+printf 'PHASE_P0_FAIL\n\nP1\n\n- factory/bin/x.py:42 : bug A non resolu\n' > "$QD/r1_nom"
+printf 'PHASE_P0_FAIL\n\nP1\n\n- factory/bin/y.sh:99 : bug B different (autre point)\n' > "$QD/r2_nom"
+[ "$(stall_signature "$QD/r1_nom")" != "$(stall_signature "$QD/r2_nom")" ]; chk "d013q_nom_diff_p1_diff_sig" "$?" "0"
+SFNOM="$QD/last_audit_P0_nom.sha256"; rm -f "$SFNOM"
+printf '%s' "$(stall_signature "$QD/r1_nom")" > "$SFNOM"
+audit_same_as_previous "$SFNOM" "$QD/r2_nom"; chk "d013q_nom_different_p1_not_stalled" "$?" "1"
+
+# --- (4) CAS MULTI-FINDINGS : rapport avec plusieurs findings P1/High, la
+#     concatenation est STABLE et DETERMINISTE entre deux appels sur le meme
+#     rapport (meme entree -> meme sortie). ---
+printf 'PHASE_P1_FAIL\n\nP1\n\n- premier P1 factory/a.py:1\n\nP2\n\n- mineur ignore\n\nP1\n\n- second P1 factory/b.py:2\n\nHigh\n\n- high severity factory/c.py:3\n\nP3\n\n- ignore aussi\n' > "$QD/multi"
+# determinisme : deux appels successifs -> signature identique.
+m1="$(stall_signature "$QD/multi")"; m2="$(stall_signature "$QD/multi")"
+[ -n "$m1" ]; chk "d013q_multi_sig_nonempty" "$?" "0"
+[ "$m1" = "$m2" ]; chk "d013q_multi_deterministic" "$?" "0"
+# seuls les blocs P1/High sont extraits (P2/P3 ecartes), dans l ordre d apparition :
+EXM="$(extract_p1_high_findings "$QD/multi")"
+printf '%s\n' "$EXM" | grep -qF -- '- premier P1 factory/a.py:1' && pass=$((pass+1)) \
+  || { fail=$((fail+1)); echo "FAIL: d013q multi n extrait pas le 1er P1"; }
+printf '%s\n' "$EXM" | grep -qF -- '- second P1 factory/b.py:2' && pass=$((pass+1)) \
+  || { fail=$((fail+1)); echo "FAIL: d013q multi n extrait pas le 2e P1"; }
+printf '%s\n' "$EXM" | grep -qF -- '- high severity factory/c.py:3' && pass=$((pass+1)) \
+  || { fail=$((fail+1)); echo "FAIL: d013q multi n extrait pas le High"; }
+if printf '%s\n' "$EXM" | grep -qF 'mineur ignore'; then
+  fail=$((fail+1)); echo "FAIL: d013q multi extrait un bloc P2 (doit etre ecarte)"
+else pass=$((pass+1)); fi
+# l ordre d apparition est respecte (stable) : a.py avant b.py avant c.py.
+a=$(printf '%s\n' "$EXM" | grep -nF 'a.py:1' | head -1 | cut -d: -f1)
+b=$(printf '%s\n' "$EXM" | grep -nF 'b.py:2' | head -1 | cut -d: -f1)
+c=$(printf '%s\n' "$EXM" | grep -nF 'c.py:3' | head -1 | cut -d: -f1)
+[ -n "$a" ] && [ -n "$b" ] && [ -n "$c" ] && [ "$a" -lt "$b" ] && [ "$b" -lt "$c" ]
+chk "d013q_multi_stable_appearance_order" "$?" "0"
+
+# --- (5) REGRESSION EXPLICITE : aucun fichier last_audit_${PHASE}.sha256 n est
+#     jamais ecrit ou supprime en dehors de atomic_write_exact / purge_file_logged
+#     (meme garde de securite qu en D-013-ter, etendue a l ecriture). ---
+# (5a) pas de 'rm -f ... 2>/dev/null' muet ciblant un fichier d etat de stall
+#      (garde D-013-ter, reaffirmee pour D-013-quater) :
+if grep -qE 'rm -f .*(pending_redirect_\$\{PHASE\}|last_audit_P[01]\.sha256).*2>/dev/null' "$DRV"; then
+  fail=$((fail+1)); echo "FAIL: d013q un 'rm -f ... 2>/dev/null' muet cible encore un fichier d etat de stall"
+else pass=$((pass+1)); fi
+# (5b) aucune ecriture par redirection directe (printf/echo > $STALL_FILE ou
+#      > last_audit_*.sha256) en dehors d atomic_write_exact : on interdit tout
+#      '>' ou '>>' ciblant explicitement le fichier de stall.
+if grep -nE '(>|>>)[[:space:]]*"?\$?STALL_FILE"?' "$DRV" | grep -qvE 'atomic_write_exact|purge_file_logged' \
+   || grep -nE '(>|>>)[[:space:]]*"?\$RECEIPTS_DIR/last_audit_P[01]\.sha256"?' "$DRV" | grep -qvE 'atomic_write_exact|purge_file_logged'; then
+  fail=$((fail+1)); echo "FAIL: d013q ecriture directe (redirection) sur last_audit hors atomic_write_exact/purge_file_logged"
+else pass=$((pass+1)); fi
+# (5c) atomic_write_exact est TOUJOURS l unique voie d ecriture du SHA de stall :
+grep -qF 'atomic_write_exact "$STALL_FILE"' "$DRV"; chk "d013q_stall_write_via_atomic_only" "$?" "0"
+# (5d) sha256_file n est plus utilise COMME CONTENU consigne pour le stall (il
+#      reste legitime ailleurs : checkpoint_p0) -- on verifie l absence du motif
+#      specifique au site de stall :
+if grep -qF '"$(sha256_file "$AUDIT_CODEX")" > "$STALL_FILE"' "$DRV" \
+   || grep -qF 'atomic_write_exact "$STALL_FILE" "$(sha256_file "$AUDIT_CODEX")"' "$DRV"; then
+  fail=$((fail+1)); echo "FAIL: d013q le rapport entier est encore consigne comme SHA de stall"
+else pass=$((pass+1)); fi
 
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

@@ -802,6 +802,125 @@ class TestRuleL16DeadCodeCloseMutant(unittest.TestCase):
                          f"eu {f.status}: {f}")
 
 
+# ===================================================================
+# P0 finding 4 (round 5, contre-audit Claude) : le tracker comportemental
+# doit vérifier l'IDENTITÉ du fd fermé. Un mutant `os.close(0)` ferme le
+# MAUVAIS fd (stdin) — le fd réel du verrou (issu de os.open) fuit. La règle
+# DOIT le marquer DEFECT (present) ; l'ancien tracker crédite toute fermeture
+# sans vérifier le fd -> faux négatif (absent à tort).
+# ===================================================================
+
+# Mutant : filet large `except OSError` qui ferme un MAUVAIS fd (os.close(0)),
+# pas le fd du verrou. Contre-audit Claude round 5 : l'ancien _Tracker.closed
+# incrémentait closes sur n'importe quel os.close(...) -> closes>=opens -> sûr
+# à tort. Le tracker durci ne crédite qu'un close() ciblant un fd RÉELLEMENT
+# ouvert.
+MUTANT_WRONG_FD_CLOSE = '''
+import os, fcntl
+
+_LOCK_FDS = {}
+
+def acquire_lock(lockfile):
+    key = lockfile
+    if key in _LOCK_FDS:
+        return True
+    fd = os.open(lockfile, os.O_CREAT | os.O_WRONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    except OSError:
+        os.close(0)   # MAUVAIS fd (stdin) — le fd du verrou (fd) fuit réellement
+        return False
+    _LOCK_FDS[key] = fd
+    return True
+'''
+
+
+class TestRuleL16WrongFdCloseMutant(unittest.TestCase):
+    """Contre-audit Claude round 5 : un mutant qui ferme le MAUVAIS fd
+    (`os.close(0)`, pas le fd du verrou) doit rester DEFECT — le fd réel fuit.
+    Le tracker comportemental ne crédite une fermeture QUE si elle cible un fd
+    réellement ouvert par os.open (identité du fd), pas n'importe quel close()."""
+
+    def test_wrong_fd_close_is_defect(self):
+        f = _find(run_checker(MUTANT_WRONG_FD_CLOSE), "-16")
+        self.assertEqual(f.status, "present",
+                         f"un os.close(0) fermant le MAUVAIS fd doit être "
+                         f"DEFECT (present), eu {f.status}: {f}")
+
+    def test_wrong_fd_close_really_leaks_lock_fd(self):
+        # Preuve comportementale : on exécute RÉELLEMENT le source (faux
+        # os/fcntl où flock lève une OSError non-bloquante) en comptant les fd
+        # PAR IDENTITÉ. Le fd du verrou (retourné par os.open) n'est JAMAIS
+        # fermé par os.close(0) -> il reste vivant -> fuite réelle -> DEFECT.
+        tracker = _FdTrackerById()
+        mod = __import__("types").ModuleType("uut")
+        exec(compile(MUTANT_WRONG_FD_CLOSE, "<uut>", "exec"), mod.__dict__)
+        mod.os = _ExecOsById(tracker)
+        mod.fcntl = _ExecFcntlLeak
+        rc = mod.acquire_lock("x.lock")
+        self.assertFalse(rc, "le mutant retourne False")
+        lock_fd = tracker.lock_fd
+        self.assertIsNotNone(lock_fd, "os.open doit avoir été appelé")
+        self.assertNotIn(lock_fd, tracker.closed_fds,
+                         "le fd du verrou n'est PAS fermé par os.close(0) -> "
+                         "fuite réelle, DEFECT justifié")
+        self.assertIn(0, tracker.closed_fds,
+                      "le mutant ferme bien fd 0 (le mauvais) — preuve que le "
+                      "tracker distingue identité des fd")
+        self.assertGreater(tracker.open_count, tracker.matched_close_count,
+                           "moins de fermetures CORRECTES que d'ouvertures -> "
+                           "fuite (le mauvais fd ne compte pas)")
+
+    def test_safe_wide_close_still_ok_round5(self):
+        # Non-régression : la version SÛRE (filet large + os.close(fd) ciblant
+        # le bon fd) reste ok (absent) — pas de faux positif introduit par la
+        # vérification d'identité.
+        f = _find(run_checker(SAFE_ACQUIRE_WIDE_CLOSE), "-16")
+        self.assertEqual(f.status, "absent",
+                         f"os.close(fd) réel (bon fd) doit rester ok, "
+                         f"eu {f.status}: {f}")
+
+
+class _FdTrackerById:
+    """Compteur de fd PAR IDENTITÉ (round 5) : enregistre le fd exact retourné
+    par os.open (le fd du verrou) et ne crédite une fermeture QUE si elle cible
+    ce fd. Distingue os.close(lock_fd) de os.close(mauvais_fd)."""
+    def __init__(self):
+        self.open_count = 0
+        self.matched_close_count = 0   # fermetures ciblant un fd réellement ouvert
+        self.closed_fds = []           # tous les fd passés à close (audit)
+        self._next = 3
+        self.lock_fd = None
+
+    def open(self, path):
+        self.open_count += 1
+        self._next += 1
+        self.lock_fd = self._next
+        return self._next
+
+    def close(self, fd):
+        self.closed_fds.append(fd)
+        if fd == self.lock_fd:
+            self.matched_close_count += 1
+
+
+class _ExecOsById:
+    """Fake `os` qui compte les fd PAR IDENTITÉ (round 5)."""
+    O_CREAT = 0
+    O_WRONLY = 1
+
+    def __init__(self, tracker):
+        self._t = tracker
+
+    def open(self, path, flags):
+        return self._t.open(path)
+
+    def close(self, fd):
+        return self._t.close(fd)
+
+
 class TestCheckerReadFailureIsClean(unittest.TestCase):
     """Contre-audit Codex (round 3) : le checker, cœur de la mesure A/B, ne
     doit JAMAIS planter en traceback sur une source illisible/non-UTF8. Il

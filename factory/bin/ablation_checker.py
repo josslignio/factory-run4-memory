@@ -434,8 +434,9 @@ def _measure_acquire_lock_fd_closure(src: str):
     Renvoie :
       - True  si le fd issu de `os.open` est RÉELLEMENT fermé (filet sûr) ;
       - False si le fd fuit (filet large sans fermeture réelle, fermeture
-        mortelle `if False: os.close(fd)`, ou .close() sur une ressource sans
-        rapport avec le fd) ;
+        mortelle `if False: os.close(fd)`, fermeture d'une ressource sans
+        rapport avec le fd, OU fermeture d'un MAUVAIS fd comme `os.close(0)`
+        qui ne ferme pas le fd du verrou) ;
       - None  si la mesure comportementale est impossible (source non
         exécutable sous les fakes, os.open non atteint...).
 
@@ -444,24 +445,46 @@ def _measure_acquire_lock_fd_closure(src: str):
     `os.close(fd)` mais ne ferme JAMAIS le fd en réalité (contre-audit Codex).
     Seul le COMPORTEMENT RÉEL compte — exigence explicite du finding 4.
 
+    Contre-audit round 5 (Claude) : un mutant `except OSError: os.close(0)`
+    ferme le MAUVAIS fd (stdin) — le fd réel du verrou (issu de `os.open`)
+    fuit. Le tracker ne doit créditer une fermeture QUE si elle cible un fd
+    RÉELLEMENT ouvert (identité du fd), pas n'importe quel appel `os.close`.
+
     Sandbox : exec dans un espace de noms frais, `__import__` intercepté pour
     que `import os`/`import fcntl` retournent des fakes (aucun effet de bord
     OS réel, aucune ressource OS touchée, aucun register_at_fork réel). Le
     source exécuté est celui du fichier analysé : PAS une réimplémentation
     recopiée."""
     import builtins
+    from collections import Counter
 
     class _Tracker:
+        # Compteur comportemental (finding 4 + contre-audit round 5 Claude) :
+        # on ne crédite une fermeture QUE si elle cible un fd RÉELLEMENT ouvert
+        # par os.open (identité du fd). Un mutant `os.close(0)` (fermant stdin)
+        # ne ferme PAS le fd du verrou -> doit rester DEFECT (faux négatif
+        # sinon). `_open` est un multi-ensemble des fds encore vivants.
         def __init__(self):
+            self._next = 100
+            self._open = Counter()   # fd -> nb d'ouvertures encore vivantes
             self.opens = 0
-            self.closes = 0
+            self.closes = 0          # fermetures CORRECTES (ciblant un fd ouvert)
 
         def opened(self):
+            self._next += 1
+            fd = self._next
+            self._open[fd] += 1
             self.opens += 1
-            return 100 + self.opens
+            return fd
 
         def closed(self, fd):
-            self.closes += 1
+            # Seule une fermeture ciblant un fd RÉELLEMENT ouvert compte : fermer
+            # un mauvais fd (ex: os.close(0)) ne résout PAS la fuite du verrou.
+            if self._open.get(fd, 0) > 0:
+                self._open[fd] -= 1
+                if self._open[fd] <= 0:
+                    del self._open[fd]
+                self.closes += 1
 
     tracker = _Tracker()
 
@@ -536,7 +559,10 @@ def _measure_acquire_lock_fd_closure(src: str):
         return None
     if tracker.opens == 0:
         return None  # os.open non atteint -> non mesurable
-    return tracker.closes >= tracker.opens
+    # Le fd du verrou (issu de os.open) doit être RÉELLEMENT fermé : AUCUN fd
+    # ouvert ne doit rester vivant. Fermer un MAUVAIS fd (ex: os.close(0)) ne
+    # compte pas — seul un close() ciblant le fd ouvert résout la fuite.
+    return not tracker._open
 
 
 def rule_L16(code: str, orig: str, path: str) -> Finding:
@@ -553,7 +579,10 @@ def rule_L16(code: str, orig: str, path: str) -> Finding:
         rapport avec le fd issu de os.open) ;
       - `except OSError: if False: os.close(fd); return False` (fermeture
         MORTELLE — contre-audit Codex : l'occurrence textuelle crédite à tort
-        une analyse purement lexicale).
+        une analyse purement lexicale) ;
+      - `except OSError: os.close(0); return False` (ferme un MAUVAIS fd —
+        contre-audit round 5 Claude : le fd réel du verrou fuit, seul un
+        close() ciblant le fd ouvert résout la fuite).
 
     Décision :
       1. pas d'acquire_lock / pas de `except BlockingIOError` isolé -> absent

@@ -23,9 +23,12 @@ Idempotent : réécrire le même fichier à l'octet près si rien n'a changé
 (bootstrap figé à l'extraction). Stdlib uniquement.
 """
 import argparse
+import fcntl
 import json
 import os
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -435,21 +438,78 @@ LESSONS = [
 ]
 
 
-def write_jsonl(lessons, out_path: Path) -> None:
+# Délai max d'attente du verrou d'écriture (P0 finding 3) : un flock(LOCK_EX)
+# classique bloque indéfiniment ; on l'acquiert en LOCK_NB borné -> JAMAIS
+# d'attente infinie, deadlock impossible. 30s est très large pour du IO local.
+LOCK_TIMEOUT = 30.0
+
+
+def _flock_ex_timeout(fd: int, timeout: float = LOCK_TIMEOUT) -> None:
+    """Acquiert flock(LOCK_EX) en mode non-bloquant, réessayé jusqu'au
+    `timeout` (en secondes). Lève TimeoutError si la contention dépasse le
+    délai — JAMAIS d'attente infinie, JAMAIS de deadlock."""
+    deadline = time.monotonic() + timeout
+    delay = 0.02
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"impossible d'acquérir le verrou d'écriture bootstrap "
+                    f"après {timeout}s (contention) — abandon fail-closed")
+            time.sleep(delay)
+            delay = min(delay * 1.5, 0.5)
+
+
+def write_jsonl(lessons, out_path: Path, timeout: float = LOCK_TIMEOUT) -> None:
     """Écrit les leçons (une par ligne, JSON UTF-8, ensure_ascii=False).
 
     Idempotent : même entrée → mêmes octets. Pas de newline final superflu.
+
+    P0 finding 3 : écriture CONCURRENTE SÉRIALISÉE en réutilisant le pattern
+    déjà validé du repo (cf. lesson_extractor._write_jsonl_fresh et les
+    leçons L-10..L-16 de memory/lessons.jsonl) — PAS de nouvelle abstraction
+    de lock :
+      - fcntl.flock exclusif sur un fichier de verrou dédié `<out>.lock` ;
+      - fd de verrou ouvert puis TOUJOURS fermé dans un `finally` (libération
+        garantie même sur crash) ;
+      - acquisition BORNÉE (_flock_ex_timeout) : jamais d'attente infinie ;
+      - tmp UNIQUE par processus (tempfile.mkstemp, pas un `.tmp` fixe
+        partagé) + `with os.fdopen(fd)` (context manager) + fsync ;
+      - `os.replace` atomique : le fichier destination n'est jamais vu à
+        moitié écrit, jamais corrompu par une course ;
+      - nettoyage du tmp dans un `finally`.
     """
-    # P2 audit Codex : écriture ATOMIQUE (tmp + fsync + os.replace). Un
-    # crash pendant write_text ne peut plus tronquer un fichier existant.
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = out_path.with_suffix(out_path.suffix + ".lock")
     lines = [json.dumps(l, ensure_ascii=False, sort_keys=False) for l in lessons]
-    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, out_path)
+    # O_CREAT : le fichier de verrou est créé s'il n'existe pas. Il persiste
+    # après exécution (fichier auxiliaire) — c'est attendu et sans impact
+    # sur lessons.jsonl lui-même (cf. D-009 / leçon L-05 : on n'unlink pas).
+    lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        _flock_ex_timeout(lock_fd, timeout)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(out_path.parent),
+            prefix=out_path.name + ".",
+            suffix=".tmp")
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, out_path)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+    finally:
+        os.close(lock_fd)
 
 
 def main() -> int:
@@ -477,7 +537,23 @@ def main() -> int:
         return 1
 
     out = Path(args.out)
-    write_jsonl(LESSONS, out)
+    try:
+        write_jsonl(LESSONS, out)
+    except FileNotFoundError as e:
+        # P0 finding 3 : capturé explicitement — peut survenir si le répertoire
+        # parent est retiré concurremment, ou si mkstemp/fsync tombe sur un
+        # chemin disparu. main() le traduit en rc=1 contrôlé (pas de traceback).
+        print(f"bootstrap: écriture {out} impossible — "
+              f"FileNotFoundError: {e}", file=sys.stderr)
+        return 1
+    except TimeoutError as e:
+        print(f"bootstrap: écriture {out} impossible — "
+              f"timeout de verrou: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"bootstrap: écriture {out} impossible — "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+        return 1
     print(f"bootstrap: {n} leçons valides écrites dans {out} "
           f"(min={args.min}, source={REPO}, date={RUN3_DATE})")
     return 0

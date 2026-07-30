@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Pilote headless Run #4 (Mémoire / Experience Compiler).
-# GLM (via opencode, zai-coding-plan) construit ; Claude ET Codex reviewent chaque tranche
-# EN PARALLÈLE (deux avis indépendants) et font chacun l'audit final exhaustif.
+# GLM (via opencode, zai-coding-plan) construit ; Codex review chaque tranche
+# (avis indépendant, lecture seule) et fait l'audit final exhaustif.
+# (Relevé 30/07 Jocelyn : Claude retiré de la boucle de review/audit — Codex seul.)
 # Ne s'arrête jamais tout seul sauf état terminal explicite.
 #
 # ATTENTION AVANT DE LANCER EN LONGUE DURÉE — deux smoke-tests de 30s à faire d'abord (UN PAR UN,
@@ -21,8 +22,16 @@
 #   D-002 (Claude#2): reviewers en lecture seule technique (--allowedTools Read/Grep/Glob
 #                     pour claude, -s read-only pour codex), diff embarqué dans le prompt.
 #   D-003 (Claude#1): contrat d'état cohérent (prompt = valeur seule ; lecteur tolérant au préfixe).
-#   D-004 (Codex#2) : audit final gating — P1 -> retour RUNNING (cap 2) au lieu de WAITING_HUMAN_BOSS_GO.
-#   D-005 (Codex#3) : backoff infra 30/120/300s, max 3 échecs -> WAITING_INFRA.
+#   D-004 (Codex#2) : audit final gating — non-PASS -> retour RUNNING (round de
+#                     repair) au lieu de WAITING_HUMAN_BOSS_GO. Budget repair
+#                     courant = MAX_P0_REPAIR=6 / MAX_P1_REPAIR=6 (redescendu
+#                     30/07 après dérive longue). AUTORITÉ UNIQUE : § MACHINE
+#                     À ÉTATS du MASTER_ORDER + constantes ci-dessous.
+#   D-005 (Codex#3) : backoff infra 30/120/300s -> WAITING_INFRA. Seuil courant
+#                     = MAX_INFRA_FAILS=10 (relevé 30/07 Jocelyn ; plus bas à
+#                     l'origine). AUTORITÉ UNIQUE : § MACHINE À ÉTATS du
+#                     MASTER_ORDER + constante ci-dessous. Aucune valeur de
+#                     budget ailleurs ne doit contredire ces constantes.
 
 set -u
 REPO="${RUN4_REPO:-$HOME/factory-run4-memory}"   # surchargeable : RUN4_REPO=/chemin/worktree-conductor
@@ -35,10 +44,10 @@ AUDIT_CODEX="reports/RUN4_FINAL_AUDIT_CODEX.md"
 
 BUILD_BRANCH="run4/build"
 MAX_ITERS=300
-MAX_INFRA_FAILS=3            # D-005 : max 3 retries infra (règle 6)
+MAX_INFRA_FAILS=10           # releve 30/07 (Jocelyn) : tolerer plus de hoquets infra transitoires (ex. codex_models_manager cache TTL) avant WAITING_INFRA
 BACKOFFS=(30 120 300)        # D-005 : backoff 30s/120s/300s
-MAX_P0_REPAIR=4             # ordre fusionne 29/07 : budget repair phase P0 (6 fixes coeur)
-MAX_P1_REPAIR=4             # ordre fusionne 29/07 : budget repair phase P1 (Sharp Core minimal)
+MAX_P0_REPAIR=6             # redescendu 30/07 (Jocelyn, apres 6h/16+ rounds inutiles) : un budget trop haut a laisse tourner en silence sur un audit mal cadre -- desormais audit scope (FINAL_AUDIT_PROMPT) + budget bas = echec rapide -> FAIL -> notification, plutot que derive longue
+MAX_P1_REPAIR=6             # meme raison
 PHASE_FILE="factory/campaigns/CAMPAIGN_PHASE"
 RECEIPTS_DIR="$HOME/.factory-receipts/factory-run4-memory"   # receipts hors du repo (hors perimetre builder)
 LOCK_DIR="$RECEIPTS_DIR/driver.lock.d"   # verrou d execution atomique (mkdir), detenu toute la vie du driver
@@ -69,29 +78,581 @@ read_state() {
   if [ -f "$STATE_FILE" ]; then
     raw=$(<"$STATE_FILE")
   fi
-  raw=${raw//[[:space:]]/}                 # retire tout whitespace
-  raw=${raw#CAMPAIGN_STATE=}               # tolère un préfixe (ne matche jamais un état inconnu)
+  # D-003 : tolère un éventuel préfixe "CAMPAIGN_STATE=" laissé par GLM ET les
+  # espaces de BORD (trailing newline, indentation). MAIS (P0 finding 6 / audit
+  # fail-open 27/07) on ne retire PLUS les espaces INTERNES : un état malformé
+  # comme "RUN NING" ne doit PAS être réparé silencieusement en "RUNNING" — sinon
+  # state_kind ne le voit jamais comme illegal (fail-open). L'ancien
+  # `${raw//[[:space:]]/}` retirait TOUT whitespace -> normalisation silencieuse.
+  # On trime donc UNIQUEMENT les bords (idiom POSIX), on strippe le préfixe, et
+  # on laisse state_kind trancher sur la valeur exacte. Testé par
+  # tests/test_driver_helpers.bash (entrées malformées incluses).
+  raw="${raw#"${raw%%[![:space:]]*}"}"      # trim leading whitespace
+  raw=${raw#CAMPAIGN_STATE=}                # tolère un préfixe (D-003)
+  raw="${raw#"${raw%%[![:space:]]*}"}"      # re-trim leading (ex: "= RUNNING")
+  raw="${raw%"${raw##*[![:space:]]}"}"      # trim trailing whitespace
   printf '%s' "$raw"
 }
 
 # --- Contre-relecture GPT 29/07 : lecture stricte de la phase (jamais de reinit silencieuse). ---
 read_phase() {
   local p
-  p=$(cat "$PHASE_FILE" 2>/dev/null | tr -d ' \r\n')
+  p=$(cat "$PHASE_FILE" 2>/dev/null)
+  # P0 finding 6 / audit fail-open 27/07 : on ne retire PLUS les espaces internes
+  # (l'ancien `tr -d ' \r\n'` réparait silencieusement "P 1" en "P1", autorisant
+  # l'entrée en P1 sans checkpoint valide). On trime UNIQUEMENT les bords :
+  # "P 1" reste "P 1" -> ne matche pas P0|P1 -> return 1 (fail-closed).
+  p="${p#"${p%%[![:space:]]*}"}"
+  p="${p%"${p##*[![:space:]]}"}"
   case "$p" in
     P0|P1) printf '%s' "$p"; return 0 ;;
     *) return 1 ;;
   esac
 }
 
+# --- P0 finding 6 : autorité UNIQUE des états (MASTER_ORDER § « MACHINE À ÉTATS »).
+# state_kind classifie un état lu dans CAMPAIGN_STATE en action LÉGALE. Toute
+# valeur non listée -> 'illegal' : le pilote ne répare JAMAIS silencieusement un
+# état invalide. (L'ancien code laissait un état inconnu tomber dans la boucle
+# de build = traité de fait comme RUNNING, ce qui était une réparation
+# silencieuse.) États légaux et leur action :
+#   RUNNING                       -> build   (continue vers la construction)
+#   READY_FOR_FINAL_AUDIT         -> audit   (audit simple Codex -- Claude retire de la boucle 30/07)
+#   WAITING_INFRA                 -> infra_stop
+#   WAITING_HUMAN_BOSS_GO|WAITING_HUMAN|FAIL|DONE|MEMORY_SYSTEM_FAIL -> terminal
+# Testé par tests/test_driver_helpers.bash.
+state_kind() {
+  case "$1" in
+    RUNNING) printf 'build' ;;
+    READY_FOR_FINAL_AUDIT) printf 'audit' ;;
+    WAITING_INFRA) printf 'infra_stop' ;;
+    WAITING_HUMAN_BOSS_GO|WAITING_HUMAN|FAIL|DONE|MEMORY_SYSTEM_FAIL) printf 'terminal' ;;
+    *) printf 'illegal' ;;
+  esac
+}
+
+# --- P0 finding 6 (transitions légales) : AUTORITÉ UNIQUE des transitions.
+# `state_kind` valide les VALEURS d'état ; `legal_transition` valide les
+# TRANSITIONS (from -> to). Une transition non listée ici est 'illegal' :
+# main() l'applique en tête de chaque itération et s'arrête fail-closed
+# (JAMAIS de réparation silencieuse). C'était précisément le finding de
+# l'audit Codex (PHASE_P0_FAIL) : « le pilote valide des valeurs d'état mais
+# n'applique pas les transitions légales ; un builder peut écrire directement
+# WAITING_HUMAN_BOSS_GO ou READY_FOR_FINAL_AUDIT depuis n'importe quel
+# état/phase ; le pilote les accepte ».
+#
+# Source unique = MASTER_ORDER § « MACHINE À ÉTATS » -> « Transitions
+# légales » (lignes 84-89). Transitions autorisées :
+#   - identité (X -> X) : toujours légale (pas de changement d'état).
+#   - RUNNING -> READY_FOR_FINAL_AUDIT : builder déclare fin de phase.
+#   - RUNNING -> WAITING_INFRA | MEMORY_SYSTEM_FAIL : pilot signale
+#     quota/réseau indispo ou mémoire corrompue (terminal, écrit puis exit).
+#   - READY_FOR_FINAL_AUDIT -> RUNNING : audit résolu (P0 PASS -> P1, ou
+#     non-PASS -> repair round, retour build).
+#   - READY_FOR_FINAL_AUDIT -> WAITING_INFRA : reviewer final indisponible,
+#     sortie vide/invalide/illisible après épuisement du budget infra.
+#   - READY_FOR_FINAL_AUDIT -> WAITING_HUMAN_BOSS_GO : audit P1 PASS (Codex seul).
+#   - READY_FOR_FINAL_AUDIT -> FAIL : budget de repair épuisé.
+#   - FAIL -> RUNNING : UNIQUEMENT via RESUME_AFTER_FAIL=1 (traité au
+#     démarrage, pas en boucle).
+# Toute autre transition est illégale (ex: RUNNING -> WAITING_HUMAN_BOSS_GO,
+# RUNNING -> DONE, READY_FOR_FINAL_AUDIT -> MEMORY_SYSTEM_FAIL, etc.).
+# Testé par tests/test_driver_helpers.bash (cas légaux ET illégaux + boucle
+# réelle de main).
+legal_transition() {
+  local from="$1" to="$2"
+  [ "$from" = "$to" ] && { printf 'legal'; return 0; }
+  case "$from" in
+    RUNNING)
+      case "$to" in
+        READY_FOR_FINAL_AUDIT|WAITING_INFRA|MEMORY_SYSTEM_FAIL) printf 'legal'; return 0 ;;
+      esac ;;
+    READY_FOR_FINAL_AUDIT)
+      case "$to" in
+        RUNNING|WAITING_INFRA|WAITING_HUMAN_BOSS_GO|FAIL) printf 'legal'; return 0 ;;
+      esac ;;
+    FAIL)
+      # Réservé à RESUME_AFTER_FAIL (démarrage). En boucle, FAIL est terminal.
+      case "$to" in
+        RUNNING) printf 'legal'; return 0 ;;
+      esac ;;
+  esac
+  printf 'illegal'
+}
+
+# --- P0 finding 6 (garde-boucle testable) : applique la transition légale.
+# C'est le GARDE RÉEL de tête de boucle de main() : toute transition
+# `prev -> st` non listée par legal_transition est ILLÉGALE -> exit 1
+# (fail-closed). Le pilote ne répare JAMAIS silencieusement un état invalide.
+# Extrait en fonction nommée (vs inline) pour que tests/test_driver_helpers.bash
+# appelle le VRAI garde de production (pas une copie) — exigence « teste
+# réellement l'item » + contre-audit Codex (PHASE_P0_FAIL) : « la machine à
+# états n'est pas testée par une exécution réelle de main() ».
+enforce_legal_transition_or_die() {
+  local prev="$1" st="$2"
+  if [ "$st" != "$prev" ] && [ "$(legal_transition "$prev" "$st")" = "illegal" ]; then
+    echo "[$(date -u +%FT%TZ)] TRANSITION ILLÉGALE '$prev' -> '$st' dans $STATE_FILE -> arret fail-closed (aucune réparation silencieuse). Transitions légales : cf. MASTER_ORDER § MACHINE À ÉTATS + legal_transition." >> "$LOG"
+    echo "Transition illégale '$prev' -> '$st' dans $STATE_FILE -> arret fail-closed (voir MASTER_ORDER § MACHINE À ÉTATS). Aucune réinitialisation silencieuse." >&2
+    exit 1
+  fi
+}
+
 sha256_file() { python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1" 2>/dev/null; }
 
-# --- Verdict d audit par token EXACT en premiere ligne (PHASE_P0_PASS / PHASE_P1_PASS). ---
-phase_audit_ok() {
+# --- Verdict d audit par token EXACT en premiere ligne. ---
+phase_audit_has_token() {
   [ -s "$1" ] || return 1
   local first
-  first=$(head -n 1 "$1" | tr -d ' \t\r')
+  first=$(head -n 1 "$1")
+  first="${first#"${first%%[![:space:]]*}"}"
+  first="${first%"${first##*[![:space:]]}"}"
   [ "$first" = "$2" ]
+}
+phase_audit_ok() { phase_audit_has_token "$1" "$2"; }
+
+# --- FIX 2 (post-mortem 30/07 : bug CLI Codex "failed to load models cache:
+# missing field supports_reasoning_summaries") : le bruit d'erreur du CLI Codex
+# peut fuiter dans stdout et se retrouver DANS le contenu de AUDIT_CODEX /
+# REVIEW_CODEX. Sans cette garde, phase_audit_ok echouait (1ere ligne != token)
+# et le round etait compte comme un VRAI audit non-PASS -> audit_repairs++,
+# brulant des rounds de repair reels (et du quota Codex) pour du simple bruit
+# infra. Desormais ce bruit est detecte et traite comme infra_fail dans main()
+# (backoff + retenter, pas de round de repair consomme). Renvoie 0 (vrai) si le
+# fichier contient la signature du bug CLI cache, 1 sinon. Teste reellement par
+# tests/test_driver_helpers.bash. ---
+codex_cache_bug_in_file() {
+  [ -s "$1" ] || return 1
+  grep -qE 'failed to load models cache|supports_reasoning_summaries' "$1"
+}
+
+# --- FIX 3 / D-013-quater : comparaison testable de la signature de stall.
+# Codes retour de audit_same_as_previous :
+#   0 = meme signature critique (stall)
+#   1 = premier round, absence de finding critique, ou signature differente
+#   2 = rapport/parser en echec OU signature precedente corrompue
+#       (ERREUR INFRA, jamais "progres")
+# La comparaison pure est separee du parsing pour que main() calcule UNE SEULE
+# fois STALL_SIG puis reutilise exactement cette valeur pour comparer ET stocker.
+audit_signature_same_as_previous() {
+  local prev_sha_file="$1" cur="$2" prev=""
+  [ -n "$cur" ] || return 1
+  [ -e "$prev_sha_file" ] || [ -L "$prev_sha_file" ] || return 1
+  [ -f "$prev_sha_file" ] || return 2
+  prev=$(cat "$prev_sha_file" 2>/dev/null) || return 2
+  [[ "$prev" =~ ^[0-9A-Fa-f]{64}$ ]] || return 2
+  prev=$(printf '%s' "$prev" | tr '[:upper:]' '[:lower:]') || return 2
+  [ "$prev" = "$cur" ]
+}
+
+audit_same_as_previous() {
+  local prev_sha_file="$1" cur_file="$2" cur=""
+  cur="$(stall_signature "$cur_file")" || return 2
+  audit_signature_same_as_previous "$prev_sha_file" "$cur"
+}
+
+# --- D-013-quater (granularite de la detection de stall) : la signature de
+# stall etait calculee sur le RAPPORT ENTIER (sha256_file $AUDIT_CODEX) ->
+# (1) FAUX NEGATIF : un meme finding P1/High persistant mais noye dans un
+# rapport qui change par ailleurs (reformulation, autre finding P2, timestamp)
+# -> SHA differant -> pas de stall -> boucle jusqu au plafond MAX_*_REPAIR (29
+# rounds observes), exactement le mode d echec que D-013 devait corriger ;
+# (2) FAUX POSITIF : 2 rapports identiques sans AUCUN P1/High -> stall/FAIL
+# cosmetique sur du bruit P2 alors que rien de critique n est bloque.
+# Desormais la signature ne porte QUE sur les findings P1/High extraits.
+# Perimetre strict (RIEN d autre touche) : extract_p1_high_findings +
+# stall_signature + audit_same_as_previous + le site d ecriture du SHA. Ni
+# stall_action, ni build_cur_prompt, ni FIX1/2/3, ni D-001..D-013-ter, ni la
+# machine a etats ne sont modifies. La robustesse crash-safe de D-013-ter
+# (atomic_write_exact / purge_file_logged) est preservee integralement : seul
+# le CONTENU hache change. ---
+
+# extract_p1_high_findings : construit le PAYLOAD deterministe de stall.
+# Priorite :
+#   1. blocs explicitement critiques P0/P1/High (P0 inclus : plus grave que P1) ;
+#   2. fallback sur le corps complet APRES PHASE_P0_FAIL/PHASE_P1_FAIL, mais
+#      UNIQUEMENT si le rapport ne contient AUCUN en-tete de severite connu.
+# Le fallback couvre le contrat reel du prompt ("FAIL suivi des findings") sans
+# reintroduire le faux positif D-013-quater : un rapport explicitement P2-only
+# contient un en-tete connu, donc reste sans signature et ne peut pas staller.
+#
+# Formats reconnus : token nu, titre Markdown, label [P1]/[High], liste
+# "- [P1] ...", et emphase Markdown "**[P1] ...**". Un titre non bracketed doit
+# etre separe du token par ':'/'—'/'–'/'-' ; ainsi "High confidence: ..." reste
+# de la prose et ne devient JAMAIS un finding critique.
+#
+# Les frontieres de blocs critiques sont preservees dans un tableau JSON. Le
+# fallback non etiquete utilise le MEME tableau a un element qu'un bloc critique
+# unique : un reviewer qui ajoute/retire seulement le label P1 ne fabrique pas
+# un faux progres et ne peut pas obtenir une deuxieme redirection. Echec
+# UTF-8/lecture -> rc non nul.
+extract_p1_high_findings() {
+  local f="$1"
+  [ -s "$f" ] || return 0
+
+  python3 - "$f" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+SEVERITIES = r"P[0-4]|HIGH|MEDIUM|LOW|INFO|MINOR"
+CRITICAL = {"P0", "P1", "HIGH"}
+FAIL_VERDICTS = {"PHASE_P0_FAIL", "PHASE_P1_FAIL"}
+
+def strip_outer_emphasis(text):
+    for marker in ("**", "__"):
+        if text.startswith(marker) and text.endswith(marker):
+            return text[len(marker):-len(marker)].strip()
+    return text
+
+def severity_header(raw):
+    text = raw.strip()
+    heading = re.match(r"^(#{1,6})\s+(.*)$", text)
+    heading_level = len(heading.group(1)) if heading else None
+    if heading:
+        text = heading.group(2).strip()
+
+    bullet = re.match(r"^[-*+]\s+(.*)$", text)
+    if bullet:
+        text = bullet.group(1).strip()
+
+    text = strip_outer_emphasis(text)
+    # Accepte aussi "**[P1]** titre" et "**P1** : titre".
+    text = re.sub(
+        rf"^(?:\*\*|__)(\[?(?:{SEVERITIES})\]?)(?:\*\*|__)(?=$|\s|[:\u2013\u2014-])",
+        r"\1",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    bracket = re.match(
+        rf"^\[({SEVERITIES})\](?:\s*[:\u2013\u2014-]?\s*(.*))?$",
+        text,
+        re.IGNORECASE,
+    )
+    if bracket:
+        return (
+            bracket.group(1).upper(),
+            (bracket.group(2) or "").strip(),
+            heading_level,
+        )
+
+    bare = re.fullmatch(rf"({SEVERITIES})", text, re.IGNORECASE)
+    if bare:
+        return bare.group(1).upper(), "", heading_level
+
+    titled = re.match(
+        rf"^({SEVERITIES})\s*[:\u2013\u2014-]\s+(.+)$",
+        text,
+        re.IGNORECASE,
+    )
+    if titled:
+        return titled.group(1).upper(), titled.group(2).strip(), heading_level
+
+    # "P1 Titre" / "### P0 Titre" est non ambigu : contrairement au mot
+    # naturel "High", un token P0..P4 en debut de ligne est une severite.
+    numbered_title = re.match(r"^(P[0-4])\s+(.+)$", text, re.IGNORECASE)
+    if numbered_title:
+        return (
+            numbered_title.group(1).upper(),
+            numbered_title.group(2).strip(),
+            heading_level,
+        )
+
+    return None
+
+blocks = []
+current = None
+current_level = None
+saw_severity = False
+
+def flush():
+    global current, current_level
+    if current is None:
+        return
+    while current and not current[0].strip():
+        current.pop(0)
+    while current and not current[-1].strip():
+        current.pop()
+    if current:
+        blocks.append("\n".join(current))
+    current = None
+    current_level = None
+
+lines = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+first_nonempty_index = next(
+    (index for index, line in enumerate(lines) if line.strip()),
+    None,
+)
+verdict = (
+    lines[first_nonempty_index].strip()
+    if first_nonempty_index is not None
+    else ""
+)
+
+for raw in lines:
+    heading_match = re.match(r"^\s*(#{1,6})\s+", raw)
+    heading_level = len(heading_match.group(1)) if heading_match else None
+    header = severity_header(raw)
+    if header:
+        saw_severity = True
+        flush()
+        severity, title, header_level = header
+        current = [] if severity in CRITICAL else None
+        current_level = header_level if current is not None else None
+        if current is not None and title:
+            current.append(title)
+    elif heading_level and current is not None:
+        # Apres un token nu "P1", le premier titre Markdown est le titre du
+        # finding, pas une nouvelle section : on le conserve puis utilise son
+        # niveau comme frontiere pour les titres suivants.
+        if current_level is None and not any(line.strip() for line in current):
+            current.append(raw)
+            current_level = heading_level
+        elif current_level is None or heading_level <= current_level:
+            flush()
+        else:
+            current.append(raw)
+    elif current is not None:
+        current.append(raw)
+
+flush()
+
+if blocks:
+    sys.stdout.write(
+        json.dumps(blocks, ensure_ascii=False, separators=(",", ":"))
+    )
+elif verdict in FAIL_VERDICTS and not saw_severity:
+    body = lines[first_nonempty_index + 1:]
+    while body and not body[0].strip():
+        body.pop(0)
+    while body and not body[-1].strip():
+        body.pop()
+    if body:
+        sys.stdout.write(
+            json.dumps(
+                ["\n".join(body)],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+PY
+}
+
+# stall_signature : SHA-256 du payload de stall ci-dessus. Renvoie vide (rc 0)
+# pour un rapport sans finding critique exploitable ; rc 2 si le parser echoue.
+stall_signature() {
+  local f="$1" extracted
+  [ -s "$f" ] || return 0
+  extracted="$(extract_p1_high_findings "$f")" || return 2
+  [ -n "$extracted" ] || return 0
+  printf '%s' "$extracted" |
+    python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())' ||
+    return 2
+}
+
+# --- D-013 (post-post-mortem 30/07 : FIX 3 trop brutal) : redirection
+# CHIRURGICALE bornee a UNE SEULE tentative quand le verdict Codex est identique
+# au round precedent. Au lieu du FAIL immediat de FIX 3 au 1er stall (2 audits
+# identiques) -- qui abandonnait trop tot un point potentiellement fixable en
+# une derniere tentative ciblee -- on extrait les findings du dernier rapport
+# Codex et on redirige GLM UNE fois avec un prompt chirurgical. Un 2e stall
+# identique APRES redirection -> FAIL immediat (flag redirect_attempt_PHASE.used).
+# Objectif mesurable : un blocage reel ne depasse JAMAIS 3 rounds Codex avant
+# FAIL (1 normal + 1 stall + 1 redirection), au lieu de boucler jusqu au plafond
+# MAX_*_REPAIR (29 rounds observes) ou de FAIL trop tot. Jamais de boucle, meme
+# deguisee : la redirection est strictement bornee a 1 tentative par sequence.
+
+# Extract les lignes de finding (motif fichier:numero) d un rapport Codex, pour
+# la redirection chirurgicale. Aucune regex de parsing de finding n existait
+# ailleurs dans le pilote -> motif raisonnable fichier.(py|sh|md|json):numero,
+# capture les lignes ENTIERES (contexte utile pour GLM). Une ligne sans
+# localisation fichier:numero est ecartee (bruit non exploitable). Si rien ne
+# matche, renvoie vide (le prompt partira avec un placeholder d ambiguïte).
+# Teste reellement par tests/test_driver_helpers.bash.
+extract_findings() {
+  local f="$1"
+  [ -s "$f" ] || return 0
+  grep -E '[a-zA-Z0-9_./]+\.(py|sh|md|json):[0-9]+' "$f" 2>/dev/null || return 0
+}
+
+# Construit le REDIRECT_PROMPT chirurgical (texte fixe D-013 + findings extraits).
+# Prompt court, cible, DERNIERE tentative avant FAIL. Teste reellement par
+# tests/test_driver_helpers.bash.
+build_redirect_prompt() {
+  local findings="${1:-}"
+  if [ -z "$findings" ]; then
+    findings="<aucun finding fichier:ligne extrait -- le rapport Codex ne cite pas de localisation exploitable ; traite l ambiguite explicitement dans ton commit plutot que de re-tenter en aveugle>"
+  fi
+  printf 'Ta derniere tentative n a RIEN change au probleme signale (verdict Codex identique au round precedent). N ESSAIE PAS la meme chose une deuxieme fois. Voici EXACTEMENT et UNIQUEMENT le(s) finding(s) a corriger, extrait du dernier rapport Codex :\n%s\nApplique un patch MINIMAL et CHIRURGICAL qui cible precisement cette ligne/ce comportement, ne touche a AUCUN autre fichier ni AUCUNE autre logique. Si le finding te semble deja corrige ou ambigu, dis-le explicitement dans ton commit plutot que de re-tenter en aveugle. C est ta DERNIERE tentative sur ce point avant arret FAIL du pilote et intervention humaine.' "$findings"
+}
+
+# --- D-013-bis (correctif de branchement, post-revue independante Codex sur
+# le commit b674838) : le mecanisme D-013 de redirection chirurgicale vers GLM
+# en cas de stall etait STRUCTURELLEMENT present mais FONCTIONNELLEMENT INERTE.
+# Le REDIRECT_PROMPT etait ecrit dans REVIEW_CLAUDE puis copie dans REVIEW_CODEX,
+# mais CUR_PROMPT (la valeur REELLEMENT passee a `opencode run`, l'appel GLM qui
+# construit) etait TOUJOURS assigne depuis BUILD_PROMPT_P0/P1 statique et ne
+# lisait JAMAIS REVIEW_CLAUDE, REVIEW_CODEX ni REDIRECT_PROMPT. Resultat : GLM
+# ne voyait JAMAIS le contenu de redirection, meme apres un stall detecte -- la
+# redirection ne produisait aucun effet cible.
+#
+# Ce correctif branche REELLEMENT la redirection. Isoler la construction de
+# CUR_PROMPT dans une fonction testable build_cur_prompt(PHASE) :
+#   - au moment ou REDIRECT_PROMPT est construit (branche redirect du case
+#     stall_action), son contenu est persiste dans
+#     RECEIPTS_DIR/pending_redirect_PHASE.txt (PHASE = P0 ou P1) ;
+#   - build_cur_prompt(PHASE) verifie ce fichier : s'il existe, CUR_PROMPT =
+#     contenu du fichier PUIS BUILD_PROMPT_P0/P1 (redirection EN PLUS du prompt
+#     de build standard, jamais a la place) ; sinon CUR_PROMPT = BUILD_PROMPT
+#     standard seul ;
+#   - APRES l'appel opencode run, le fichier pending_redirect est supprime ->
+#     usage UNIQUE, jamais de re-injection sur une iteration ulterieure.
+# Teste reellement par tests/test_driver_helpers.bash (verification du CONTENU
+# reel de CUR_PROMPT produit, pas seulement l'existence des fonctions D-013). ---
+build_cur_prompt() {
+  local phase="$1" base pr
+  if [ "$phase" = "P1" ]; then base="$BUILD_PROMPT_P1"; else base="$BUILD_PROMPT_P0"; fi
+  pr="$RECEIPTS_DIR/pending_redirect_${phase}.txt"
+  if [ -f "$pr" ]; then
+    # Redirection chirurgicale D-013 EN TETE du prompt : GLM recoit le contenu de
+    # redirection AVANT le build standard, pour garantir qu'il est effectivement
+    # pris en compte. $(cat ...) evite le bruit d'une commande vide.
+    printf '%s\n\n%s' "$(cat "$pr")" "$base"
+  else
+    printf '%s' "$base"
+  fi
+}
+
+# ====================================================================
+# D-013-ter (audit défensif complet de la mécanique stall/redirect) :
+# écriture atomique + nettoyage crash-safe des fichiers d'état de la redirection
+# (pending_redirect_PHASE.txt, redirect_attempt_PHASE.used, last_audit_PHASE.sha256).
+# Ces helpers ne touchent NI à la logique de décision (stall_action), NI à
+# build_cur_prompt, NI à FIX1/FIX2/FIX3, NI à D-001..D-012, NI à la machine à
+# états (state_kind/legal_transition/enforce_legal_transition_or_die) : ils ne
+# font que rendre atomiques et crash-safe les ÉCRITURES/SUPPRESSIONS de ces
+# fichiers. Testés réellement (nominal + simulation crash/interruption) par
+# tests/test_driver_helpers.bash.
+# ====================================================================
+
+# atomic_write_exact : écrit <content> À L'IDENTIQUE (aucun newline ajouté) dans
+# <path> via le pattern tmp-puis-mv (atomique au sens POSIX rename). Indispensable
+# pour last_audit_PHASE.sha256 dont la comparaison est byte-exacte (un newline
+# parasite casserait audit_same_as_previous -> faux négatif de stall). Retourne 0
+# si ok, 1 sinon (logge l'échec + purge le tmp ; l'appelant décide du fail-closed).
+atomic_write_exact() {
+  local path="$1" content="$2" tmp rc
+  tmp="${path}.tmp.$$"
+  if printf '%s' "$content" > "$tmp" 2>>"$LOG"; then
+    if mv -f "$tmp" "$path" 2>>"$LOG"; then
+      return 0
+    fi
+  fi
+  rc=$?
+  rm -f "$tmp" 2>/dev/null || true
+  echo "[$(date -u +%FT%TZ)] atomic_write_exact ECHEC sur $path (rc=$rc) -> fichier NON ecrit, tmp purge" >> "$LOG"
+  return 1
+}
+
+# purge_file_logged : supprime <path> SANS avaler l'erreur (remplace les
+# 'rm -f ... 2>/dev/null' muets sur les fichiers d'état de redirection). Logge
+# explicitement la suppression réussie et l'échec éventuel. Retourne 0 si le
+# fichier n'existe plus après (ou n'existait pas), 1 si la suppression a échoué.
+purge_file_logged() {
+  local path="$1" label="${2:-$1}"
+  [ -e "$path" ] || return 0
+  if rm -f "$path" 2>>"$LOG"; then
+    echo "[$(date -u +%FT%TZ)] purge $label : supprime ($path)" >> "$LOG"
+    return 0
+  fi
+  echo "[$(date -u +%FT%TZ)] purge $label : ECHEC suppression ($path)" >> "$LOG"
+  return 1
+}
+
+# enter_scoped_purge / exit_scoped_purge : pour la section critique (appel
+# opencode run), on ÉTEND temporairement le trap EXIT global du driver (SANS
+# remplacer sa déclaration dans main : on sauvegarde l'état exact des traps
+# EXIT/INT/TERM/HUP puis on le RESTAURE à l'identique après la section) afin que
+# <file> soit purgé même si le pilote est tué (SIGTERM/SIGINT/SIGHUP -> tous
+# 'exit 143' -> EXIT) ou crashe pendant la section. Les traps INT/TERM/HUP
+# eux-mêmes ne sont PAS modifiés : leur 'exit 143' global funnel vers EXIT, donc
+# la purge se déclenche quand même sur signal.
+_SCP_FILE=""; _SCP_SAVED=""
+enter_scoped_purge() {
+  _SCP_FILE="$1"
+  _SCP_SAVED="$(trap -p EXIT INT TERM HUP)"
+  # EXIT augmenté : purge le fichier PUIS invoque le cleanup original du driver
+  # (verrou + heartbeat). On rappelle cleanup explicitement car ré-armer un trap
+  # pendant un EXIT en cours ne l'exécute pas une seconde fois.
+  trap 'rm -f "$_SCP_FILE" 2>/dev/null || true; cleanup' EXIT
+}
+exit_scoped_purge() {
+  local line
+  trap - EXIT INT TERM HUP
+  while IFS= read -r line; do
+    [ -n "$line" ] && eval "$line"
+  done <<SCPHEREDOC
+$_SCP_SAVED
+SCPHEREDOC
+  _SCP_FILE=""; _SCP_SAVED=""
+}
+
+# commit_redirect : engagement TRANSACTIONNEL et atomique d'une redirection
+# chirurgicale. Écrit pending_redirect (tmp-puis-mv atomique) PUIS touche le
+# flag, le tout sous un scoped trap qui ROLLBACK (supprime pending + tmp + flag)
+# sur interruption entre les deux écritures -> JAMAIS d'état inconsistent :
+#   - jamais pending sans flag (re-injection + 2e redirection autorisée),
+#   - jamais flag sans pending (FAIL sans avoir délivré la redirection).
+# Ordre pending-puis-flag : en cas de signal non rattrapable (SIGKILL, hors
+# scope du trap), la fenêtre résiduelle laisse au pire pending-sans-flag (la
+# redirection est re-délivrée une fois, moins dangereux que flag-sans-pending
+# qui perdrait la tentative). Retourne 0 si ok, 1 sinon (fail-closed :
+# l'appelant ne doit PAS compter la redirection comme engagée).
+CR_SAVED=""; CR_PENDING=""; CR_TMP=""; CR_FLAG=""
+commit_redirect() {
+  local pending="$1" flag="$2" content="$3"
+  CR_SAVED="$(trap -p EXIT INT TERM HUP)"
+  CR_PENDING="$pending"; CR_TMP="${pending}.tmp.$$"; CR_FLAG="$flag"
+  # scoped rollback EXIT : interruption (signal -> exit 143 -> EXIT, ou crash)
+  # entre l'écriture de pending et le touch du flag -> on retire TOUT.
+  trap 'rm -f "$CR_PENDING" "$CR_TMP" "$CR_FLAG" 2>/dev/null || true' EXIT
+  printf '%s\n' "$content" > "$CR_TMP" 2>>"$LOG" || { _commit_redirect_fail; return 1; }
+  mv -f "$CR_TMP" "$pending" 2>>"$LOG"        || { _commit_redirect_fail; return 1; }
+  touch "$flag" 2>>"$LOG"                     || { _commit_redirect_fail; return 1; }
+  _cr_restore
+  return 0
+}
+_commit_redirect_fail() {
+  rm -f "$CR_TMP" "$CR_PENDING" 2>/dev/null || true
+  _cr_restore
+}
+_cr_restore() {
+  local line
+  trap - EXIT INT TERM HUP
+  while IFS= read -r line; do
+    [ -n "$line" ] && eval "$line"
+  done <<CRHEREDOC
+$CR_SAVED
+CRHEREDOC
+}
+
+# Decision de stall en 2 temps (D-013). Entrees :
+#   $1 = code retour du predicat audit_same_as_previous (0 = stalled, autre = non).
+#   $2 = chemin du flag redirect_attempt_PHASE.used.
+# Renvoie 'redirect' / 'fail' / 'normal' :
+#   - non stalled                          -> 'normal'  (progres reel : reset flag, boucle standard)
+#   - stalled + flag ABSENT (1er stall)    -> 'redirect' (1 redirection chirurgicale vers GLM)
+#   - stalled + flag PRESENT (deja tente)  -> 'fail'     (FAIL immediat fail-closed, pas de 3e tentative)
+# Extrait en fonction nommee (vs inline) pour que tests/test_driver_helpers.bash
+# appelle la VRAIE table de decision de production (meme discipline que
+# enforce_legal_transition_or_die / audit_same_as_previous : le test appelle le
+# VRAI predicat, pas une copie locale).
+stall_action() {
+  local stalled="$1" flag="$2"
+  [ "$stalled" = "0" ] || { printf 'normal'; return 0; }
+  if [ -f "$flag" ]; then printf 'fail'; return 0; fi
+  printf 'redirect'
 }
 
 # --- Verrou d execution atomique (mkdir) : SEULE autorite anti-double-pilote (pgrep = diagnostic). ---
@@ -170,7 +731,7 @@ BUILD_PROMPT_P1='PHASE P1 — Sharp Core minimal (le checkpoint P0 est fige et v
 
 REVIEW_HEADER='Tu es un reviewer independant (jamais le builder) de Run 4, factory de Jocelyn. Review UNIQUEMENT le dernier commit du repo courant. Cherche : bugs reels reproduits, donnees inventees non tracees fichier:ligne, violations des INTERDITS ABSOLUS du master order. Tu disposes uniquement des outils Read/Grep/Glob (lecture seule) ; le diff du dernier commit t est fourni ci-dessous. Commence ta reponse par PASS ou FIX_NEEDED en premiere ligne, puis la liste des findings avec fichier:ligne si FIX_NEEDED, vide si PASS. Sois concis, ceci est une review de tranche, pas un audit complet.'
 
-FINAL_AUDIT_PROMPT='Tu es un reviewer independant de Run 4, factory de Jocelyn. Ceci est la review FINALE avant merge. Ne review PAS seulement le dernier diff : audite l INTEGRALITE du code produit dans le repo courant (tous les fichiers factory/bin/*.py, memory/, tests). Cherche exhaustivement : validation de donnees manquante, gestion d erreurs incomplete, fuites de ressources, conditions de concurrence, cas limites. Verifie aussi que le resultat de l ablation A/B dans reports/RUN4_FINAL_REPORT.md est un chiffre reel trace a une execution reelle, pas invente. Tu disposes uniquement des outils Read/Grep/Glob (lecture seule). Rends un rapport complet dont la PREMIERE LIGNE est EXACTEMENT le token de verdict exige par la note de phase ci-dessus (rien d autre sur cette ligne), puis les findings tries par severite (P1/P2/P3), chaque finding trace fichier:ligne.'
+FINAL_AUDIT_PROMPT='Tu es un reviewer independant de Run 4, factory de Jocelyn. Review CIBLEE et RAPIDE, PAS un audit exhaustif du repo entier : verifie UNIQUEMENT les items enumeres explicitement dans la note de phase ci-dessus (rien d autre). Pour chaque item : le comportement demande est-il reellement implemente et couvert par un test qui echoue si on le casse (pas juste un test cosmetique) ? Ne cherche PAS de nouveaux sujets hors de cette liste (pas de nouvelle exhaustivite sur validation/erreurs/concurrence/cas limites non demandes) -- ce n est pas le role de cet audit, ca ralentit le run sans ajouter de valeur. Seule exception autorisee hors liste : si un item de la liste ci-dessus a une consequence factuelle directe sur reports/RUN4_FINAL_REPORT.md (ex: chiffre invente), le signaler. Tu disposes uniquement des outils Read/Grep/Glob (lecture seule). Rends un rapport COURT dont la PREMIERE LIGNE est EXACTEMENT le token de verdict exige par la note de phase ci-dessus (rien d autre sur cette ligne). Si le verdict est FAIL, groupe chaque finding sous une severite explicite P0, P1, High, P2, P3 ou P4 (formats recommandes : "## P1", "[P1] Titre" ou "- [P1] Titre"), puis donne fichier:ligne. Le pilote accepte aussi un FAIL non etiquete en fallback defensif, mais les severites explicites rendent la detection de stall plus precise. Si tout est ferme, la reponse est le token PASS suivi de rien.'
 
 # --- D-005 : applique le backoff infra courant puis continue la boucle. ---
 # Renvoie le délai (s) choisi pour n-ième échec (sans dormir) — testable sans sleep réel.
@@ -203,13 +764,61 @@ audit_ok() {
   return 1
 }
 
+# --- Garde mémoire fail-closed AVANT tout appel agent (AUTORITÉ UNIQUE :
+# MASTER_ORDER § MACHINE À ÉTATS, point « Mémoire de leçons »). C'est une
+# garde P0 de la machine à états, applicable à CHAQUE itération builder
+# toutes phases confondues — PAS une fonction P1. Le brief P1 point 4 ne fait
+# qu'AJOUTER le test formel de ce hook (« le hook driver existe deja »).
+#
+# Extraction en fonction (30/07, round 2 Codex) : le précédent test
+# test_injection_failclosed.bash ne faisait que `grep` le source puis RÉPLIQUAIT
+# le contrat dans une fonction locale driver_contract() — il n'exécutait JAMAIS
+# le hook réel. Une régression du branchement/arrêt (par ex. exit 0 au lieu de
+# exit 1, ou STATE_FILE non écrit) laissait le test vert. Désormais le test
+# source le pilote et appelle CETTE fonction directement (en subshell pour
+# capturer l'exit) : toute régression du hook casse le test.
+#
+# Lit STATE_FILE/RECEIPTS_DIR/LOG de la portée appelante. Sort (exit 1) et
+# écrit MEMORY_SYSTEM_FAIL dans STATE_FILE si :
+#   - l'injecteur factory/bin/lesson_injector.py est absent ;
+#   - ou son rc != 0 (contrat STRICT P1 fonction 4 : rc!=0 = panne système).
+# $1 = numéro d'itération (pour le log).
+memory_preflight_or_die() {
+  local _mpf_iter="${1:-0}" _mpf_inj_err _mpf_inj_rc
+  if [ ! -f "factory/bin/lesson_injector.py" ]; then
+    echo "MEMORY_SYSTEM_FAIL" > "$STATE_FILE"
+    echo "[$(date -u +%FT%TZ)] iter $_mpf_iter: lesson_injector.py INTROUVABLE -> STATE=MEMORY_SYSTEM_FAIL -> arret" >> "$LOG"
+    exit 1
+  fi
+  _mpf_inj_err="$RECEIPTS_DIR/injector_stderr.$$"
+  python3 factory/bin/lesson_injector.py "healthcheck driver preflight" --format quiet >/dev/null 2>"$_mpf_inj_err"
+  _mpf_inj_rc=$?
+  # Contrat STRICT (brief P1 fonction 4 verbatim : « s arrete en
+  # MEMORY_SYSTEM_FAIL si rc!=0 ») : TOUT rc != 0 = panne système ->
+  # MEMORY_SYSTEM_FAIL + exit 1. AUCUN carve-out. L'injecteur renvoie rc=0
+  # sur mémoire saine (match OU non-match), rc!=0 uniquement sur panne
+  # (mémoire absente/illisible, schéma invalide, argparse/CLI cassée).
+  # Audit P1 round 5 (Codex) fermé : l'ancien carve-out « rc=2 && stderr vide »
+  # laissait un rc=2 continuer -> ne détectait pas la régression ; ce test
+  # l'entérinait. Le contrat strict + le contrat injecteur rc!=0=panne
+  # (commit jumeau factory/bin/lesson_injector.py) ferment le défaut pour de bon.
+  if [ "$_mpf_inj_rc" -eq 0 ]; then
+    rm -f "$_mpf_inj_err" 2>/dev/null
+    return 0
+  fi
+  cat "$_mpf_inj_err" >> "$LOG" 2>/dev/null
+  echo "MEMORY_SYSTEM_FAIL" > "$STATE_FILE"
+  echo "[$(date -u +%FT%TZ)] iter $_mpf_iter: lesson_injector rc=$_mpf_inj_rc (!=0, panne système) -> STATE=MEMORY_SYSTEM_FAIL -> arret" >> "$LOG"
+  exit 1
+}
+
 main() {
   cd "$REPO" || { echo "Repo $REPO introuvable — crée-le et colle MASTER_ORDER_RUN4_MEMORY.md dedans d'abord." >&2; exit 1; }
   mkdir -p reports factory/campaigns memory
   [ -f "$STATE_FILE" ] || echo RUNNING > "$STATE_FILE"
 
   # --- Contre-relecture GPT 29/07 : verrou atomique = SEULE autorite anti-double-pilote. ---
-  local ST0 OTHERS RESUME_PHASE
+  local ST0 OTHERS RESUME_PHASE STALL_SIG
   if ! acquire_lock; then exit 1; fi
   trap cleanup EXIT
   trap 'exit 143' TERM INT HUP
@@ -247,68 +856,272 @@ main() {
   fi
   if [ ! -f "$PHASE_FILE" ]; then
     echo "P0" > "$PHASE_FILE"
-  elif ! read_phase >/dev/null; then
-    echo "Phase inconnue dans $PHASE_FILE (ni P0 ni P1) -> refus fail-closed, aucune reinitialisation silencieuse." >&2
-    exit 1
+  else
+    local _STARTUP_PHASE
+    if ! _STARTUP_PHASE=$(read_phase); then
+      echo "Phase inconnue dans $PHASE_FILE (ni P0 ni P1) -> refus fail-closed, aucune reinitialisation silencieuse." >&2
+      exit 1
+    fi
+    # Durcissement 30/07 (Codex) : une phase P1 lue au demarrage DOIT etre couverte par un
+    # checkpoint P0 verifiable, meme hors chemin RESUME_AFTER_FAIL (demarrage direct avec
+    # CAMPAIGN_PHASE deja a P1 sans etre passe par un FAIL -- contournement possible sinon).
+    if [ "$_STARTUP_PHASE" = "P1" ] && ! verify_checkpoint_p0; then
+      echo "Demarrage en phase P1 REFUSE : checkpoint P0 absent, incomplet ou modifie ($RECEIPTS_DIR/checkpoint_p0). Fail-closed, aucun contournement du gate P0->P1." >&2
+      exit 1
+    fi
   fi
   start_heartbeat
-  echo "[$(date -u +%FT%TZ)] === RUN4 DRIVER START (dual review Claude+Codex, fixes D-001..D-005) ===" >> "$LOG"
+  echo "[$(date -u +%FT%TZ)] === RUN4 DRIVER START (review Codex seul -- Claude retire 30/07, fixes D-001..D-005) ===" >> "$LOG"
   ensure_build_branch
 
   local infra_fails=0 audit_repairs=0
   local ST rc i DIFF DIFF_TRUNC REVIEW_PROMPT PID_CLAUDE PID_CODEX
-  local PHASE PHASE_NOTE MAX_REPAIR CUR_PROMPT INJ_RC INJ_ERR TOKEN WT_DIRTY WT_STATE WT_DIFF_SHA
+  local PHASE PHASE_NOTE MAX_REPAIR CUR_PROMPT TOKEN FAIL_TOKEN WT_DIRTY WT_STATE WT_DIFF_SHA
+  local PREV_ST
+  local STALL_FILE REDIRECT_FLAG STALL_RC EXTRACTED REDIRECT_PROMPT
+  # P0 finding 6 : état consommé au démarrage (post-resume). Sert de référence
+  # pour valider chaque transition lue en tête de boucle via legal_transition.
+  PREV_ST="$(read_state)"
 
   for i in $(seq 1 $MAX_ITERS); do
   echo "$i" > "$ITER_FILE"
   ST=$(read_state)
-  case "$ST" in
-    WAITING_HUMAN_BOSS_GO|WAITING_HUMAN|FAIL|DONE|MEMORY_SYSTEM_FAIL)
+  # P0 finding 6 (transitions légales) : toute transition PREV_ST -> ST non
+  # listée par legal_transition est ILLÉGALE -> arret fail-closed. Le pilote ne
+  # répare JAMAIS silencieusement un état invalide (ex: un builder qui écrit
+  # WAITING_HUMAN_BOSS_GO pendant la phase de build -> refus, pas d'arrêt muet).
+  # Le garde lui-même vit dans enforce_legal_transition_or_die (testé pour de
+  # vrai par tests/test_driver_helpers.bash).
+  enforce_legal_transition_or_die "$PREV_ST" "$ST"
+  PREV_ST="$ST"
+  case "$(state_kind "$ST")" in
+    terminal)
       echo "[$(date -u +%FT%TZ)] STATE=$ST -> arret pilote (iter $i)" >> "$LOG"; exit 0 ;;
-    WAITING_INFRA)
+    infra_stop)
       echo "[$(date -u +%FT%TZ)] STATE=WAITING_INFRA -> arret pilote (quota/reseau, iter $i)" >> "$LOG"; exit 0 ;;
-    READY_FOR_FINAL_AUDIT)
+    audit)
       PHASE=$(read_phase) || { echo "[$(date -u +%FT%TZ)] phase invalide dans $PHASE_FILE -> arret fail-closed (aucune reinit silencieuse)" >> "$LOG"; exit 1; }
       if [ "$PHASE" = "P0" ]; then
-        PHASE_NOTE="AUDIT DE PHASE P0 UNIQUEMENT : verifie que les 6 findings P0 (source-tag/evidence, finding vide fail-closed, ecriture concurrente bootstrap, credit fd comportemental, claim ablation honnete, machine a etats) sont fermes par des tests reels, et qu AUCUN changement de phase P1 (receipt, promotion automatique) n a ete introduit avant le checkpoint. PREMIERE LIGNE de ta reponse : EXACTEMENT PHASE_P0_PASS si tout est ferme et prouve, sinon EXACTEMENT PHASE_P0_FAIL suivi des findings."
+        PHASE_NOTE="AUDIT DE PHASE P0 UNIQUEMENT : verifie que les 6 findings P0 (source-tag/evidence, finding vide fail-closed, ecriture concurrente bootstrap, credit fd comportemental, claim ablation honnete, machine a etats) sont fermes par des tests reels. PRECISION SCOPE (evite un faux P1 -- desambiguisation 30/07) : RECEIPTS_DIR, resume_receipt.json, checkpoint_p0/, sha256_file() et verify_checkpoint_p0() dans run_run4_autonomous.sh sont l ORCHESTRATION DU DRIVER lui-meme (prevue des le preflight initial 43aa069, approuvee, necessaire pour gater la transition P0->P1) -- ce N EST PAS le Sharp Core P1. Le Sharp Core P1 reel = les 4 fonctions listees dans BUILD_PROMPT_P1 (gate receipt de TACHE via factory/bin/run_gate.py, verdict reviewer artefact codex_review_verdict.json, outil promote de LECON, injection fail-closed) : verifie leur ABSENCE dans factory/bin/ (ls factory/bin/ ne doit lister aucun run_gate.py ni outil promote) comme preuve que le perimetre P1 n a pas ete franchi -- ne compte PAS l orchestration driver comme une violation. PREMIERE LIGNE de ta reponse : EXACTEMENT PHASE_P0_PASS si les 6 items sont fermes ET qu aucun outil Sharp Core P1 n existe dans factory/bin/, sinon EXACTEMENT PHASE_P0_FAIL suivi des findings."
         TOKEN="PHASE_P0_PASS"
+        FAIL_TOKEN="PHASE_P0_FAIL"
         MAX_REPAIR="$MAX_P0_REPAIR"
       else
         PHASE_NOTE="AUDIT DE PHASE P1 : le checkpoint P0 est fige. Verifie les 4 fonctions Sharp Core (gate receipt reel, verdict codex artefact, promotion automatique verifiante, injection fail-closed) et les tests adversariaux associes. PREMIERE LIGNE de ta reponse : EXACTEMENT PHASE_P1_PASS si tout est branche et prouve, sinon EXACTEMENT PHASE_P1_FAIL suivi des findings."
         TOKEN="PHASE_P1_PASS"
+        FAIL_TOKEN="PHASE_P1_FAIL"
         MAX_REPAIR="$MAX_P1_REPAIR"
       fi
-      echo "[$(date -u +%FT%TZ)] iter $i: GLM se declare pret -> audit final phase $PHASE (Claude + Codex, independants, lecture seule)" >> "$LOG"
-      claude -p "$PHASE_NOTE
-$FINAL_AUDIT_PROMPT" --dangerously-skip-permissions --allowedTools "Read Grep Glob" > "$AUDIT_CLAUDE" 2>>"$LOG" \
-        || echo "[$(date -u +%FT%TZ)] iter $i: audit claude rc non-zero" >> "$LOG"
+      echo "[$(date -u +%FT%TZ)] iter $i: GLM se declare pret -> audit final phase $PHASE (Codex seul, reviewer independant, lecture seule -- Claude retire de la boucle de review sur demande explicite Jocelyn, economie de quota)" >> "$LOG"
+      # FIX 1 : purge du cache modeles Codex AVANT chaque appel 'codex exec' pour
+      # eviter le bug CLI "failed to load models cache: missing field
+      # supports_reasoning_summaries" (silencieux, n'echoue jamais le script).
+      rm -f "$HOME/.codex/models_cache.json" 2>/dev/null || true
       codex exec -s read-only --skip-git-repo-check "$PHASE_NOTE
 $FINAL_AUDIT_PROMPT" > "$AUDIT_CODEX" 2>>"$LOG" \
         || echo "[$(date -u +%FT%TZ)] iter $i: audit codex rc non-zero" >> "$LOG"
-      if phase_audit_ok "$AUDIT_CLAUDE" "$TOKEN" && phase_audit_ok "$AUDIT_CODEX" "$TOKEN"; then
+      # FIX 2 : si le bruit d'erreur CLI du cache a fuite dans AUDIT_CODEX, on
+      # NE l'incremente PAS comme un vrai audit non-PASS (sinon un round de
+      # repair reel etait consomme pour du simple bruit infra). Traite comme
+      # infra_fail -> backoff + retenter, sans consommer de round de repair ni
+      # de quota inutile (meme logique backoff/infra_fails que le bloc review).
+      if codex_cache_bug_in_file "$AUDIT_CODEX"; then
+        infra_fails=$((infra_fails+1))
+        echo "[$(date -u +%FT%TZ)] iter $i: codex cache bug detecte -> traite comme infra_fail, pas comme audit (infra_fails=$infra_fails/$MAX_INFRA_FAILS)" >> "$LOG"
+        if [ "$infra_fails" -gt "$MAX_INFRA_FAILS" ]; then
+          echo "WAITING_INFRA" > "$STATE_FILE"
+          echo "[$(date -u +%FT%TZ)] $MAX_INFRA_FAILS echecs infra consecutifs -> STATE=WAITING_INFRA -> arret" >> "$LOG"
+          exit 0
+        fi
+        apply_backoff "$infra_fails"
+        continue
+      fi
+      # Une sortie vide est une panne du reviewer, pas un vrai audit FAIL. Sans
+      # cette garde elle consommerait le budget audit_repairs et pourrait finir
+      # en STATE=FAIL alors qu'aucun verdict n'a ete rendu.
+      if [ ! -s "$AUDIT_CODEX" ]; then
+        infra_fails=$((infra_fails+1))
+        echo "[$(date -u +%FT%TZ)] iter $i: audit Codex vide -> infra_fail, aucun round de repair consomme (infra_fails=$infra_fails/$MAX_INFRA_FAILS)" >> "$LOG"
+        if [ "$infra_fails" -gt "$MAX_INFRA_FAILS" ]; then
+          echo "WAITING_INFRA" > "$STATE_FILE"
+          echo "[$(date -u +%FT%TZ)] $MAX_INFRA_FAILS audits vides consecutifs -> STATE=WAITING_INFRA -> arret" >> "$LOG"
+          exit 0
+        fi
+        apply_backoff "$infra_fails"
+        continue
+      fi
+      if phase_audit_ok "$AUDIT_CODEX" "$TOKEN"; then
+        # Verdict PASS syntaxiquement exploitable : la sequence d'echecs infra
+        # est bien interrompue.
+        infra_fails=0
         if [ "$PHASE" = "P0" ]; then
           mkdir -p "$RECEIPTS_DIR/checkpoint_p0"
-          cp "$AUDIT_CLAUDE" "$AUDIT_CODEX" "$RECEIPTS_DIR/checkpoint_p0/" 2>>"$LOG"
+          cp "$AUDIT_CODEX" "$RECEIPTS_DIR/checkpoint_p0/" 2>>"$LOG"
           WT_DIRTY=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
           if [ "${WT_DIRTY:-0}" -eq 0 ]; then WT_STATE="clean"; WT_DIFF_SHA=""; else
             WT_STATE="dirty"
             WT_DIFF_SHA=$(git diff 2>/dev/null | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')
             echo "[$(date -u +%FT%TZ)] AVERTISSEMENT checkpoint P0: worktree non propre (diff sha256=$WT_DIFF_SHA consigne)" >> "$LOG"
           fi
-          printf '{"phase":"P0","commit":"%s","timestamp":"%s","worktree":"%s","diff_sha256":"%s","audit_sha256":{"%s":"%s","%s":"%s"}}\n' \
+          printf '{"phase":"P0","commit":"%s","timestamp":"%s","worktree":"%s","diff_sha256":"%s","audit_sha256":{"%s":"%s"}}\n' \
             "$(git rev-parse HEAD)" "$(date -u +%FT%TZ)" "$WT_STATE" "$WT_DIFF_SHA" \
-            "$(basename "$AUDIT_CLAUDE")" "$(sha256_file "$RECEIPTS_DIR/checkpoint_p0/$(basename "$AUDIT_CLAUDE")")" \
             "$(basename "$AUDIT_CODEX")" "$(sha256_file "$RECEIPTS_DIR/checkpoint_p0/$(basename "$AUDIT_CODEX")")" \
             > "$RECEIPTS_DIR/checkpoint_p0/checkpoint.json"
           echo "P1" > "$PHASE_FILE"
+          # D-013-ter : purge explicite + loggee des stall files (plus de
+          # 'rm -f ... 2>/dev/null' muet) a la transition P0 -> P1.
+          purge_file_logged "$RECEIPTS_DIR/last_audit_P0.sha256" "last_audit_P0 (transition P0->P1)"
+          purge_file_logged "$RECEIPTS_DIR/last_audit_P1.sha256" "last_audit_P1 (transition P0->P1)"
           audit_repairs=0
           echo "RUNNING" > "$STATE_FILE"
-          echo "[$(date -u +%FT%TZ)] audits P0 OK x2 -> checkpoint P0 fige dans $RECEIPTS_DIR/checkpoint_p0 -> PHASE=P1, STATE=RUNNING" >> "$LOG"
+          echo "[$(date -u +%FT%TZ)] audit P0 OK (Codex seul) -> checkpoint P0 fige dans $RECEIPTS_DIR/checkpoint_p0 -> PHASE=P1, STATE=RUNNING" >> "$LOG"
           continue
         fi
         echo "WAITING_HUMAN_BOSS_GO" > "$STATE_FILE"
-        echo "[$(date -u +%FT%TZ)] audits P1 OK (PRET A MERGER x2) -> STATE=WAITING_HUMAN_BOSS_GO -> arret pilote" >> "$LOG"
+        echo "[$(date -u +%FT%TZ)] audit P1 OK (Codex seul, PRET A MERGER) -> STATE=WAITING_HUMAN_BOSS_GO -> arret pilote" >> "$LOG"
         exit 0
+      fi
+      # Un audit non-PASS doit tout de meme respecter le contrat FAIL exact.
+      # Une sortie non vide mais sans PHASE_P*_FAIL est inexploitable : la
+      # router comme infra evite de faire reparer a GLM du bruit ou une erreur
+      # de protocole, et preserve le budget de repair.
+      if ! phase_audit_has_token "$AUDIT_CODEX" "$FAIL_TOKEN"; then
+        infra_fails=$((infra_fails+1))
+        echo "[$(date -u +%FT%TZ)] iter $i: verdict audit Codex invalide (attendu $TOKEN ou $FAIL_TOKEN en premiere ligne) -> infra_fail, aucun round de repair consomme (infra_fails=$infra_fails/$MAX_INFRA_FAILS)" >> "$LOG"
+        if [ "$infra_fails" -gt "$MAX_INFRA_FAILS" ]; then
+          echo "WAITING_INFRA" > "$STATE_FILE"
+          echo "[$(date -u +%FT%TZ)] $MAX_INFRA_FAILS verdicts audit invalides consecutifs -> STATE=WAITING_INFRA -> arret" >> "$LOG"
+          exit 0
+        fi
+        apply_backoff "$infra_fails"
+        continue
+      fi
+      # --- D-013 (post-post-mortem 30/07 : FIX 3 trop brutal) : detection de
+      # stall en 2 TEMPS, bornee a MAXIMUM 1 redirection chirurgicale vers GLM.
+      # FIX 3 faisait FAIL IMMEDIAT des le 1er stall (2 audits identiques) -- un
+      # point qui aurait pu etre fixe en une derniere tentative ciblee etait
+      # abandonne trop tot. Desormais :
+      #   Round N (audit identique au round N-1, detecte par audit_same_as_previous) :
+      #     - flag redirect_attempt_PHASE.used ABSENT -> extraire les findings du
+      #       rapport Codex, construire un REDIRECT_PROMPT chirurgical, le router
+      #       vers GLM via REVIEW_CLAUDE/REVIEW_CODEX (comme la review de tranche),
+      #       STATE=RUNNING, poser le flag, UNE SEULE fois. Pas de FAIL immediat.
+      #     - flag PRESENT (redirection deja tentee) -> FAIL IMMEDIAT.
+      #   Round N+1 :
+      #     - audit ENCORE identique (sha256 strict via audit_same_as_previous) ->
+      #       stall + flag present -> FAIL IMMEDIAT fail-closed, message exact.
+      #     - audit DIFFERENT (progres reel, meme partiel) -> branche normale,
+      #       reset du flag + nouveau sha consigne, budget audit_repairs standard.
+      # Objectif mesurable : un blocage reel sur un finding non resolu ne JAMAIS
+      # depasser 3 rounds Codex avant FAIL (1 normal + 1 stall + 1 redirection),
+      # au lieu de boucler jusqu au plafond MAX_*_REPAIR (29 rounds observes).
+      # Jamais de boucle, meme deguisee : la redirection est strictement bornee a
+      # 1 tentative par sequence de stall (le flag l interdit physiquement). ---
+      STALL_FILE="$RECEIPTS_DIR/last_audit_${PHASE}.sha256"
+      REDIRECT_FLAG="$RECEIPTS_DIR/redirect_attempt_${PHASE}.used"
+      # Round 3 : calcule la signature UNE SEULE fois. La meme valeur est
+      # comparee ci-dessous puis stockee atomiquement plus bas. Un echec du
+      # parser est une panne infra distincte : il ne passe jamais par
+      # stall_action("normal"), ne purge donc jamais redirect_attempt comme un
+      # faux "progres reel", et ne consomme aucun round de repair.
+      if STALL_SIG="$(stall_signature "$AUDIT_CODEX")"; then
+        infra_fails=0
+      else
+        infra_fails=$((infra_fails+1))
+        echo "[$(date -u +%FT%TZ)] iter $i: audit Codex illisible (parser stall rc!=0) -> infra_fail, etat stall/redirect preserve (infra_fails=$infra_fails/$MAX_INFRA_FAILS)" >> "$LOG"
+        if [ "$infra_fails" -gt "$MAX_INFRA_FAILS" ]; then
+          echo "WAITING_INFRA" > "$STATE_FILE"
+          echo "[$(date -u +%FT%TZ)] $MAX_INFRA_FAILS audits illisibles consecutifs -> STATE=WAITING_INFRA -> arret" >> "$LOG"
+          exit 0
+        fi
+        apply_backoff "$infra_fails"
+        continue
+      fi
+      if audit_signature_same_as_previous "$STALL_FILE" "$STALL_SIG"; then
+        STALL_RC=0
+      else
+        STALL_RC=$?
+      fi
+      # Une absence de fichier au premier round est un non-stall normal (rc=1).
+      # En revanche, un fichier present mais vide/illisible/malforme est un etat
+      # persiste corrompu (rc=2), jamais un progres : conserver le flag de
+      # redirection et le SHA, puis retenter sous le budget infra.
+      if [ "$STALL_RC" -eq 2 ]; then
+        infra_fails=$((infra_fails+1))
+        echo "[$(date -u +%FT%TZ)] iter $i: signature stall precedente invalide -> infra_fail, etat stall/redirect preserve (infra_fails=$infra_fails/$MAX_INFRA_FAILS)" >> "$LOG"
+        if [ "$infra_fails" -gt "$MAX_INFRA_FAILS" ]; then
+          echo "WAITING_INFRA" > "$STATE_FILE"
+          echo "[$(date -u +%FT%TZ)] $MAX_INFRA_FAILS signatures stall invalides consecutives -> STATE=WAITING_INFRA -> arret" >> "$LOG"
+          exit 0
+        fi
+        apply_backoff "$infra_fails"
+        continue
+      fi
+      case "$(stall_action "$STALL_RC" "$REDIRECT_FLAG")" in
+        redirect)
+          # 1er stall de la sequence : redirection chirurgicale UNE fois vers GLM.
+          EXTRACTED="$(extract_findings "$AUDIT_CODEX")"
+          REDIRECT_PROMPT="$(build_redirect_prompt "$EXTRACTED")"
+          { echo "REDIRECT_CHIRURGICAL (phase $PHASE, stall : verdict Codex identique au round precedent -- D-013 DERNIERE tentative avant FAIL)";
+            echo "--- REDIRECT_PROMPT ---"; printf '%s\n' "$REDIRECT_PROMPT"; } > "$REVIEW_CLAUDE"
+          cp "$REVIEW_CLAUDE" "$REVIEW_CODEX"
+          mkdir -p "$RECEIPTS_DIR"
+          # D-013-bis : persiste le REDIRECT_PROMPT pour que build_cur_prompt le
+          # lise au prochain tour de build. Sans cette persistance, CUR_PROMPT
+          # resterait le BUILD_PROMPT statique et la redirection serait inerte
+          # (GLM ne la verrait jamais). Le fichier est purge APRES l'appel
+          # opencode run (usage unique).
+          # D-013-ter : l'engagement (pending_redirect + flag redirect_attempt)
+          # est desormais TRANSACTIONNEL et atomique (commit_redirect) : aucune
+          # interruption (SIGTERM/SIGINT/crash) entre les deux écritures ne peut
+          # laisser un état inconsistent (rollback sous scoped trap). Échec
+          # d'écriture -> FAIL fail-closed (on ne peut pas engager la redirection
+          # sans risquer une boucle ou une perte silencieuse).
+          if commit_redirect "$RECEIPTS_DIR/pending_redirect_${PHASE}.txt" "$REDIRECT_FLAG" "$REDIRECT_PROMPT"; then
+            :
+          else
+            echo "FAIL" > "$STATE_FILE"
+            echo "[$(date -u +%FT%TZ)] STALL phase $PHASE : echec ecriture atomique (pending_redirect/redirect_attempt) -> STATE=FAIL fail-closed (redirection non engageable)" >> "$LOG"
+            exit 0
+          fi
+          # NB : on NE consigne PAS le sha courant dans STALL_FILE et on N
+          # incremente PAS audit_repairs. Le round de redirection doit etre
+          # compare au MEME sha precedent (sinon un audit identique apres
+          # redirection ne serait plus detecte comme stalled). Le sha precedent
+          # reste donc valide pour le round N+1, et la presence du flag force le
+          # FAIL si l audit est encore identique.
+          echo "RUNNING" > "$STATE_FILE"
+          echo "[$(date -u +%FT%TZ)] STALL_DETECTED phase $PHASE : verdict Codex identique au round precedent -> redirection chirurgicale vers GLM (1 seule tentative, flag redirect_attempt_${PHASE}.used pose), STATE=RUNNING, pas de FAIL immediat" >> "$LOG"
+          continue ;;
+        fail)
+          # 2e stall APRES redirection deja tentee : FAIL immediat fail-closed,
+          # message exact exige par D-013. Pas de 3e tentative, pas d attente du
+          # plafond MAX_*_REPAIR.
+          echo "FAIL" > "$STATE_FILE"
+          echo "[$(date -u +%FT%TZ)] STALL_DETECTED phase $PHASE : meme finding non resolu APRES tentative de redirection chirurgicale -> arret fail-closed, intervention humaine necessaire (pas d attente du budget $MAX_REPAIR)" >> "$LOG"
+          exit 0 ;;
+        normal)
+          # Pas stalled : progres reel (audit different). Reset du flag de
+          # redirection pour cette phase -- une NOUVELLE sequence de stall aura
+          # droit a sa propre redirection (bornage par sequence, pas global).
+          if [ -f "$REDIRECT_FLAG" ]; then
+            # D-013-ter : purge explicite + loggee du flag (plus de rm muet).
+            purge_file_logged "$REDIRECT_FLAG" "redirect_attempt_${PHASE}.used (reset progres reel)"
+            echo "[$(date -u +%FT%TZ)] phase $PHASE : audit different du precedent apres redirection -> progres reel, reset du flag redirect_attempt, boucle normale (budget audit_repairs standard)" >> "$LOG"
+          fi ;;
+      esac
+      mkdir -p "$RECEIPTS_DIR"
+      # D-013-ter : écriture atomique (tmp-puis-mv) du sha : une écriture
+      # interrompue laisserait un sha partiel/vide -> audit_same_as_previous
+      # faussé (faux négatif de stall). Échec -> on purge le stall file (prochain
+      # round repart propre, pas de sha corrompu) + log explicite.
+      # Round 3 : STALL_SIG a deja ete calculee et validee AVANT stall_action.
+      # On stocke exactement la valeur comparee (aucun second parsing divergent).
+      if atomic_write_exact "$STALL_FILE" "$STALL_SIG"; then
+        :
+      else
+        purge_file_logged "$STALL_FILE" "last_audit_${PHASE}.sha256"
+        echo "[$(date -u +%FT%TZ)] phase $PHASE : echec ecriture last_audit sha -> stall file purge" >> "$LOG"
       fi
       audit_repairs=$((audit_repairs+1))
       if [ "$audit_repairs" -gt "$MAX_REPAIR" ]; then
@@ -316,42 +1129,61 @@ $FINAL_AUDIT_PROMPT" > "$AUDIT_CODEX" 2>>"$LOG" \
         echo "[$(date -u +%FT%TZ)] audits phase $PHASE non-OK apres $MAX_REPAIR rounds de repair -> STATE=FAIL -> arret" >> "$LOG"
         exit 0
       fi
-      { echo "AUDIT_REPAIR_NEEDED (phase $PHASE, round $audit_repairs)"; echo "--- Claude audit ---"; cat "$AUDIT_CLAUDE" 2>/dev/null; echo; echo "--- Codex audit ---"; cat "$AUDIT_CODEX" 2>/dev/null; } > "$REVIEW_CLAUDE"
+      { echo "AUDIT_REPAIR_NEEDED (phase $PHASE, round $audit_repairs)"; echo "--- Codex audit ---"; cat "$AUDIT_CODEX" 2>/dev/null; } > "$REVIEW_CLAUDE"
       cp "$REVIEW_CLAUDE" "$REVIEW_CODEX"
       echo "RUNNING" > "$STATE_FILE"
-      echo "[$(date -u +%FT%TZ)] audits phase $PHASE non-OK (round $audit_repairs) -> findings routes vers review, STATE=RUNNING, boucle" >> "$LOG"
+      echo "[$(date -u +%FT%TZ)] audit phase $PHASE non-OK (round $audit_repairs) -> findings Codex routees vers review, STATE=RUNNING, boucle" >> "$LOG"
       continue ;;
+    build)
+      : ;;   # RUNNING (etat nominal) -> on continue vers la boucle de build
+    illegal)
+      # P0 finding 6 : etat INCONNU/illegal dans CAMPAIGN_STATE. Le pilote ne le
+      # repare JAMAIS silencieusement (l'ancien code le laissait tomber a la
+      # boucle de build = traite comme RUNNING). Fail-closed + message clair.
+      echo "[$(date -u +%FT%TZ)] STATE='$ST' INCONNU/illegal dans $STATE_FILE -> arret fail-closed (aucune reparation silencieuse). Etats legaux : RUNNING, READY_FOR_FINAL_AUDIT, WAITING_INFRA, WAITING_HUMAN_BOSS_GO, WAITING_HUMAN, FAIL, DONE, MEMORY_SYSTEM_FAIL (cf. MASTER_ORDER MACHINE A ETATS)." >> "$LOG"
+      echo "Etat illegal '$ST' dans $STATE_FILE -> arret fail-closed (voir MASTER_ORDER § MACHINE A ETATS). Aucune reinitialisation silencieuse ; corriges l'etat a la main si voulu." >&2
+      exit 1 ;;
   esac
 
-  # --- Ordre fusionne 29/07 (P1.4 cote driver) : memoire fail-closed AVANT tout appel agent. ---
-  # rc=0 (leçons trouvees) et rc=2 (memoire valide, aucune leçon pertinente) sont sains ;
-  # rc=1 (store corrompu/schema invalide) ou injecteur manquant = MEMORY_SYSTEM_FAIL.
-  if [ ! -f "factory/bin/lesson_injector.py" ]; then
-    echo "MEMORY_SYSTEM_FAIL" > "$STATE_FILE"
-    echo "[$(date -u +%FT%TZ)] iter $i: lesson_injector.py INTROUVABLE -> STATE=MEMORY_SYSTEM_FAIL -> arret" >> "$LOG"
-    exit 1
-  fi
-  INJ_ERR="$RECEIPTS_DIR/injector_stderr.$$"
-  python3 factory/bin/lesson_injector.py "healthcheck driver preflight" --format quiet >/dev/null 2>"$INJ_ERR"
-  INJ_RC=$?
-  # Contrat strict (contre-relecture GPT) : rc=0, OU rc=2 AVEC stderr vide (= MEMORY_VALID_NO_MATCH,
-  # seul cas rc=2 legitime de l injecteur). Un rc=2 avec stderr (erreur argparse/CLI) = panne.
-  if [ "$INJ_RC" -eq 0 ] || { [ "$INJ_RC" -eq 2 ] && [ ! -s "$INJ_ERR" ]; }; then
-    rm -f "$INJ_ERR" 2>/dev/null
-  else
-    cat "$INJ_ERR" >> "$LOG" 2>/dev/null
-    echo "MEMORY_SYSTEM_FAIL" > "$STATE_FILE"
-    echo "[$(date -u +%FT%TZ)] iter $i: lesson_injector rc=$INJ_RC avec stderr non vide ou rc inattendu -> STATE=MEMORY_SYSTEM_FAIL -> arret" >> "$LOG"
-    exit 1
-  fi
+  # --- Garde mémoire fail-closed AVANT tout appel agent (AUTORITÉ UNIQUE :
+  # MASTER_ORDER § MACHINE À ÉTATS, point « Mémoire de leçons »). C'est une
+  # garde P0 de la machine à états, applicable à CHAQUE itération builder
+  # toutes phases confondues — PAS une fonction P1. Le brief P1 point 4 ne fait
+  # qu'AJOUTER le test formel de ce hook (« le hook driver existe deja »).
+  # Implémentation extraite dans memory_preflight_or_die (cf. doc de cette
+  # fonction) : le test formalise le hook en APPELANT la fonction réelle du
+  # pilote, pas en grep+réplique locale.
+  memory_preflight_or_die "$i"
   PHASE=$(read_phase) || { echo "[$(date -u +%FT%TZ)] phase invalide dans $PHASE_FILE -> arret fail-closed (aucune reinit silencieuse)" >> "$LOG"; exit 1; }
-  if [ "$PHASE" = "P1" ]; then CUR_PROMPT="$BUILD_PROMPT_P1"; else CUR_PROMPT="$BUILD_PROMPT_P0"; fi
+  # D-013-bis : CUR_PROMPT est construit par build_cur_prompt, qui PREPEND le
+  # contenu d une eventuelle redirection chirurgicale D-013 (fichier
+  # pending_redirect_PHASE.txt) au BUILD_PROMPT standard. Avant ce branchement,
+  # CUR_PROMPT etait TOUJOURS assigne statiquement depuis BUILD_PROMPT_P0/P1 et
+  # ne lisait JAMAIS REVIEW_CLAUDE/REVIEW_CODEX/REDIRECT_PROMPT -> la redirection
+  # D-013 etait structurellement presente mais fonctionnellement inerte.
+  CUR_PROMPT="$(build_cur_prompt "$PHASE")"
   echo "[$(date -u +%FT%TZ)] iter $i (state=$ST, phase=$PHASE) -> GLM build (opencode, zai-coding-plan/glm-5.2 force)" >> "$LOG"
+  # D-013-ter : section critique. pending_redirect_PHASE.txt (s'il existe, ie
+  # juste apres une redirection D-013) doit etre purge meme si le pilote est tue
+  # (SIGTERM/SIGINT/SIGHUP) ou crashe pendant l'appel opencode run -- sinon la
+  # redirection fuierait vers un 2e tour (violation de l usage unique). On etend
+  # TEMPORAIREMENT le trap EXIT global (sauvegarde -> restauration exacte apres
+  # la section ; INT/TERM/HUP laisses intacts, ils funnel vers EXIT via 'exit
+  # 143'). Sans cette scoped trap, un kill pendant opencode laissait le fichier.
+  _prf="$RECEIPTS_DIR/pending_redirect_${PHASE}.txt"
+  enter_scoped_purge "$_prf"
   # ADAPTE CETTE LIGNE si le smoke-test opencode montre une autre syntaxe (mais garde TOUJOURS --model zai-coding-plan/*) :
-  if opencode run --model zai-coding-plan/glm-5.2 "$CUR_PROMPT" >> "$LOG" 2>&1; then
+  opencode run --model zai-coding-plan/glm-5.2 "$CUR_PROMPT" >> "$LOG" 2>&1
+  rc=$?
+  # D-013-bis / D-013-ter : purge du fichier pending_redirect APRES l'appel
+  # opencode run -> la redirection chirurgicale est consommee (GLM l a recue),
+  # usage UNIQUE, jamais de re-injection. purge_file_logged : explicite + loggee
+  # (plus de 'rm -f ... 2>/dev/null' muet ; n avale pas l echec).
+  purge_file_logged "$_prf" "pending_redirect_${PHASE}"
+  exit_scoped_purge
+  if [ "$rc" -eq 0 ]; then
     infra_fails=0
   else
-    rc=$?
     infra_fails=$((infra_fails+1))
     echo "[$(date -u +%FT%TZ)] iter $i: opencode rc=$rc, infra_fails=$infra_fails/$MAX_INFRA_FAILS" >> "$LOG"
     if [ "$infra_fails" -gt "$MAX_INFRA_FAILS" ]; then
@@ -364,7 +1196,7 @@ $FINAL_AUDIT_PROMPT" > "$AUDIT_CODEX" 2>>"$LOG" \
   fi
   ensure_build_branch   # D-001 : GLM doit rester hors de main
 
-  echo "[$(date -u +%FT%TZ)] iter $i -> review de tranche Claude + Codex (independants, en parallele, lecture seule)" >> "$LOG"
+  echo "[$(date -u +%FT%TZ)] iter $i -> review de tranche Codex seul (independant, lecture seule -- Claude retire de la boucle de review)" >> "$LOG"
 
   # D-002 : diff du dernier commit embarqué dans le prompt (les reviewers n'ont que Read/Grep/Glob).
   if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
@@ -383,17 +1215,33 @@ $DIFF
 ------------------8<------------------
 $([ "$DIFF_TRUNC" = 1 ] && echo "(DIFF TRONQUE - ouvre les fichiers pertinents via Read pour le detail.)")"
 
-  claude -p "$REVIEW_PROMPT" --dangerously-skip-permissions --allowedTools "Read Grep Glob" > "$REVIEW_CLAUDE" 2>>"$LOG" &
-  PID_CLAUDE=$!
-  codex exec -s read-only --skip-git-repo-check "$REVIEW_PROMPT" > "$REVIEW_CODEX" 2>>"$LOG" &
-  PID_CODEX=$!
-  wait "$PID_CLAUDE" 2>/dev/null || echo "[$(date -u +%FT%TZ)] iter $i: review claude rc non-zero" >> "$LOG"
-  wait "$PID_CODEX" 2>/dev/null || echo "[$(date -u +%FT%TZ)] iter $i: review codex rc non-zero" >> "$LOG"
+  # FIX 1 : purge du cache modeles Codex AVANT chaque appel 'codex exec' (meme
+  # garde que le bloc audit -- evite le bug CLI "supports_reasoning_summaries").
+  rm -f "$HOME/.codex/models_cache.json" 2>/dev/null || true
+  if ! codex exec -s read-only --skip-git-repo-check "$REVIEW_PROMPT" > "$REVIEW_CODEX" 2>>"$LOG"; then
+    echo "[$(date -u +%FT%TZ)] iter $i: review codex rc non-zero" >> "$LOG"
+  fi
+
+  # FIX 2 : bruit CLI du cache fuite dans REVIEW_CODEX -> infra_fail, PAS une
+  # review valide (sinon le bruit etait traite comme finding/round consomme
+  # pour du simple bruit infra). Meme logique backoff/infra_fails que le bloc
+  # audit et que la garde vide ci-dessous.
+  if codex_cache_bug_in_file "$REVIEW_CODEX"; then
+    infra_fails=$((infra_fails+1))
+    echo "[$(date -u +%FT%TZ)] iter $i: codex cache bug detecte -> traite comme infra_fail, pas comme review (infra_fails=$infra_fails/$MAX_INFRA_FAILS)" >> "$LOG"
+    if [ "$infra_fails" -gt "$MAX_INFRA_FAILS" ]; then
+      echo "WAITING_INFRA" > "$STATE_FILE"
+      echo "[$(date -u +%FT%TZ)] $MAX_INFRA_FAILS echecs infra consecutifs -> STATE=WAITING_INFRA -> arret" >> "$LOG"
+      exit 0
+    fi
+    apply_backoff "$infra_fails"
+    continue
+  fi
 
   # D-005 : un reviewer muet = echec infra (pas de relance immédiate admise).
-  if [ ! -s "$REVIEW_CLAUDE" ] || [ ! -s "$REVIEW_CODEX" ]; then
+  if [ ! -s "$REVIEW_CODEX" ]; then
     infra_fails=$((infra_fails+1))
-    echo "[$(date -u +%FT%TZ)] iter $i: review vide (claude=$( [ -s "$REVIEW_CLAUDE" ] && echo ok || echo vide ), codex=$( [ -s "$REVIEW_CODEX" ] && echo ok || echo vide )), infra_fails=$infra_fails/$MAX_INFRA_FAILS" >> "$LOG"
+    echo "[$(date -u +%FT%TZ)] iter $i: review codex vide, infra_fails=$infra_fails/$MAX_INFRA_FAILS" >> "$LOG"
     if [ "$infra_fails" -gt "$MAX_INFRA_FAILS" ]; then
       echo "WAITING_INFRA" > "$STATE_FILE"
       echo "[$(date -u +%FT%TZ)] $MAX_INFRA_FAILS echecs infra consecutifs -> STATE=WAITING_INFRA -> arret" >> "$LOG"

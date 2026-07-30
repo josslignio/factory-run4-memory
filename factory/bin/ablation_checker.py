@@ -2,9 +2,12 @@
 """
 Bug detector déterministe pour l'ablation A/B — master order Run 4 §4.
 
-Scan STATIQUE de source Python (aucune exécution du code testé) à la
-recherche des anti-patterns CONCRETS couverts par les leçons du bootstrap
-qui s'appliquent à la tâche lock_manager + fork-safety :
+Mix STATIQUE + COMPORTEMENTAL de source Python à la recherche des
+anti-patterns CONCRETS couverts par les leçons du bootstrap qui s'appliquent à
+la tâche lock_manager + fork-safety. La plupart des règles sont statiques
+(regex / présence-absence de tokens). L-16 est vérifiée COMPORTEMENTALEMENT
+(exécution de acquire_lock sous faux os/fcntl, comptage réel des fd — cf.
+rule_L16) : c'est le comportement réel, pas le texte, qui décide.
 
   L-01 (P1, concurrency) : lockfile TOCTOU — absent fcntl.flock
   L-05 (P2, resource-leak): release_lock unlink le lockfile
@@ -13,7 +16,8 @@ qui s'appliquent à la tâche lock_manager + fork-safety :
   L-10 (P2, concurrency) : clé dict non canonicalisée (pas de .resolve())
   L-12 (P1, concurrency) : os.fork sans os.register_at_fork
   L-13 (P1, concurrency) : flock(LOCK_UN) dans enfant au lieu de os.close
-  L-16 (P2, resource-leak): except BlockingIOError seul (fuite fd)
+  L-16 (P2, resource-leak): except BlockingIOError seul (fuite fd) —
+        vérifié COMPORTEMENTALEMENT (fermeture réelle du fd, pas le texte)
 
 Les leçons data-validation (L-02/04/06/08/11/14/15/17) concernent les
 checkpoints ; la tâche d'ablation est lock_manager seul → non applicables.
@@ -24,8 +28,10 @@ produit (status present|absent, evidence fichier:ligne + extrait).
 USAGE :
     python3 factory/bin/ablation_checker.py <source.py> [--json] [--md]
 
-Sortie par défaut : Markdown humain. --json : machine. rc=0 toujours
-(le checker ne « fail » pas ; il mesure).
+Sortie par défaut : Markdown humain. --json : machine. rc=0 quand la mesure
+s'exécute ; rc=1 si la source est illisible/introuvable/non-UTF8 (échec
+contrôlé, JAMAIS de traceback — la mesure ne peut pas être produite, on ne
+l'invente pas). Le checker ne mesure que du code qu'il arrive à lire.
 """
 import argparse
 import io
@@ -419,12 +425,209 @@ def rule_L13(code: str, orig: str, path: str) -> Finding:
                    f"hook enfant {hook_name} propre (pas de LOCK_UN)")
 
 
+def _measure_acquire_lock_fd_closure(src: str):
+    """Mesure COMPORTEMENTALE (P0 finding 4) : exécute la fonction
+    `acquire_lock` extraite du source sous des faux modules `os`/`fcntl` où
+    `fcntl.flock` lève une OSError NON-BlockingIOError (= le chemin de fuite
+    que L-16 doit détecter), et compte les fd ouverts/fermés.
+
+    Renvoie :
+      - True  si le fd issu de `os.open` est RÉELLEMENT fermé (filet sûr) ;
+      - False si le fd fuit (filet large sans fermeture réelle, fermeture
+        mortelle `if False: os.close(fd)`, fermeture d'une ressource sans
+        rapport avec le fd, OU fermeture d'un MAUVAIS fd comme `os.close(0)`
+        qui ne ferme pas le fd du verrou) ;
+      - None  si la mesure comportementale est impossible (source non
+        exécutable sous les fakes, os.open non atteint...).
+
+    Pourquoi l'exécution plutôt que le texte : un mutant `except OSError:
+    if False: os.close(fd); return False` contient l'occurrence textuelle
+    `os.close(fd)` mais ne ferme JAMAIS le fd en réalité (contre-audit Codex).
+    Seul le COMPORTEMENT RÉEL compte — exigence explicite du finding 4.
+
+    Contre-audit round 5 (Claude) : un mutant `except OSError: os.close(0)`
+    ferme le MAUVAIS fd (stdin) — le fd réel du verrou (issu de `os.open`)
+    fuit. Le tracker ne doit créditer une fermeture QUE si elle cible un fd
+    RÉELLEMENT ouvert (identité du fd), pas n'importe quel appel `os.close`.
+
+    Sandbox : exec dans un espace de noms frais. `__import__` est intercepté en
+    LISTE BLANCHE : os/fcntl = fakes (aucun effet de bord OS réel, aucune
+    ressource OS touchée, aucun register_at_fork réel) ; pathlib autorisé (pur
+    calcul de chemins, requis par le bras GOOD_LOCK mesuré) ; tout autre module
+    REFUSÉ via ImportError. Les builtins dangereux (open/exec/eval/compile/input)
+    sont retirés -> pas d'I/O fichier ni d'exec de code arbitraire depuis le
+    source analysé (P1 audit Codex #2, reprise FAIL 27/07). Défense en profondeur,
+    pas une frontière de sécurité dure : pour du code adversarial, isoler par
+    subprocess/timeout. Le source exécuté est celui du fichier analysé : PAS une
+    réimplémentation recopiée."""
+    import builtins
+    from collections import Counter
+
+    class _Tracker:
+        # Compteur comportemental (finding 4 + contre-audit round 5 Claude) :
+        # on ne crédite une fermeture QUE si elle cible un fd RÉELLEMENT ouvert
+        # par os.open (identité du fd). Un mutant `os.close(0)` (fermant stdin)
+        # ne ferme PAS le fd du verrou -> doit rester DEFECT (faux négatif
+        # sinon). `_open` est un multi-ensemble des fds encore vivants.
+        def __init__(self):
+            self._next = 100
+            self._open = Counter()   # fd -> nb d'ouvertures encore vivantes
+            self.opens = 0
+            self.closes = 0          # fermetures CORRECTES (ciblant un fd ouvert)
+
+        def opened(self):
+            self._next += 1
+            fd = self._next
+            self._open[fd] += 1
+            self.opens += 1
+            return fd
+
+        def closed(self, fd):
+            # Seule une fermeture ciblant un fd RÉELLEMENT ouvert compte : fermer
+            # un mauvais fd (ex: os.close(0)) ne résout PAS la fuite du verrou.
+            if self._open.get(fd, 0) > 0:
+                self._open[fd] -= 1
+                if self._open[fd] <= 0:
+                    del self._open[fd]
+                self.closes += 1
+
+    tracker = _Tracker()
+
+    class _Wrap:
+        # Wrapper retourné par fake os.fdopen : .close()/contexte comptabilise
+        # la fermeture du fd sous-jacent (c'est le `with os.fdopen(fd)` crédité).
+        def __init__(self, fd):
+            self._fd = fd
+
+        def close(self):
+            tracker.closed(self._fd)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            tracker.closed(self._fd)
+
+    class _FakeOs:
+        O_CREAT = O_WRONLY = O_EXCL = O_RDWR = 0
+
+        def open(self, path, flags):
+            return tracker.opened()
+
+        def close(self, fd):
+            return tracker.closed(fd)
+
+        def fdopen(self, fd, *a, **k):
+            return _Wrap(fd)
+
+        def register_at_fork(self, **kw):
+            return None
+
+        def unlink(self, path):
+            return None
+
+    class _FakeFcntl:
+        LOCK_EX = LOCK_NB = LOCK_UN = 0
+
+        @staticmethod
+        def flock(fd, flags):
+            # OSError NON-BlockingIOError : c'est précisément le chemin de
+            # fuite (BlockingIOError est une sous-classe ; OSError elle-même
+            # ne l'est pas -> remonte jusqu'au filet large, s'il existe).
+            raise OSError("simulated non-blocking oserror (leak path)")
+
+    fake_os = _FakeOs()
+    real_import = builtins.__import__
+
+    # Reprise FAIL 27/07 (P1 audit Codex #2) : l'exécution du source analysé ne
+    # doit PAS permettre l'exécution de code arbitraire local. On restreint
+    # DEUX vecteurs d'effets de bord :
+    #   (a) __import__ en mode LISTE BLANCHE : os/fcntl = fakes ; pathlib = réel
+    #       et sûr (pur calcul de chemins, nécessaire au bras GOOD_LOCK mesuré,
+    #       qui fait `from pathlib import Path` + Path.resolve()). TOUT autre
+    #       module (subprocess, socket, shutil, ctypes,…) est REFUSÉ via
+    #       ImportError -> un source hostile ne peut pas obtenir de handle vers
+    #       ces modules. L'ancien code laissait passer `real_import` pour tout
+    #       module non-os/fcntl -> import subprocess exécuté pour réel.
+    #   (b) builtins dangereux retirés (open/exec/eval/compile/input/…) -> un
+    #       source hostile ne peut ni lire/écrire de fichiers ni exécuter du
+    #       code via ces primitives. compile/exec sont ceux du CHEF de mesure
+    #       (portée réelle), pas du source exécuté (portée `bi`).
+    # Les bras réels d'ablation n'ont qu'un `except BlockingIOError` isolé (pas
+    # de filet large) -> cette mesure n'est JAMAIS appelée sur eux : les chiffres
+    # A/B n'en dépendent pas (cf. §7 RUN4_ABLATION_AB.md). Défense en profondeur,
+    # pas une frontière de sécurité dure : pour du code adversarial, isoler par
+    # subprocess/timeout (limite V1 assumée et documentée).
+    _ALLOWED_REAL_MODULES = {"pathlib"}
+
+    def _import(name, *a, **k):
+        if name == "os":
+            return fake_os
+        if name == "fcntl":
+            return _FakeFcntl
+        if name in _ALLOWED_REAL_MODULES:
+            return real_import(name, *a, **k)
+        raise ImportError(
+            f"import du module '{name}' interdit dans le bac à sable de la "
+            f"mesure comportementale L-16 (liste blanche : os, fcntl, pathlib)")
+
+    bi = dict(vars(builtins))
+    for _dangerous in ("open", "exec", "eval", "compile", "input",
+                       "breakpoint", "exit", "quit"):
+        bi.pop(_dangerous, None)
+    bi["__import__"] = _import
+    g = {"__builtins__": bi, "__name__": "uut"}
+    try:
+        exec(compile(src, "<acquire_lock_uut>", "exec"), g)
+    except BaseException:
+        return None
+    acq = g.get("acquire_lock")
+    if not callable(acq):
+        return None
+    try:
+        acq("x.lock")
+    except OSError:
+        pass  # version sûre : relance l'OSError APRÈS os.close(fd)
+    except BaseException:
+        return None
+    if tracker.opens == 0:
+        return None  # os.open non atteint -> non mesurable
+    # Le fd du verrou (issu de os.open) doit être RÉELLEMENT fermé : AUCUN fd
+    # ouvert ne doit rester vivant. Fermer un MAUVAIS fd (ex: os.close(0)) ne
+    # compte pas — seul un close() ciblant le fd ouvert résout la fuite.
+    return not tracker._open
+
+
 def rule_L16(code: str, orig: str, path: str) -> Finding:
-    """L-16 (P2, resource-leak) : except BlockingIOError seul.
-    Defect present si `except BlockingIOError` apparaît dans acquire_lock
-    SANS un filet large (finally ou except BaseException/Exception + close)
-    DANS LE MÊME acquire_lock. Scope-aware : un `except OSError` dans le
-    hook fork ne compte pas (sinon faux positif crédité à tort)."""
+    """L-16 (P2, resource-leak) : except BlockingIOError SANS fermeture réelle.
+
+    P0 finding 4 : un filet large (`except BaseException/Exception/OSError` ou
+    `finally`) n'est crédité sûr QUE s'il ferme RÉELLEMENT le fd dans
+    acquire_lock. C'est le COMPORTEMENT RÉEL qui compte — PAS le texte.
+
+    Trois mutants portant une fermeture « textuelle » mais fuyant en réalité,
+    que la règle DOIT marquer DEFECT (present) :
+      - `except OSError: return False` (aucun close) ;
+      - `except OSError: _unrelated.close()` (close sur une ressource sans
+        rapport avec le fd issu de os.open) ;
+      - `except OSError: if False: os.close(fd); return False` (fermeture
+        MORTELLE — contre-audit Codex : l'occurrence textuelle crédite à tort
+        une analyse purement lexicale) ;
+      - `except OSError: os.close(0); return False` (ferme un MAUVAIS fd —
+        contre-audit round 5 Claude : le fd réel du verrou fuit, seul un
+        close() ciblant le fd ouvert résout la fuite).
+
+    Décision :
+      1. pas d'acquire_lock / pas de `except BlockingIOError` isolé -> absent
+         (non applicable : L-16 cible spécifiquement ce pattern) ;
+      2. `except BlockingIOError` SANS filet large -> present (fuite
+         déterministe sur toute autre OSError — cas des bras A et B réels) ;
+      3. filet large présent -> mesure COMPORTEMENTALE
+         (_measure_acquire_lock_fd_closure) : absent SEULEMENT si le fd est
+         RÉELLEMENT fermé.
+
+    Scope-aware : on ne regarde QUE le corps de acquire_lock (un `except
+    OSError` dans le hook fork ne compte pas — sinon faux positif crédité)."""
     body = _func_body(code, "acquire_lock")
     if not body:
         return Finding("L-20260727T150500Z-16", "resource-leak", "P2",
@@ -433,20 +636,36 @@ def rule_L16(code: str, orig: str, path: str) -> Finding:
     ln_rel = _line_of(r"except\s+BlockingIOError", body)
     if not ln_rel:
         return Finding("L-20260727T150500Z-16", "resource-leak", "P2",
-                       "absent", f"{path}: (pas de except BlockingIOError dans acquire_lock)",
+                       "absent",
+                       f"{path}: (pas de except BlockingIOError dans acquire_lock)",
                        "aucun except BlockingIOError isolé dans acquire_lock")
-    has_wide = bool(re.search(r"except\s+(BaseException|Exception|OSError)", body) or
-                    re.search(r"finally\s*:\s*\n\s*os\.close", body))
     # offset absolu pour evidence (corps démarre APRÈS la ligne `def`)
     abs_ln = _body_abs_line(code, "acquire_lock", ln_rel)
-    if has_wide:
-        return Finding("L-20260727T150500Z-16", "resource-leak", "P2",
-                       "absent",
+    # Filet large = except BaseException/Exception/OSError OU finally.
+    has_wide = bool(re.search(r"except\s+(BaseException|Exception|OSError)", body)
+                    or re.search(r"\bfinally\s*:", body))
+    if not has_wide:
+        # Cas déterministe (bras A et B réels) : seul BlockingIOError est
+        # attrapé -> toute autre OSError après os.open fuit le fd.
+        return Finding("L-20260727T150500Z-16", "resource-leak", "P2", "present",
                        f"{path}:{abs_ln} {_line_content(orig, abs_ln)}",
-                       "filet large présent dans acquire_lock (finally/except large + close)")
+                       "acquire_lock : except BlockingIOError SANS filet large "
+                       "→ fuite fd sur toute autre OSError")
+    # Filet large présent : seule une mesure COMPORTEMENTALE prouve la fermeture
+    # RÉELLE. L'analyse textuelle créditerait à tort une fermeture mortelle
+    # (`if False: os.close(fd)`) ou un .close() sur une ressource sans rapport
+    # (contre-audit Codex, round 4).
+    closed = _measure_acquire_lock_fd_closure(orig)
+    if closed is True:
+        return Finding("L-20260727T150500Z-16", "resource-leak", "P2", "absent",
+                       f"{path}:{abs_ln} {_line_content(orig, abs_ln)}",
+                       "filet large ET fermeture RÉELLE du fd prouvée "
+                       "comportementalement (exécution sous faux os/fcntl)")
     return Finding("L-20260727T150500Z-16", "resource-leak", "P2", "present",
                    f"{path}:{abs_ln} {_line_content(orig, abs_ln)}",
-                   "acquire_lock : except BlockingIOError seul → fuite fd sur autre OSError")
+                   "acquire_lock : filet large SANS fermeture RÉELLE du fd "
+                   "(mesure comportementale : le fd fuit sur une OSError non "
+                   "bloquante) → fuite fd")
 
 
 RULES = (rule_L01, rule_L05, rule_L07, rule_L09, rule_L10,
@@ -511,7 +730,16 @@ def main(argv=None) -> int:
         print(f"ablation_checker: {path} n'est pas un fichier", file=sys.stderr)
         return 1
 
-    findings = check_file(path)
+    # Lecture protégée (contre-audit : la source peut être illisible ou non
+    # UTF-8 — read_text lèverait alors UnicodeDecodeError/OSError et ferait
+    # planter le checker, cœur de la mesure A/B, en traceback). On traduit en
+    # rc=1 contrôlé : la mesure ne peut pas être produite, on ne l'invente pas.
+    try:
+        findings = check_file(path)
+    except (OSError, UnicodeDecodeError) as e:
+        print(f"ablation_checker: source {path} illisible/non-UTF8 — "
+              f"{type(e).__name__}: {e} (mesure impossible, rc=1)", file=sys.stderr)
+        return 1
     stats = summarize(findings)
 
     if args.json:

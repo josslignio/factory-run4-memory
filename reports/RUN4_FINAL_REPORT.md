@@ -4,7 +4,7 @@
 - **Builder** : GLM `zai-coding-plan/glm-5.2` (via opencode, driver headless)
 - **Reviewers** : Claude (`claude -p`) + Codex (`codex exec`), indépendants, à chaque tranche + audit final exhaustif chacun
 - **Date** : 2026-07-27
-- **Statuts** : PROUVÉ PAR EXÉCUTION / PROUVÉ PAR CODE / CORRIGÉ / NON PROUVÉ / BLOQUÉ — aucune phrase « devrait fonctionner ».
+- **Statuts** : PROUVÉ PAR EXÉCUTION / REPRODUCTIBLE PAR EXÉCUTION / PROUVÉ PAR CODE / CORRIGÉ / NON PROUVÉ / BLOQUÉ — aucune phrase « devrait fonctionner ». (`REPRODUCTIBLE PAR EXÉCUTION` = chiffres re-dérivables en rejouant la commande ; le journal archivé reste une transcription manuelle NON scellée, cf. RUN4_ABLATION_AB.md §8.)
 
 ## Synthèse par capacité (master order §1 à §4)
 
@@ -26,8 +26,9 @@
 - Tests : `tests/test_lesson_injector.py` — verts.
 - **Limite honnête documentée** : rappel incomplet — l'injecteur déclenche sur le texte de la spec, pas sur les patterns du code produit ; 3 leçons remontées sur 8 applicables dans l'ablation. Piste d'amélioration explicite pour un run ultérieur, hors scope Run 4.
 
-### §4 — Preuve par ablation A/B : **PROUVÉ PAR EXÉCUTION (chiffres corrigés post-audit)**
+### §4 — Preuve par ablation A/B : **REPRODUCTIBLE PAR EXÉCUTION (chiffres corrigés post-audit)**
 - Protocole figé AVANT exécution (`ablation/PROTOCOL.md`), tâche neutre (`TASK_SPEC.md`), variable unique = injection ou non du bloc de leçons.
+- **Honnêteté (contre-audit Codex round 3)** : les chiffres sont **re-dérivables** en rejouant `python3 factory/bin/ablation_checker.py ablation/arm_{a,b}_lock_manager.py --json` (vérifié : A=5 défauts/1 P1, B=2/0 P1). En revanche le journal archivé `ablation/ABLATION_RUN_LOG.txt` est une **transcription manuelle, append-only par convention d'écriture seulement, NON tamper-evident, NON scellé cryptographiquement** (cf. RUN4_ABLATION_AB.md §8) : il ne prouve pas par lui-même qu'une exécution a eu lieu, seulement la reproductibilité de la commande. Aucun chaînage crypto n'a été construit.
 - **Correction majeure issue du contre-audit Codex** : la règle L-13 du checker marquait tout `LOCK_UN` comme défaut P1, y compris l'usage légitime de libération dans `release_lock` du bras A — gonflant artificiellement son comptage. Règle corrigée (L-13 = `LOCK_UN` DANS un hook post-fork enfant uniquement), les deux bras re-mesurés, le rapport d'ablation ré-écrit avec les chiffres honnêtes.
 - **Résultat brut final (reproductible via `python3 factory/bin/ablation_checker.py ablation/arm_{a,b}_lock_manager.py --json`, archivé dans `ablation/arm_{a,b}_measurements.json`)** :
 

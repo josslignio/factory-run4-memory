@@ -1,9 +1,7 @@
-PASS
+AUDIT_REPAIR_NEEDED (phase P1, round 5)
+--- Codex audit ---
+PHASE_P1_FAIL
 
-Vérifications effectuées sur le commit e27b8e1 (flip `CAMPAIGN_STATE: RUNNING → READY_FOR_FINAL_AUDIT`) :
-- L'état `READY_FOR_FINAL_AUDIT` n'est pas dans l'énumération de la règle 10 du master order, mais c'est une extension documentée et tracée (D-003, `DECISIONS_AUTONOMOUS.md:26-35`) et reconnue par le pilote (`run_run4_autonomous.sh:124`) — pas une violation.
-- Les chiffres du message de commit sont vérifiables, pas inventés : `pytest tests/` → 92 passed (conforme), `bash tests/test_driver_helpers.bash` → `PASS=13 FAIL=0` (conforme), résultat A/B (A=5 défauts/1 P1, B=2/0 P1) tracé dans `reports/RUN4_ABLATION_AB.md:61-70`, `ablation/arm_a_measurements.json`, `ablation/arm_b_measurements.json`, et déjà recoupé indépendamment par l'audit Codex précédent avec citations fichier:ligne.
-- Le pilote régénère `AUDIT_CLAUDE`/`AUDIT_CODEX` par redirection écrasante (`>`) à chaque passage par cet état (`run_run4_autonomous.sh:126,128`), donc les anciens verdicts "PAS PRET" stockés dans le repo ne bloqueront pas indûment le round 3.
-- Aucune trace de merge/push/tag vers `main`, aucun cleanup destructif dans ce diff.
+## P1
 
-Aucun finding.
+- [P1] L’injection n’est pas fail-closed pour tout `rc!=0` : le driver accepte `rc=2` avec stderr vide et continue, au lieu d’écrire `MEMORY_SYSTEM_FAIL` et s’arrêter. Le test entérine ce contournement, donc ne détecterait pas cette régression. [run_run4_autonomous.sh:796](/Users/jocelyngrosjean/factory-run4-memory/run_run4_autonomous.sh:796) [tests/test_injection_failclosed.bash:229](/Users/jocelyngrosjean/factory-run4-memory/tests/test_injection_failclosed.bash:229)

@@ -33,6 +33,26 @@ from lesson_extractor import (  # noqa: E402
     build_lesson,
     extract_lessons,
 )
+
+
+def _purge_tmp(path):
+    """Nettoyage NON récursif (règle 7 absolue : INTERDIT rm/shutil récursif
+    ou large). Supprime uniquement les FICHIERS directs de `path` (un seul
+    niveau) puis tente os.rmdir (no-op sûr si non vide)."""
+    try:
+        for name in os.listdir(path):
+            full = os.path.join(path, name)
+            if os.path.isfile(full) and not os.path.islink(full):
+                try:
+                    os.unlink(full)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    try:
+        os.rmdir(path)
+    except OSError:
+        pass
 from lesson_schema import (  # noqa: E402
     validate_lesson,
     LessonError,
@@ -187,9 +207,9 @@ class TestAppendIntegration(unittest.TestCase):
         self.addCleanup(self._cleanup)
 
     def _cleanup(self):
-        # Nettoyage LOCAL uniquement (règle : pas de rm récursif large).
-        import shutil
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        # Nettoyage LOCAL uniquement, NON récursif (règle 7 : pas de rm/shutil
+        # récursif large). _purge_tmp supprime les fichiers directs puis rmdir.
+        _purge_tmp(self.tmp)
 
     def test_append_then_collision_refused(self):
         base = Path(self.tmp) / "lessons.jsonl"
@@ -248,8 +268,7 @@ class TestOutConcurrentSerialization(unittest.TestCase):
         self.addCleanup(self._cleanup)
 
     def _cleanup(self):
-        import shutil
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        _purge_tmp(self.tmp)
 
     def test_two_concurrent_out_same_ids_one_wins_one_refuses(self):
         import subprocess
@@ -281,6 +300,60 @@ class TestOutConcurrentSerialization(unittest.TestCase):
         leftovers = list(Path(self.tmp).glob("*.tmp"))
         self.assertEqual(leftovers, [], f".tmp résiduels : {leftovers}")
 
+    def test_two_concurrent_out_distinct_ids_no_silent_loss(self):
+        # Reprise FAIL 27/07 (P1 audit Codex) : deux --out concurrents avec des
+        # ids DIFFÉRENTS (extraction-ts distincts) sur le même fichier. Avant le
+        # fix, le second ne voyait aucune collision puis exécutait os.replace ->
+        # effaçait SILEENCIEUSEMENT le résultat valide du premier (les deux rc=0,
+        # perte). Maintenant le flock sérialise : le second voit les ids étrangers
+        # SOUS verrou et REFUSE proprement (rc=1) ; le contenu du gagnant est
+        # préservé (aucune perte, aucun JSON partiel).
+        import subprocess
+        base = Path(self.tmp) / "lessons.jsonl"
+        cli = str(REPO / "factory" / "bin" / "lesson_extractor.py")
+        cmd_a = [sys.executable, cli, str(FIXTURE), "--out", str(base),
+                 "--extraction-ts", "20260727T160000Z"]
+        cmd_b = [sys.executable, cli, str(FIXTURE), "--out", str(base),
+                 "--extraction-ts", "20260727T170000Z"]   # ids distincts
+        p1 = subprocess.Popen(cmd_a, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL)
+        p2 = subprocess.Popen(cmd_b, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL)
+        rc1 = p1.wait(timeout=30)
+        rc2 = p2.wait(timeout=30)
+        # Exactement un gagnant (rc=0) + un refus propre (rc=1). JAMAIS les deux
+        # rc=0 (perte silencieuse), jamais rc=2 (traceback/corruption).
+        codes = sorted([rc1, rc2])
+        self.assertEqual(codes, [0, 1],
+                         f"attendu [0,1] (un gagnant + un refus propre, pas de "
+                         f"perte silencieuse), eu rc1={rc1} rc2={rc2}")
+        # Le contenu du gagnant est INTACT (3 leçons valides) — pas écrasé.
+        rows = load_jsonl(base)
+        self.assertEqual(len(rows), 3, "le gagnant écrit 3 leçons valides, "
+                                       "préservées (pas de perte)")
+        # Aucun résidu `.tmp` (mkstemp unique + nettoyage finally).
+        leftovers = list(Path(self.tmp).glob("*.tmp"))
+        self.assertEqual(leftovers, [], f".tmp résiduels : {leftovers}")
+
+    def test_out_refuses_foreign_ids_no_overwrite(self):
+        # Déterministe (sans course) : un fichier contenant des ids ÉTRANGERS à
+        # l'écriture fraîche doit être refusé (--out ne détruit jamais du contenu
+        # valide). Contrat : --out n'écrit que sur un fichier absent/vide.
+        base = Path(self.tmp) / "lessons.jsonl"
+        # Pré-écrire un fichier avec des ids différents (autre extraction-ts).
+        rc = ex.main([str(FIXTURE), "--out", str(base),
+                      "--extraction-ts", "20260801T000000Z"])
+        self.assertEqual(rc, 0)
+        before = load_jsonl(base)
+        self.assertEqual(len(before), 3)
+        # Réécrire --out avec des ids DIFFÉRENTS -> refus (préserve l'existant).
+        rc2 = ex.main([str(FIXTURE), "--out", str(base),
+                       "--extraction-ts", "20260802T000000Z"])
+        self.assertEqual(rc2, 1, "--out sur ids étrangers doit échouer (rc=1)")
+        after = load_jsonl(base)
+        self.assertEqual([l["id"] for l in after], [l["id"] for l in before],
+                         "le contenu existant est INTACT (rien écrasé)")
+
 
 class TestCliStdout(unittest.TestCase):
     def test_main_stdout_emits_jsonl(self):
@@ -301,6 +374,175 @@ class TestCliStdout(unittest.TestCase):
             obj = json.loads(l)  # JSON valide
             self.assertIn("id", obj)
             self.assertTrue(obj["id"].startswith(f"L-{FIX_TS}-"))
+
+
+# ===================================================================
+# P0 finding 1 : --source-tag normalisé, validé, cohérent source/evidence
+# ===================================================================
+class TestSourceTag(unittest.TestCase):
+    """--source-tag doit : strip(), refuser vide/espaces (rc!=0), appliquer
+    AVANT la validation finale puis RE-valider, et préserver la cohérence
+    source/evidence (evidence commence par '<source>:')."""
+
+    def _run_main_capturing(self, argv):
+        backup_out, backup_err = sys.stdout, sys.stderr
+        sys.stdout = io.StringIO()
+        sys.stderr = io.StringIO()
+        try:
+            rc = ex.main(argv)
+            out = sys.stdout.getvalue()
+            err = sys.stderr.getvalue()
+        finally:
+            sys.stdout, sys.stderr = backup_out, backup_err
+        return rc, out, err
+
+    def test_source_tag_empty_refused(self):
+        # source-tag vide -> FAIL (rc != 0)
+        rc, out, err = self._run_main_capturing(
+            [str(FIXTURE), "--extraction-ts", FIX_TS, "--source-tag", ""])
+        self.assertNotEqual(rc, 0, f"source-tag vide doit échouer, eu rc={rc}")
+        self.assertEqual(out.strip(), "", "rien ne doit être émis sur stdout")
+
+    def test_source_tag_spaces_refused(self):
+        # source-tag réduit à des espaces -> FAIL (rc != 0) après strip()
+        rc, out, err = self._run_main_capturing(
+            [str(FIXTURE), "--extraction-ts", FIX_TS, "--source-tag", "   "])
+        self.assertNotEqual(rc, 0, f"source-tag espaces doit échouer, eu rc={rc}")
+        self.assertEqual(out.strip(), "")
+
+    def test_source_tag_rewrites_source_and_evidence_prefix(self):
+        # CAS COHÉRENT -> PASS : le tag remplace source ET le préfixe
+        # d'evidence, la leçon re-validée passe le schéma.
+        tag = "new-repo@sha123"
+        rc, out, err = self._run_main_capturing(
+            [str(FIXTURE), "--extraction-ts", FIX_TS, "--source-tag", tag])
+        self.assertEqual(rc, 0, f"source-tag cohérent doit passer, err={err}")
+        rows = [json.loads(l) for l in out.strip().splitlines() if l.strip()]
+        self.assertEqual(len(rows), 3)
+        for r in rows:
+            self.assertEqual(r["source"], tag)
+            self.assertTrue(r["evidence"].startswith(tag + ":"),
+                            f"evidence doit commencer par '{tag}:' : {r['evidence']!r}")
+            ex.assert_source_evidence_coherent(r)  # ne lève pas
+            validate_lesson(r)  # re-valide -> passe
+
+    def test_source_tag_strips_surrounding_whitespace(self):
+        # Le tag entouré d'espaces est normalisé : source == valeur strippée.
+        rc, out, err = self._run_main_capturing(
+            [str(FIXTURE), "--extraction-ts", FIX_TS,
+             "--source-tag", "  trimmed-tag  "])
+        self.assertEqual(rc, 0, f"err={err}")
+        rows = [json.loads(l) for l in out.strip().splitlines() if l.strip()]
+        for r in rows:
+            self.assertEqual(r["source"], "trimmed-tag")
+
+    def test_incoherent_source_evidence_detected(self):
+        # CAS INCOHÉRENT -> FAIL : on change `source` SANS remettre à jour
+        # le préfixe d'evidence. assert_source_evidence_coherent doit lever.
+        lessons = extract_lessons(FIXTURE.read_text(encoding="utf-8"),
+                                  extraction_ts=FIX_TS)
+        lesson = dict(lessons[0])
+        old_ev = lesson["evidence"]
+        lesson["source"] = "completely-different-source"
+        # evidence NON réécrite -> commence encore par l'ancien préfixe.
+        self.assertFalse(old_ev.startswith(lesson["source"] + ":"))
+        with self.assertRaises(ex.ExtractionError):
+            ex.assert_source_evidence_coherent(lesson)
+
+    def test_apply_source_tag_unit_coherent_passes(self):
+        # Unitaire : apply_source_tag réécrit source + evidence, cohérent -> OK.
+        lessons = extract_lessons(FIXTURE.read_text(encoding="utf-8"),
+                                  extraction_ts=FIX_TS)
+        lesson = dict(lessons[0])
+        ex.apply_source_tag(lesson, "  unit-tag  ")
+        self.assertEqual(lesson["source"], "unit-tag")
+        self.assertTrue(lesson["evidence"].startswith("unit-tag:"))
+        validate_lesson(lesson)  # re-validation passe
+
+    def test_apply_source_tag_unit_empty_refused(self):
+        lessons = extract_lessons(FIXTURE.read_text(encoding="utf-8"),
+                                  extraction_ts=FIX_TS)
+        lesson = dict(lessons[0])
+        with self.assertRaises(ex.ExtractionError):
+            ex.apply_source_tag(lesson, "   ")
+
+    def test_source_tag_invisible_only_refused(self):
+        # Contre-audit Codex P3 : un --source-tag constitué uniquement de
+        # caractères invisibles NON retirés par str.strip() (ex: U+200B ZERO
+        # WIDTH SPACE, cat. Cf) doit être refusé (rc != 0) — sinon une valeur
+        # sémantiquement vide est acceptée.
+        invisible = "\u200b\u200c\ufeff"   # zero-width space, zwnj, BOM/ZWNBSP
+        self.assertEqual(invisible.strip(), invisible,
+                         "sanity : str.strip() ne retire pas U+200B")
+        rc, out, err = self._run_main_capturing(
+            [str(FIXTURE), "--extraction-ts", FIX_TS,
+             "--source-tag", invisible])
+        self.assertNotEqual(rc, 0, f"source-tag invisibles-seul doit échouer, "
+                                    f"rc={rc} err={err}")
+        self.assertEqual(out.strip(), "", "rien ne doit être émis sur stdout")
+
+    def test_source_tag_single_invisible_refused(self):
+        # Cas minimal : un seul U+200B doit aussi être refusé.
+        with self.assertRaises(ex.ExtractionError):
+            ex.apply_source_tag(
+                dict(extract_lessons(FIXTURE.read_text(encoding="utf-8"),
+                                     extraction_ts=FIX_TS)[0]),
+                "\u200b")
+
+    def test_source_tag_visible_among_invisible_passes(self):
+        # Non-régression : un tag contenant des caractères visibles ET des
+        # invisibles doit PASSER (le visible compte, on ne rejette que le
+        # 100% invisible). La valeur strip() est conservée.
+        lessons = extract_lessons(FIXTURE.read_text(encoding="utf-8"),
+                                  extraction_ts=FIX_TS)
+        lesson = dict(lessons[0])
+        ex.apply_source_tag(lesson, "  \u200breal-tag\u200b  ")
+        self.assertEqual(lesson["source"], "\u200breal-tag\u200b")
+        self.assertTrue(lesson["evidence"].startswith("\u200breal-tag\u200b:"))
+        validate_lesson(lesson)
+
+
+# ===================================================================
+# P0 finding 2 : bloc [FINDING][/FINDING] vide -> fail-closed
+# ===================================================================
+class TestEmptyFindingBlockFailClosed(unittest.TestCase):
+    """Un bloc [FINDING][/FINDING] vide fait échouer TOUTE l'extraction."""
+
+    GOOD = ("[FINDING]\nseverity: P1\ncategory: other\nfile: a.py\nline: 1\n"
+            "description: x\nfix: y\ntrigger_keywords: z\nsource: r\n"
+            "[/FINDING]\n")
+
+    def _valid_block(self, name="b.py", line="2"):
+        return (f"[FINDING]\nseverity: P2\ncategory: other\nfile: {name}\n"
+                f"line: {line}\ndescription: x\nfix: y\n"
+                f"trigger_keywords: z\nsource: r\n[/FINDING]\n")
+
+    def test_one_valid_block_passes(self):
+        lessons = extract_lessons(self.GOOD, extraction_ts=FIX_TS)
+        self.assertEqual(len(lessons), 1)
+
+    def test_empty_block_fails(self):
+        empty = "[FINDING]\n[/FINDING]\n"
+        with self.assertRaises(ex.ExtractionError):
+            extract_lessons(empty, extraction_ts=FIX_TS)
+
+    def test_valid_plus_empty_fails_whole_extraction(self):
+        # Un bloc valide + un bloc vide -> l'extraction entière échoue
+        # (fail-closed : on n'ignore pas silencieusement le bloc vide).
+        mixed = self.GOOD + "[FINDING]\n[/FINDING]\n"
+        with self.assertRaises(ex.ExtractionError):
+            extract_lessons(mixed, extraction_ts=FIX_TS)
+
+    def test_empty_block_with_only_blank_lines_fails(self):
+        # Un bloc contenant uniquement des lignes vides reste vide (dict={}) .
+        blanky = "[FINDING]\n   \n\t\n[/FINDING]\n"
+        with self.assertRaises(ex.ExtractionError):
+            extract_lessons(blanky, extraction_ts=FIX_TS)
+
+    def test_two_valid_blocks_pass(self):
+        two = self._valid_block() + self._valid_block("c.py", "3")
+        lessons = extract_lessons(two, extraction_ts=FIX_TS)
+        self.assertEqual(len(lessons), 2)
 
 
 if __name__ == "__main__":

@@ -2,11 +2,17 @@
 
 > Preuve par ablation de l'efficacité de la mémoire injectée. Chiffres
 > RÉELS produits par `factory/bin/ablation_checker.py` (bug-detector
-> déterministe, stdlib, scan statique, 8 règles validées par
-> `tests/test_ablation_checker.py` 22/22 OK). Aucun chiffre inventé.
+> déterministe, stdlib, **7 règles statiques sur 8 + L-16 comportementale**
+> (elle exécute le source de `acquire_lock` sous un bac à sable à liste
+> blanche d'imports + builtins restreints pour compter les fd réellement
+> fermés — voir §7), 8 règles validées par
+> `tests/test_ablation_checker.py` 43/43 OK). Aucun chiffre inventé.
 > Trace d'exécution datée et reproductible archivée dans
-> `ablation/ABLATION_RUN_LOG.txt` (append-only, 2 blocs : run initial +
-> re-run post-durcissement round-2).
+> `ablation/ABLATION_RUN_LOG.txt` (append-only **par convention d'écriture**,
+> NON tamper-evident, NON scellé cryptographiquement — voir §8). Chaque bloc
+> est désormais **auto-écrit** par `ablation/run_ablation.sh` qui ré-exécute
+> le checker déterministe sur les deux bras (preuve d'exécution réelle, pas
+> seulement de reproductibilité — contre-audit Codex P1 #1).
 
 ## 1. Protocole (figé AVANT exécution — `ablation/PROTOCOL.md`)
 
@@ -110,13 +116,32 @@ rappel de l'injecteur, pas du mécanisme de mémoire lui-même.
   produirait statistiquement au moins autant de défauts au bras A, plus
   probablement davantage. Inversement, aucun effet ne serait attributed
   à tort — le delta est réel (mesuré par detector objectif).
-- **Detector statique** : `ablation_checker.py` scanne le source, n'exécute
-  pas le code. Les défauts d'exécution non visibles dans le source
-  (deadlocks subtils, perf, comportement OS-spécifique) ne sont PAS
-  mesurés ici. Les 8 règles sont validées sur snippets défectueux ET
-  sains (22/22 tests, dont 5 tests de régression round-2 : hook no-op,
-  hook sans `.clear()`, flock hors `acquire_lock`, off-by-one de ligne
-  d'evidence) mais ne couvrent que les anti-patterns listés.
+- **Nature du detector** : `ablation_checker.py` combine **7 règles
+  statiques** (L-01/L-05/L-07/L-09/L-10/L-12/L-13 : regex / présence-absence
+  de tokens sur le source blanchi des commentaires) et **1 règle
+  comportementale, L-16**. L-16 **EXÉCUTE** le source de `acquire_lock` sous
+  un bac à sable qui fake `os`/`fcntl` (via `__import__` intercepté) pour
+  compter les fd réellement ouverts/fermés (P0 finding 4) : c'est le
+  comportement réel, pas le texte, qui décide si un filet large ferme le fd.
+  **Important pour cette ablation** : les deux bras n'ont qu'un `except
+  BlockingIOError` isolé et AUCUN filet large (`except OSError`/`finally`),
+  donc L-16 rend son verdict par sa branche **déterministe statique** —
+  l'exécution n'est PAS atteinte pour les bras mesurés ici, et les chiffres
+  A/B ci-dessus ne dépendent donc pas d'une exécution. Les défauts non
+  visibles dans le source (deadlocks subtils, perf, comportement OS-spécifique)
+  restent non mesurés. Les 8 règles sont validées sur snippets défectueux ET
+  sains (**43/43 tests**, incluant 4 mutants L-16 à fermeture textuelle mais
+  fuite réelle : `return False` sans close, `.close()` sur ressource sans
+  rapport, `if False: os.close(fd)` mortelle, `os.close(0)` mauvais fd ; plus
+  3 tests de neutralisation du bac à sable — reprise FAIL 27/07, P1 audit
+  Codex #2).
+  Bac à sable (honnête) : `__import__` est intercepté en **liste blanche**
+  (`os`/`fcntl` = fakes sans effet de bord OS ; `pathlib` = réel et sûr, requis
+  par le bras GOOD_LOCK mesuré ; tout autre module `subprocess`/`socket`/…
+  REFUSÉ) et les builtins dangereux (`open`/`exec`/`eval`/`compile`) sont
+  retirés → un source analysé ne peut ni faire d'I/O fichier ni importer de
+  module dangereux au top-level. Défense en profondeur, **pas une frontière de
+  sécurité dure** : pour du code adversarial, isoler par subprocess/timeout.
 - **Pas de boucle reviewer** : la métrique « nombre de tours de review
   avant PASS » du master order §4 n'est pas mesurable en exécution
   headless autonome (pas de reviewer disponible dans la boucle d'ablation).
@@ -131,21 +156,50 @@ rappel de l'injecteur, pas du mécanisme de mémoire lui-même.
 - **Reproductibilité** : les chiffres ci-dessus sont reproductibles
   exactement via `python3 factory/bin/ablation_checker.py
   ablation/arm_{a,b}_lock_manager.py --json` (JSON archivés dans
-  `ablation/arm_{a,b}_measurements.json`). Une **trace d'exécution datée
-  et append-only** (`ablation/ABLATION_RUN_LOG.txt`) capture l'horodatage
-  UTC, le hash HEAD du repo et la sortie complète du checker pour chaque
-  exécution — exigence de traçabilité du contre-audit Codex satisfaite.
+  `ablation/arm_{a,b}_measurements.json`). Une **trace d'exécution datée**,
+  append-only **par convention d'écriture** (`ablation/ABLATION_RUN_LOG.txt`),
+  capture l'horodatage UTC, le hash HEAD du repo et la sortie complète du
+  checker pour chaque exécution. **Preuve d'exécution (contre-audit Codex
+  P1 #1)** : le script `ablation/run_ablation.sh` ré-exécute RÉELLEMENT le
+  checker sur les deux bras et APPEND automatiquement le bloc daté dans le
+  journal (test réel `tests/test_ablation_runner.py`) — l'exécution est donc
+  prouvée, pas seulement reproductible. **Honnêtement** : cette trace n'est PAS
+  tamper-evident et n'est PAS scellée cryptographiquement (fichier texte
+  ordinaire — voir §8) ; l'exigence de traçabilité du contre-audit est
+  satisfaite au niveau « exécution réelle datée + reproductible », pas au
+  niveau « preuve d'intégrité ».
 
-## 8. Traçabilité de l'exécution (contre-audit Codex P1 #2)
+## 8. Traçabilité de l'exécution (contre-audit Codex P1 #1/#2) — honnêteté V1
 
-Le contre-audit a exigé une trace horodatée/non modifiable, pas seulement
+Le contre-audit demandait une trace horodatée des exécutions, pas seulement
 la cohérence statique des JSON archivés. Celle-ci vit dans
-`ablation/ABLATION_RUN_LOG.txt` (append-only) :
+`ablation/ABLATION_RUN_LOG.txt`. **Honnêtement (limite V1 assumée)** :
 
-- en-tête daté (UTC ISO8601), hôte, version Python, hash HEAD du repo ;
-- sortie JSON complète du checker pour chaque bras ;
-- ligne de verdict consolidée (`p1 A->B`, `total A->B`).
+- Le fichier est **append-only PAR CONVENTION D'ÉCRITURE** : le script
+  `ablation/run_ablation.sh` n'utilise QUE l'opérateur `>>` (jamais `>` ni
+  truncate), donc chaque exécution y insère un bloc daté sans rien écraser.
+  Il **n'est PAS tamper-evident** et **n'est PAS cryptographiquement scellé** :
+  c'est un fichier texte ordinaire, modifiable par tout processus du même
+  utilisateur macOS (même limite V1 que les receipts documentée dans
+  MASTER_ORDER §« MACHINE À ÉTATS »). **Aucun chaînage cryptographique n'a été
+  construit** (et on n'en prétend pas un) : cela sortirait du périmètre
+  stdlib/honnête de Run 4 (P0 finding 5 l'interdit explicitement).
+- Le `hash HEAD du repo` consigné dans l'en-tête prouve **quel commit a
+  produit** chaque exécution (reproductibilité) ; il **ne scelle pas** le
+  fichier de trace contre une modification ultérieure. C'est un repère
+  de reproductibilité, pas une garantie d'intégrité.
+- Contenu d'un bloc : en-tête daté (UTC ISO8601), hôte, version Python, hash
+  HEAD du repo ; sortie JSON complète du checker pour chaque bras ; ligne de
+  verdict consolidée (`p1 A->B`, `total A->B`).
 
-Commande pour rejouer et appender un nouveau bloc daté :
+**Exécution réelle prouvée (contre-audit Codex P1 #1)** : contrairement au
+rapport précédent qui admettait qu'AUCUN script n'écrivait le journal (recopie
+manuelle → l'exécution n'était que reproductible, pas prouvée),
+`ablation/run_ablation.sh` exécute désormais RÉELLEMENT le checker sur les deux
+bras et append automatiquement le bloc daté. La reproduction manuelle reste
+possible via
 `python3 factory/bin/ablation_checker.py ablation/arm_{a,b}_lock_manager.py --json`
-(exécutée dans le bloc `===== RUN <ts> =====` du fichier de trace).
+(JSON archivés dans `ablation/arm_{a,b}_measurements.json`). La traçabilité
+repose donc sur **une exécution réelle datée** (le script) + **la
+reproductibilité** de la commande + le repère de commit — mais TOUJOURS sans
+mécanisme d'intégrité cryptographique (limite V1 assumée, honnêtement).

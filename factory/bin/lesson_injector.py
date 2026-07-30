@@ -25,11 +25,17 @@ Sortie :
   - `--format json` : liste JSON des leçons matchées + leur score.
   - `--quiet` : uniquement les ids (un par ligne), pour scripting.
 
-Code de retour :
-  - 0 si au moins une leçon remonte,
-  - 2 si aucune leçon ne matche (signal explicite « rien à injecter »,
-    fail-closed : ne pas silencieusement ne rien écrire),
-  - 1 sur erreur (f mémoire illisible, tâche vide, etc.).
+Code de retour (contrat P1 fail-closed : rc!=0 = panne système uniquement) :
+  - 0 si la mémoire est saine et lisible (match OU non-match). La sortie
+    vide / le bloc « aucune leçon ne matche » signale le non-match — ce
+    n'est PAS une panne.
+  - 1 sur panne (mémoire absente/illisible, schéma invalide, tâche vide...).
+  - 2 réservé aux erreurs argparse (CLI mal formée) — jamais au non-match.
+
+Le pilote (run_run4_autonomous.sh memory_preflight_or_die) échoue
+strictement sur rc!=0 : le non-match (sain) DOIT rester rc=0, sinon le
+préflight déclencherait un MEMORY_SYSTEM_FAIL intempestif sur toute mémoire
+saine dont aucune leçon ne matche la sonde de health-check.
 
 Où un LLM pourrait intervenir (transparence L-049) : un LLM externe peut être
 utilisé EN AMONT pour transformer une spec vague en description de tâche riche
@@ -322,10 +328,13 @@ def main(argv: List[str] = None) -> int:
     else:
         sys.stdout.write(render_text(selected, len(lessons), task.strip()))
 
-    # Code de retour :
-    # 0 si au moins une leçon remonte ; 2 si vide (fail-closed, signal
-    # explicite au pilote/appelant : rien à injecter, mémoire silencieuse).
-    return 0 if selected else 2
+    # Code de retour (contrat P1 fail-closed) : rc=0 dès que la mémoire est
+    # saine et lisible (match OU non-match). rc=1 sur panne (mémoire
+    # illisible/schéma invalide) — déjà retourné plus haut sur chaque erreur.
+    # Le pilote échoue strictement sur rc!=0, donc le non-match (sain) reste
+    # rc=0 : la sortie vide le signale, sans déclencher de MEMORY_SYSTEM_FAIL
+    # intempestif. (Fix P1 audit round 5 : rc=2 était ambigu avec argparse.)
+    return 0
 
 
 if __name__ == "__main__":

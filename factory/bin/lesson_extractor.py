@@ -86,6 +86,7 @@ import os
 import re
 import sys
 import tempfile
+import unicodedata
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -178,8 +179,18 @@ def parse_findings(text: str) -> List[Dict[str, str]]:
                 raise ExtractionError(
                     f"ligne {lineno}: `[/FINDING]` sans `[FINDING]` ouvrant"
                 )
-            if current:
-                blocks.append(current)
+            # Fail-closed (P0) : un bloc [FINDING][/FINDING] vide (aucune clé
+            # `clé: valeur`) fait échouer TOUTE l'extraction. L'ancien code
+            # sautait silencieusement un bloc vide (`if current:`) -> un
+            # rapport contenant un bloc vide était accepté à tort. On refuse
+            # désormais : un bloc ouvert doit contenir au moins une clé.
+            if not current:
+                raise ExtractionError(
+                    f"ligne {lineno}: bloc `[FINDING]...[/FINDING]` vide "
+                    f"(aucune clé `clé: valeur`) — fail-closed, l'extraction "
+                    f"entière est refusée"
+                )
+            blocks.append(current)
             in_block = False
             current = None
             current_key = None
@@ -324,6 +335,81 @@ def build_lesson(block: Dict[str, str], extraction_ts: str, seq: int) -> dict:
     return lesson
 
 
+# ----------------------------------------------- source-tag (P0 finding 1)
+def assert_source_evidence_coherent(lesson: dict) -> None:
+    """Vérifie la cohérence source/evidence d'une leçon.
+
+    Le champ `evidence` est construit (cf. build_lesson) comme
+    `<source>:<file>:<line>[ — test: <test>]`. Une leçon dont la `source`
+    a été changée sans remettre à jour le préfixe d'`evidence` est
+    INCOHÉRENTE (le repère ne pointe plus vers la source annoncée) et doit
+    être refusée. On exige donc qu'`evidence` commence exactement par
+    `<source>:`.
+    """
+    src = lesson["source"]
+    ev = lesson["evidence"]
+    if not isinstance(src, str) or not src:
+        raise ExtractionError(
+            f"source vide ou non-str — coherence impossible : {src!r}")
+    if not isinstance(ev, str) or not ev.startswith(src + ":"):
+        raise ExtractionError(
+            f"cohérence source/evidence rompue : source={src!r} mais "
+            f"evidence ne commence pas par {src + ':'!r} — evidence={ev!r}")
+
+
+def _has_visible_content(s: str) -> bool:
+    """True si `s` contient au moins un caractère VISIBLE.
+
+    `str.strip()` retire les espaces Unicode (cat. Z*, Cc classiques) mais
+    PAS les caractères de format invisibles comme U+200B (ZERO WIDTH SPACE,
+    cat. Cf). Un --source-tag constitué uniquement de tels caractères passait
+    donc le contrôle `not tag` alors qu'il est sémantiquement vide (contre-
+    audit Codex P3). On rejette donc tout tag sans au moins un caractère ni
+    séparateur (Z*) ni contrôle/format (C*).
+    """
+    for ch in s:
+        cat = unicodedata.category(ch)
+        if cat[0] in ("Z", "C") or ch.isspace():
+            continue
+        return True
+    return False
+
+
+def apply_source_tag(lesson: dict, new_source: str) -> dict:
+    """Applique `--source-tag` à une leçon (P0 finding 1).
+
+    1. Normalise `new_source` par strip().
+    2. Refuse vide / espaces seul, ET toute valeur sans contenu visible
+       (caractères invisibles type U+200B — str.strip() ne les retire pas ;
+       contre-audit Codex P3) -> ExtractionError -> rc!=0.
+    3. Remplace `source` ET réécrit le préfixe d'`evidence` pour que la
+       cohérence source/evidence soit préservée (sinon leçon incohérente).
+    4. Vérifie la cohérence (assert_source_evidence_coherent).
+    5. RE-valide la leçon modifiée (validate_lesson) — défense en
+       profondeur : un --source-tag ne doit jamais produire une leçon
+       invalide même si l'extraction initiale était valide.
+    """
+    tag = new_source.strip()
+    if not tag or not _has_visible_content(tag):
+        raise ExtractionError(
+            "--source-tag vide, réduit à des espaces, ou constitué "
+            "uniquement de caractères invisibles (ex: U+200B) après "
+            "strip() ; valeur refusée")
+    old = lesson.get("source", "")
+    ev = lesson.get("evidence", "")
+    # Réécriture du préfixe d'evidence : <old>:... -> <tag>:... pour garder
+    # la cohérence. Si l'ancien préfixe n'est pas trouvé, on laisse
+    # l'evidence telle quelle -> la vérification de cohérence qui suit
+    # échouera proprement (leçon incohérente refusée).
+    if old and ev.startswith(old + ":"):
+        ev = tag + ":" + ev[len(old) + 1:]
+    lesson["source"] = tag
+    lesson["evidence"] = ev
+    assert_source_evidence_coherent(lesson)
+    validate_lesson(lesson)
+    return lesson
+
+
 def extract_lessons(
     text: str, extraction_ts: str = None
 ) -> List[dict]:
@@ -375,11 +461,31 @@ def _write_jsonl_fresh(path: Path, lessons: List[dict]) -> None:
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         _, existing_ids = _read_existing_ids(path)
-        collisions = existing_ids & {l["id"] for l in lessons}
+        our_ids = {l["id"] for l in lessons}
+        collisions = existing_ids & our_ids
         if collisions:
             raise LessonError(
                 f"collision d'ids détectée sous verrou (--out/append "
                 f"concurrent ?) : {sorted(collisions)}")
+        # Reprise FAIL 27/07 (P1 audit Codex) : un --out vers un fichier
+        # contenant d'AUTRES ids valides (course gagnée par un autre --out aux
+        # ids distincts, ou overwrite involontaire) détruirait SILEENCIEUSEMENT
+        # ce contenu valide — le second process ne voyait aucune collision puis
+        # exécutait os.replace, effaçant le résultat du premier. --out est une
+        # écriture FRAÎCHE : on n'accepte d'écrire que sur un fichier
+        # absent/vide. Les mêmes ids sont déjà une collision (ci-dessus) ; tout
+        # id valide ÉTRANGER à cette écriture -> refus fail-closed (aucune
+        # perte silencieuse). Vérifié SOUS verrou (autoritaire face à la course
+        # entre le pré-check hors-verrou de main() et l'écriture effective).
+        foreign = existing_ids - our_ids
+        if foreign:
+            raise LessonError(
+                f"le fichier destination contient {len(foreign)} id(s) "
+                f"valide(s) absent(s) de cette écriture fraîche "
+                f"(ex: {sorted(foreign)[:3]}) — refus d'écraser du contenu "
+                f"valide (--out = écriture fraîche sur fichier vide/absent ; "
+                f"utilisez --append pour ajouter, ou supprimez le fichier "
+                f"avant).")
         fd, tmp_name = tempfile.mkstemp(
             dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
         tmp = Path(tmp_name)
@@ -474,10 +580,24 @@ def main(argv: List[str] = None) -> int:
 
     try:
         lessons = extract_lessons(text, extraction_ts=args.extraction_ts)
-        # P3 audit Codex : --source-tag était exposé mais jamais appliqué.
-        if args.source_tag:
+        # P0 finding 1 : --source-tag normalisé (strip), refusé si vide/espaces,
+        # appliqué AVANT la validation finale puis RE-validé, avec vérification
+        # de la cohérence source/evidence. L'ancien code se contentait de
+        # `l["source"] = args.source_tag` sans strip, sans contrôle vide, sans
+        # re-validation et sans vérifier la cohérence avec evidence.
+        if args.source_tag is not None:
+            # Normalisation + refus vide/espaces/invisibles tôt (message clair).
+            # apply_source_tag (appelée juste après) reste le contrôle
+            # autoritaire ; ce pré-check rejette avant de boucler sur les
+            # leçons pour un message immédiat.
+            tag = args.source_tag.strip()
+            if not tag or not _has_visible_content(tag):
+                raise ExtractionError(
+                    "--source-tag vide, réduit à des espaces, ou constitué "
+                    "uniquement de caractères invisibles (ex: U+200B) ; "
+                    "valeur refusée")
             for l in lessons:
-                l["source"] = args.source_tag
+                apply_source_tag(l, tag)
     except (ExtractionError, LessonError) as e:
         print(f"lesson_extractor: ECHEC — {e}", file=sys.stderr)
         return 1

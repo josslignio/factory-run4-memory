@@ -393,6 +393,41 @@ class TestSourceTag(unittest.TestCase):
         with self.assertRaises(ex.ExtractionError):
             ex.apply_source_tag(lesson, "   ")
 
+    def test_source_tag_invisible_only_refused(self):
+        # Contre-audit Codex P3 : un --source-tag constitué uniquement de
+        # caractères invisibles NON retirés par str.strip() (ex: U+200B ZERO
+        # WIDTH SPACE, cat. Cf) doit être refusé (rc != 0) — sinon une valeur
+        # sémantiquement vide est acceptée.
+        invisible = "\u200b\u200c\ufeff"   # zero-width space, zwnj, BOM/ZWNBSP
+        self.assertEqual(invisible.strip(), invisible,
+                         "sanity : str.strip() ne retire pas U+200B")
+        rc, out, err = self._run_main_capturing(
+            [str(FIXTURE), "--extraction-ts", FIX_TS,
+             "--source-tag", invisible])
+        self.assertNotEqual(rc, 0, f"source-tag invisibles-seul doit échouer, "
+                                    f"rc={rc} err={err}")
+        self.assertEqual(out.strip(), "", "rien ne doit être émis sur stdout")
+
+    def test_source_tag_single_invisible_refused(self):
+        # Cas minimal : un seul U+200B doit aussi être refusé.
+        with self.assertRaises(ex.ExtractionError):
+            ex.apply_source_tag(
+                dict(extract_lessons(FIXTURE.read_text(encoding="utf-8"),
+                                     extraction_ts=FIX_TS)[0]),
+                "\u200b")
+
+    def test_source_tag_visible_among_invisible_passes(self):
+        # Non-régression : un tag contenant des caractères visibles ET des
+        # invisibles doit PASSER (le visible compte, on ne rejette que le
+        # 100% invisible). La valeur strip() est conservée.
+        lessons = extract_lessons(FIXTURE.read_text(encoding="utf-8"),
+                                  extraction_ts=FIX_TS)
+        lesson = dict(lessons[0])
+        ex.apply_source_tag(lesson, "  \u200breal-tag\u200b  ")
+        self.assertEqual(lesson["source"], "\u200breal-tag\u200b")
+        self.assertTrue(lesson["evidence"].startswith("\u200breal-tag\u200b:"))
+        validate_lesson(lesson)
+
 
 # ===================================================================
 # P0 finding 2 : bloc [FINDING][/FINDING] vide -> fail-closed

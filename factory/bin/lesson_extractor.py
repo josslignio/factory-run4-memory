@@ -86,6 +86,7 @@ import os
 import re
 import sys
 import tempfile
+import unicodedata
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -356,11 +357,31 @@ def assert_source_evidence_coherent(lesson: dict) -> None:
             f"evidence ne commence pas par {src + ':'!r} — evidence={ev!r}")
 
 
+def _has_visible_content(s: str) -> bool:
+    """True si `s` contient au moins un caractère VISIBLE.
+
+    `str.strip()` retire les espaces Unicode (cat. Z*, Cc classiques) mais
+    PAS les caractères de format invisibles comme U+200B (ZERO WIDTH SPACE,
+    cat. Cf). Un --source-tag constitué uniquement de tels caractères passait
+    donc le contrôle `not tag` alors qu'il est sémantiquement vide (contre-
+    audit Codex P3). On rejette donc tout tag sans au moins un caractère ni
+    séparateur (Z*) ni contrôle/format (C*).
+    """
+    for ch in s:
+        cat = unicodedata.category(ch)
+        if cat[0] in ("Z", "C") or ch.isspace():
+            continue
+        return True
+    return False
+
+
 def apply_source_tag(lesson: dict, new_source: str) -> dict:
     """Applique `--source-tag` à une leçon (P0 finding 1).
 
     1. Normalise `new_source` par strip().
-    2. Refuse vide / espaces seul (ExtractionError -> rc!=0).
+    2. Refuse vide / espaces seul, ET toute valeur sans contenu visible
+       (caractères invisibles type U+200B — str.strip() ne les retire pas ;
+       contre-audit Codex P3) -> ExtractionError -> rc!=0.
     3. Remplace `source` ET réécrit le préfixe d'`evidence` pour que la
        cohérence source/evidence soit préservée (sinon leçon incohérente).
     4. Vérifie la cohérence (assert_source_evidence_coherent).
@@ -369,10 +390,11 @@ def apply_source_tag(lesson: dict, new_source: str) -> dict:
        invalide même si l'extraction initiale était valide.
     """
     tag = new_source.strip()
-    if not tag:
+    if not tag or not _has_visible_content(tag):
         raise ExtractionError(
-            "--source-tag vide ou réduit à des espaces après strip() ; "
-            "valeur refusée")
+            "--source-tag vide, réduit à des espaces, ou constitué "
+            "uniquement de caractères invisibles (ex: U+200B) après "
+            "strip() ; valeur refusée")
     old = lesson.get("source", "")
     ev = lesson.get("evidence", "")
     # Réécriture du préfixe d'evidence : <old>:... -> <tag>:... pour garder
@@ -544,11 +566,16 @@ def main(argv: List[str] = None) -> int:
         # `l["source"] = args.source_tag` sans strip, sans contrôle vide, sans
         # re-validation et sans vérifier la cohérence avec evidence.
         if args.source_tag is not None:
-            # Normalisation + refus vide/espaces tôt (message clair).
+            # Normalisation + refus vide/espaces/invisibles tôt (message clair).
+            # apply_source_tag (appelée juste après) reste le contrôle
+            # autoritaire ; ce pré-check rejette avant de boucler sur les
+            # leçons pour un message immédiat.
             tag = args.source_tag.strip()
-            if not tag:
+            if not tag or not _has_visible_content(tag):
                 raise ExtractionError(
-                    "--source-tag vide ou réduit à des espaces ; valeur refusée")
+                    "--source-tag vide, réduit à des espaces, ou constitué "
+                    "uniquement de caractères invisibles (ex: U+200B) ; "
+                    "valeur refusée")
             for l in lessons:
                 apply_source_tag(l, tag)
     except (ExtractionError, LessonError) as e:

@@ -2,8 +2,10 @@
 
 > Preuve par ablation de l'efficacité de la mémoire injectée. Chiffres
 > RÉELS produits par `factory/bin/ablation_checker.py` (bug-detector
-> déterministe, stdlib, scan statique, 8 règles validées par
-> `tests/test_ablation_checker.py` 22/22 OK). Aucun chiffre inventé.
+> déterministe, stdlib, **7 règles statiques sur 8 + L-16 comportementale**
+> (elle exécute le source de `acquire_lock` sous un faux `os`/`fcntl` pour
+> compter les fd réellement fermés — voir §7), 8 règles validées par
+> `tests/test_ablation_checker.py` 40/40 OK). Aucun chiffre inventé.
 > Trace d'exécution datée et reproductible archivée dans
 > `ablation/ABLATION_RUN_LOG.txt` (append-only **par convention d'écriture**,
 > NON tamper-evident, NON scellé cryptographiquement — voir §8 ; 2 blocs :
@@ -111,13 +113,28 @@ rappel de l'injecteur, pas du mécanisme de mémoire lui-même.
   produirait statistiquement au moins autant de défauts au bras A, plus
   probablement davantage. Inversement, aucun effet ne serait attributed
   à tort — le delta est réel (mesuré par detector objectif).
-- **Detector statique** : `ablation_checker.py` scanne le source, n'exécute
-  pas le code. Les défauts d'exécution non visibles dans le source
-  (deadlocks subtils, perf, comportement OS-spécifique) ne sont PAS
-  mesurés ici. Les 8 règles sont validées sur snippets défectueux ET
-  sains (22/22 tests, dont 5 tests de régression round-2 : hook no-op,
-  hook sans `.clear()`, flock hors `acquire_lock`, off-by-one de ligne
-  d'evidence) mais ne couvrent que les anti-patterns listés.
+- **Nature du detector** : `ablation_checker.py` combine **7 règles
+  statiques** (L-01/L-05/L-07/L-09/L-10/L-12/L-13 : regex / présence-absence
+  de tokens sur le source blanchi des commentaires) et **1 règle
+  comportementale, L-16**. L-16 **EXÉCUTE** le source de `acquire_lock` sous
+  un bac à sable qui fake `os`/`fcntl` (via `__import__` intercepté) pour
+  compter les fd réellement ouverts/fermés (P0 finding 4) : c'est le
+  comportement réel, pas le texte, qui décide si un filet large ferme le fd.
+  **Important pour cette ablation** : les deux bras n'ont qu'un `except
+  BlockingIOError` isolé et AUCUN filet large (`except OSError`/`finally`),
+  donc L-16 rend son verdict par sa branche **déterministe statique** —
+  l'exécution n'est PAS atteinte pour les bras mesurés ici, et les chiffres
+  A/B ci-dessus ne dépendent donc pas d'une exécution. Les défauts non
+  visibles dans le source (deadlocks subtils, perf, comportement OS-spécifique)
+  restent non mesurés. Les 8 règles sont validées sur snippets défectueux ET
+  sains (**40/40 tests**, incluant 4 mutants L-16 à fermeture textuelle mais
+  fuite réelle : `return False` sans close, `.close()` sur ressource sans
+  rapport, `if False: os.close(fd)` mortelle, `os.close(0)` mauvais fd).
+  Limite du bac à sable (honnête) : seuls `os`/`fcntl` sont fakes ; tout
+  autre effet de bord top-level d'un fichier analysé s'exécuterait réellement.
+  Dans cette ablation les sources analysées sont des fichiers contrôlés du
+  repo (les deux bras) — pas du code non fiable. Ne pointez pas le checker
+  sur du code adversarial sans isoler par subprocess/timeout.
 - **Pas de boucle reviewer** : la métrique « nombre de tours de review
   avant PASS » du master order §4 n'est pas mesurable en exécution
   headless autonome (pas de reviewer disponible dans la boucle d'ablation).

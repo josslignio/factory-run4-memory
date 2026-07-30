@@ -450,11 +450,16 @@ def _measure_acquire_lock_fd_closure(src: str):
     fuit. Le tracker ne doit créditer une fermeture QUE si elle cible un fd
     RÉELLEMENT ouvert (identité du fd), pas n'importe quel appel `os.close`.
 
-    Sandbox : exec dans un espace de noms frais, `__import__` intercepté pour
-    que `import os`/`import fcntl` retournent des fakes (aucun effet de bord
-    OS réel, aucune ressource OS touchée, aucun register_at_fork réel). Le
-    source exécuté est celui du fichier analysé : PAS une réimplémentation
-    recopiée."""
+    Sandbox : exec dans un espace de noms frais. `__import__` est intercepté en
+    LISTE BLANCHE : os/fcntl = fakes (aucun effet de bord OS réel, aucune
+    ressource OS touchée, aucun register_at_fork réel) ; pathlib autorisé (pur
+    calcul de chemins, requis par le bras GOOD_LOCK mesuré) ; tout autre module
+    REFUSÉ via ImportError. Les builtins dangereux (open/exec/eval/compile/input)
+    sont retirés -> pas d'I/O fichier ni d'exec de code arbitraire depuis le
+    source analysé (P1 audit Codex #2, reprise FAIL 27/07). Défense en profondeur,
+    pas une frontière de sécurité dure : pour du code adversarial, isoler par
+    subprocess/timeout. Le source exécuté est celui du fichier analysé : PAS une
+    réimplémentation recopiée."""
     import builtins
     from collections import Counter
 
@@ -534,14 +539,42 @@ def _measure_acquire_lock_fd_closure(src: str):
     fake_os = _FakeOs()
     real_import = builtins.__import__
 
+    # Reprise FAIL 27/07 (P1 audit Codex #2) : l'exécution du source analysé ne
+    # doit PAS permettre l'exécution de code arbitraire local. On restreint
+    # DEUX vecteurs d'effets de bord :
+    #   (a) __import__ en mode LISTE BLANCHE : os/fcntl = fakes ; pathlib = réel
+    #       et sûr (pur calcul de chemins, nécessaire au bras GOOD_LOCK mesuré,
+    #       qui fait `from pathlib import Path` + Path.resolve()). TOUT autre
+    #       module (subprocess, socket, shutil, ctypes,…) est REFUSÉ via
+    #       ImportError -> un source hostile ne peut pas obtenir de handle vers
+    #       ces modules. L'ancien code laissait passer `real_import` pour tout
+    #       module non-os/fcntl -> import subprocess exécuté pour réel.
+    #   (b) builtins dangereux retirés (open/exec/eval/compile/input/…) -> un
+    #       source hostile ne peut ni lire/écrire de fichiers ni exécuter du
+    #       code via ces primitives. compile/exec sont ceux du CHEF de mesure
+    #       (portée réelle), pas du source exécuté (portée `bi`).
+    # Les bras réels d'ablation n'ont qu'un `except BlockingIOError` isolé (pas
+    # de filet large) -> cette mesure n'est JAMAIS appelée sur eux : les chiffres
+    # A/B n'en dépendent pas (cf. §7 RUN4_ABLATION_AB.md). Défense en profondeur,
+    # pas une frontière de sécurité dure : pour du code adversarial, isoler par
+    # subprocess/timeout (limite V1 assumée et documentée).
+    _ALLOWED_REAL_MODULES = {"pathlib"}
+
     def _import(name, *a, **k):
         if name == "os":
             return fake_os
         if name == "fcntl":
             return _FakeFcntl
-        return real_import(name, *a, **k)
+        if name in _ALLOWED_REAL_MODULES:
+            return real_import(name, *a, **k)
+        raise ImportError(
+            f"import du module '{name}' interdit dans le bac à sable de la "
+            f"mesure comportementale L-16 (liste blanche : os, fcntl, pathlib)")
 
     bi = dict(vars(builtins))
+    for _dangerous in ("open", "exec", "eval", "compile", "input",
+                       "breakpoint", "exit", "quit"):
+        bi.pop(_dangerous, None)
     bi["__import__"] = _import
     g = {"__builtins__": bi, "__name__": "uut"}
     try:

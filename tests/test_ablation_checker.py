@@ -954,5 +954,120 @@ class TestCheckerReadFailureIsClean(unittest.TestCase):
         self.assertEqual(rc, 1, "source illisible -> rc=1 propre (pas de traceback)")
 
 
+# ===================================================================
+# Reprise FAIL 27/07 (P1 audit Codex #2) : la mesure comportementale L-16
+# exécute le source analysé dans un bac à sable. Ce bac à sable DOIT neutraliser
+# les effets de bord malveillants au top-level (I/O fichier via builtins.open,
+# import de modules dangereux comme subprocess). Avant le durcissement, seuls
+# os/fcntl étaient fakes -> `import subprocess` et `open(...)` au top-level
+# s'exécutaient POUR DE VRAI (vecteur d'exécution de code local). Preuve RÉELLE.
+# ===================================================================
+
+class TestMeasureSandboxNeutralizesMaliciousToplevel(unittest.TestCase):
+    """Le bac à sable de _measure_acquire_lock_fd_closure doit empêcher un
+    source analysé d'avoir des effets de bord au top-level (P1 audit Codex #2).
+
+    Preuve réelle : un snippet hostile tente d'écrire un fichier marqueur via
+    builtins.open et d'importer subprocess ; on vérifie qu'aucun des deux ne se
+    produit (open retiré des builtins, subprocess refusé par la liste blanche)."""
+
+    def setUp(self):
+        fd, p = tempfile.mkstemp(suffix=".marker")
+        import os as _os
+        _os.close(fd)
+        self.marker = Path(p)
+        self.marker.unlink()   # mkstemp le crée vide : on part d'un fichier absent
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        try:
+            self.marker.unlink()
+        except OSError:
+            pass
+
+    # Snippet hostile : au top-level, il tente (a) d'écrire un fichier marqueur
+    # via builtins.open, (b) d'importer subprocess. Bac à sable durci -> les
+    # DEUX neutralisés. On n'utilise PAS .format() (le dict literal `{}` lève
+    # conflit) mais .replace() d'un jeton unique.
+    _TEMPLATE = '''
+import os, fcntl
+open("@@MARKER@@", "w").write("pwned")   # vecteur I/O fichier (builtins.open)
+import subprocess                          # vecteur import dangereux
+
+_LOCK_FDS = {}
+
+def acquire_lock(lockfile):
+    key = lockfile
+    if key in _LOCK_FDS:
+        return True
+    fd = os.open(lockfile, os.O_CREAT | os.O_WRONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    except OSError:
+        return False
+    _LOCK_FDS[key] = fd
+    return True
+'''
+
+    def test_file_io_toplevel_neutralized(self):
+        # builtins.open est retiré du bac à sable -> open(marker) lève NameError
+        # au top-level -> AUCUN fichier marqueur créé (preuve réelle : le FS).
+        src = self._TEMPLATE.replace("@@MARKER@@", str(self.marker))
+        result = chk._measure_acquire_lock_fd_closure(src)
+        self.assertFalse(self.marker.exists(),
+                         "open(marker) au top-level ne doit PAS créer de fichier "
+                         "(builtins.open retiré du bac à sable)")
+        # La mesure échoue proprement (None) sans crasher.
+        self.assertIsNone(result,
+                          "la mesure doit retourner None proprement (exec avorté "
+                          "au top-level avant acquire_lock), pas crasher")
+
+    def test_dangerous_import_neutralized(self):
+        # Un snippet dont le top-level importe subprocess (refusé par la liste
+        # blanche) -> ImportError -> la mesure retourne None proprement ; le
+        # source n'est JAMAIS exécuté au-delà de l'import hostile.
+        src = '''
+import subprocess
+
+def acquire_lock(lockfile):
+    return True
+'''
+        result = chk._measure_acquire_lock_fd_closure(src)
+        self.assertIsNone(result,
+                          "import subprocess (refusé par la liste blanche) -> "
+                          "mesure retourne None proprement, pas d'exécution")
+
+    def test_safe_snippet_still_measured_after_hardening(self):
+        # Non-régression : un source SÛR (filet large + os.close(fd), n'importe
+        # que os/fcntl) reste mesuré correctement -> True (fd réellement fermé).
+        # Le durcissement ne casse pas la mesure légitime (essentiel : c'est le
+        # cœur comportemental de la règle L-16, P0 finding 4).
+        safe = '''
+import os, fcntl
+_LOCK_FDS = {}
+def acquire_lock(lockfile):
+    key = lockfile
+    if key in _LOCK_FDS:
+        return True
+    fd = os.open(lockfile, os.O_CREAT | os.O_WRONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return False
+    except BaseException:
+        os.close(fd)
+        raise
+    _LOCK_FDS[key] = fd
+    return True
+'''
+        result = chk._measure_acquire_lock_fd_closure(safe)
+        self.assertIs(result, True,
+                      "le source sûr (filet large + os.close(fd)) doit rester "
+                      f"mesuré True (fd fermé réellement), eu {result}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

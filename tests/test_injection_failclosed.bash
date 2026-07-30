@@ -178,8 +178,32 @@ fi
 # 5. DOCUMENTATION — le contrat est tracé fichier:ligne (règle 4, L-049).
 #    Le driver documente lui-même la garde (commentaire MASTER_ORDER).
 # ====================================================================
+# ====================================================================
+# 5. DOCUMENTATION — le contrat est tracé fichier:ligne (règle 4, L-049).
+#    Le driver documente lui-même la garde (commentaire MASTER_ORDER).
+# ====================================================================
 grep -qE 'Garde m.moire fail-closed AVANT tout appel agent' "$DRV" \
   && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: documentation garde mémoire absente"; }
+
+# ====================================================================
+# 6. BORNE P1 « retrieval max 5 leçons » : le défaut CLI --top du driver
+#    (qui n'a pas de --top explicite) est 5, et la sortie quiet est bornée
+#    à 5 leçons même quand >5 matchent. Mémoire de test avec 10 leçons
+#    toutes matchées par une tâche large (la mémoire réelle n'est pas touchée).
+# ====================================================================
+BOUND_MEM="$TMP/bound.jsonl"
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  printf '{"id":"L-20260730T000000Z-%02d","date":"2026-07-30","source":"p","category":"concurrency","trigger_pattern":"fork-os; lock-file","description":"d","fix_pattern":"f","severity":"P2","evidence":"a.py:1"}\n' "$i" >> "$BOUND_MEM"
+done
+# (a) illimité (--top 0) -> les 10 matchent (preuve que >5 matchent vraiment) :
+N_UNLIM=$(python3 "$INJ" "fork-os lock-file concurrency" --format quiet --memory "$BOUND_MEM" --top 0 | grep -c .)
+chk "bound_unlimited_10_match" "$N_UNLIM" "10"
+# (b) DÉFAUT (pas de --top, comme le driver) -> borné à 5 :
+N_DEFAULT=$(python3 "$INJ" "fork-os lock-file concurrency" --format quiet --memory "$BOUND_MEM" | grep -c .)
+chk "bound_default_caps_at_5" "$N_DEFAULT" "5"
+# (c) --top 3 -> exactement 3 (la borne est bien appliquée) :
+N_TOP3=$(python3 "$INJ" "fork-os lock-file concurrency" --format quiet --memory "$BOUND_MEM" --top 3 | grep -c .)
+chk "bound_top3_caps_at_3" "$N_TOP3" "3"
 
 echo ""
 echo "Injection fail-closed (P1 fonction 4): PASS=$pass FAIL=$fail"

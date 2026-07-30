@@ -99,38 +99,40 @@ chk "tr_done_to_running_BAD"     "$(legal_transition DONE RUNNING)"             
 chk "tr_unknown_from_BAD"        "$(legal_transition BOGUS RUNNING)"                            "illegal"
 chk "tr_unknown_to_BAD"          "$(legal_transition RUNNING BOGUS)"                            "illegal"
 
-# --- P0 finding 6 : INTÉGRATION de la transition dans main(). On reproduit
-# EXACTEMENT la séquence de tête de boucle de main() (lire ST, comparer à
-# PREV_ST, appeler legal_transition) avec les VRAIES fonctions du pilote sur
-# un STATE_FILE réel. Prouve qu'une transition légale est acceptée et qu'une
-# transition illégale injectée par un « builder » est détectée (BLOCK) — donc
-# main() n'accepte plus silencieusement n'importe quel état. ---
-loop_top_guard() {  # reproduit le garde-boucle de main(): renvoie ACCEPT|BLOCK
-  local st prev="$1"
-  st="$(read_state)"
-  if [ "$st" != "$prev" ] && [ "$(legal_transition "$prev" "$st")" = "illegal" ]; then
-    printf 'BLOCK'
-  else
-    printf 'ACCEPT'
-  fi
-}
-# scénario légal : RUNNING -> READY_FOR_FINAL_AUDIT (builder déclare fin de phase)
-echo "RUNNING" > "$STATE_FILE"; _PREV="$(read_state)"
-echo "READY_FOR_FINAL_AUDIT" > "$STATE_FILE"
-chk "loop_legal_transition_accepted" "$(loop_top_guard "$_PREV")" "ACCEPT"
-# scénario illégal : RUNNING -> WAITING_HUMAN_BOSS_GO (builder injecte un
-# terminal succès en plein build -> doit être refusé, pas un arrêt muet)
-echo "RUNNING" > "$STATE_FILE"; _PREV="$(read_state)"
-echo "WAITING_HUMAN_BOSS_GO" > "$STATE_FILE"
-chk "loop_illegal_transition_blocked" "$(loop_top_guard "$_PREV")" "BLOCK"
+# --- P0 finding 6 : test RÉEL du garde de production (contre-audit Codex
+# PHASE_P0_FAIL : « la machine à états n'est pas testée par une exécution
+# réelle de main() »). On appelle le VRAI enforce_legal_transition_or_die —
+# la fonction que main() utilise EN TÊTE DE BOUCLE — dans un sous-shell pour
+# capturer son code de sortie. Plus aucune reproduction locale du garde :
+# c'est le code de production qui s'exécute. Une transition légale -> exit 0
+# (acceptée) ; une transition illégale -> exit 1 (fail-closed, le pilote ne
+# répare JAMAIS silencieusement un état invalide). ---
+# transition légale : RUNNING -> READY_FOR_FINAL_AUDIT (builder déclare fin).
+( enforce_legal_transition_or_die RUNNING READY_FOR_FINAL_AUDIT )
+chk "prod_guard_legal_transition_exit0" "$?" "0"
+# transition légale identité : RUNNING -> RUNNING.
+( enforce_legal_transition_or_die RUNNING RUNNING )
+chk "prod_guard_identity_exit0" "$?" "0"
+# transition illégale : RUNNING -> WAITING_HUMAN_BOSS_GO (un builder injecte
+# un terminal succès en plein build -> le vrai garde de main() doit REFUSER,
+# pas un arrêt muet).
+( enforce_legal_transition_or_die RUNNING WAITING_HUMAN_BOSS_GO )
+chk "prod_guard_illegal_transition_exit1" "$?" "1"
+# transition illégale : READY_FOR_FINAL_AUDIT -> WAITING_INFRA (saut interdit).
+( enforce_legal_transition_or_die READY_FOR_FINAL_AUDIT WAITING_INFRA )
+chk "prod_guard_illegal_ready_to_infra_exit1" "$?" "1"
+# état illégal depuis n'importe où : BOGUS -> RUNNING.
+( enforce_legal_transition_or_die BOGUS RUNNING )
+chk "prod_guard_illegal_from_bogus_exit1" "$?" "1"
 
-# preuve structurelle : main() doit RÉELLEMENT appeler legal_transition (sinon
-# le garde est mort-né — précisément le finding « les tests ne couvrent jamais
-# les transitions réelles de main »). On exige la forme d'appel exacte.
-if grep -q 'legal_transition "$PREV_ST" "$ST"' "$REPO/run_run4_autonomous.sh"; then
+# preuve structurelle : main() doit RÉELLEMENT appeler le garde de production
+# en tête de boucle (sinon le garde est mort-né — précisément le finding
+# « les tests ne couvrent jamais les transitions réelles de main »). On exige
+# la forme d'appel exacte.
+if grep -q 'enforce_legal_transition_or_die "$PREV_ST" "$ST"' "$REPO/run_run4_autonomous.sh"; then
   pass=$((pass+1))
 else
-  fail=$((fail+1)); echo "FAIL: main() n'appelle pas legal_transition (garde de transition absent)"
+  fail=$((fail+1)); echo "FAIL: main() n'appelle pas enforce_legal_transition_or_die (garde de transition absent)"
 fi
 
 echo "PASS=$pass FAIL=$fail"

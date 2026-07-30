@@ -152,6 +152,23 @@ legal_transition() {
   printf 'illegal'
 }
 
+# --- P0 finding 6 (garde-boucle testable) : applique la transition légale.
+# C'est le GARDE RÉEL de tête de boucle de main() : toute transition
+# `prev -> st` non listée par legal_transition est ILLÉGALE -> exit 1
+# (fail-closed). Le pilote ne répare JAMAIS silencieusement un état invalide.
+# Extrait en fonction nommée (vs inline) pour que tests/test_driver_helpers.bash
+# appelle le VRAI garde de production (pas une copie) — exigence « teste
+# réellement l'item » + contre-audit Codex (PHASE_P0_FAIL) : « la machine à
+# états n'est pas testée par une exécution réelle de main() ».
+enforce_legal_transition_or_die() {
+  local prev="$1" st="$2"
+  if [ "$st" != "$prev" ] && [ "$(legal_transition "$prev" "$st")" = "illegal" ]; then
+    echo "[$(date -u +%FT%TZ)] TRANSITION ILLÉGALE '$prev' -> '$st' dans $STATE_FILE -> arret fail-closed (aucune réparation silencieuse). Transitions légales : cf. MASTER_ORDER § MACHINE À ÉTATS + legal_transition." >> "$LOG"
+    echo "Transition illégale '$prev' -> '$st' dans $STATE_FILE -> arret fail-closed (voir MASTER_ORDER § MACHINE À ÉTATS). Aucune réinitialisation silencieuse." >&2
+    exit 1
+  fi
+}
+
 sha256_file() { python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1" 2>/dev/null; }
 
 # --- Verdict d audit par token EXACT en premiere ligne (PHASE_P0_PASS / PHASE_P1_PASS). ---
@@ -338,11 +355,9 @@ main() {
   # listée par legal_transition est ILLÉGALE -> arret fail-closed. Le pilote ne
   # répare JAMAIS silencieusement un état invalide (ex: un builder qui écrit
   # WAITING_HUMAN_BOSS_GO pendant la phase de build -> refus, pas d'arrêt muet).
-  if [ "$ST" != "$PREV_ST" ] && [ "$(legal_transition "$PREV_ST" "$ST")" = "illegal" ]; then
-    echo "[$(date -u +%FT%TZ)] TRANSITION ILLÉGALE '$PREV_ST' -> '$ST' dans $STATE_FILE (iter $i) -> arret fail-closed (aucune réparation silencieuse). Transitions légales : cf. MASTER_ORDER § MACHINE À ÉTATS + legal_transition." >> "$LOG"
-    echo "Transition illégale '$PREV_ST' -> '$ST' dans $STATE_FILE -> arret fail-closed (voir MASTER_ORDER § MACHINE À ÉTATS). Aucune réinitialisation silencieuse." >&2
-    exit 1
-  fi
+  # Le garde lui-même vit dans enforce_legal_transition_or_die (testé pour de
+  # vrai par tests/test_driver_helpers.bash).
+  enforce_legal_transition_or_die "$PREV_ST" "$ST"
   PREV_ST="$ST"
   case "$(state_kind "$ST")" in
     terminal)
@@ -360,26 +375,22 @@ main() {
         TOKEN="PHASE_P1_PASS"
         MAX_REPAIR="$MAX_P1_REPAIR"
       fi
-      echo "[$(date -u +%FT%TZ)] iter $i: GLM se declare pret -> audit final phase $PHASE (Claude + Codex, independants, lecture seule)" >> "$LOG"
-      claude -p "$PHASE_NOTE
-$FINAL_AUDIT_PROMPT" --dangerously-skip-permissions --allowedTools "Read Grep Glob" > "$AUDIT_CLAUDE" 2>>"$LOG" \
-        || echo "[$(date -u +%FT%TZ)] iter $i: audit claude rc non-zero" >> "$LOG"
+      echo "[$(date -u +%FT%TZ)] iter $i: GLM se declare pret -> audit final phase $PHASE (Codex seul, reviewer independant, lecture seule -- Claude retire de la boucle de review sur demande explicite Jocelyn, economie de quota)" >> "$LOG"
       codex exec -s read-only --skip-git-repo-check "$PHASE_NOTE
 $FINAL_AUDIT_PROMPT" > "$AUDIT_CODEX" 2>>"$LOG" \
         || echo "[$(date -u +%FT%TZ)] iter $i: audit codex rc non-zero" >> "$LOG"
-      if phase_audit_ok "$AUDIT_CLAUDE" "$TOKEN" && phase_audit_ok "$AUDIT_CODEX" "$TOKEN"; then
+      if phase_audit_ok "$AUDIT_CODEX" "$TOKEN"; then
         if [ "$PHASE" = "P0" ]; then
           mkdir -p "$RECEIPTS_DIR/checkpoint_p0"
-          cp "$AUDIT_CLAUDE" "$AUDIT_CODEX" "$RECEIPTS_DIR/checkpoint_p0/" 2>>"$LOG"
+          cp "$AUDIT_CODEX" "$RECEIPTS_DIR/checkpoint_p0/" 2>>"$LOG"
           WT_DIRTY=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
           if [ "${WT_DIRTY:-0}" -eq 0 ]; then WT_STATE="clean"; WT_DIFF_SHA=""; else
             WT_STATE="dirty"
             WT_DIFF_SHA=$(git diff 2>/dev/null | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')
             echo "[$(date -u +%FT%TZ)] AVERTISSEMENT checkpoint P0: worktree non propre (diff sha256=$WT_DIFF_SHA consigne)" >> "$LOG"
           fi
-          printf '{"phase":"P0","commit":"%s","timestamp":"%s","worktree":"%s","diff_sha256":"%s","audit_sha256":{"%s":"%s","%s":"%s"}}\n' \
+          printf '{"phase":"P0","commit":"%s","timestamp":"%s","worktree":"%s","diff_sha256":"%s","audit_sha256":{"%s":"%s"}}\n' \
             "$(git rev-parse HEAD)" "$(date -u +%FT%TZ)" "$WT_STATE" "$WT_DIFF_SHA" \
-            "$(basename "$AUDIT_CLAUDE")" "$(sha256_file "$RECEIPTS_DIR/checkpoint_p0/$(basename "$AUDIT_CLAUDE")")" \
             "$(basename "$AUDIT_CODEX")" "$(sha256_file "$RECEIPTS_DIR/checkpoint_p0/$(basename "$AUDIT_CODEX")")" \
             > "$RECEIPTS_DIR/checkpoint_p0/checkpoint.json"
           echo "P1" > "$PHASE_FILE"
@@ -455,7 +466,7 @@ $FINAL_AUDIT_PROMPT" > "$AUDIT_CODEX" 2>>"$LOG" \
   fi
   ensure_build_branch   # D-001 : GLM doit rester hors de main
 
-  echo "[$(date -u +%FT%TZ)] iter $i -> review de tranche Claude + Codex (independants, en parallele, lecture seule)" >> "$LOG"
+  echo "[$(date -u +%FT%TZ)] iter $i -> review de tranche Codex seul (independant, lecture seule -- Claude retire de la boucle de review)" >> "$LOG"
 
   # D-002 : diff du dernier commit embarqué dans le prompt (les reviewers n'ont que Read/Grep/Glob).
   if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
@@ -474,17 +485,13 @@ $DIFF
 ------------------8<------------------
 $([ "$DIFF_TRUNC" = 1 ] && echo "(DIFF TRONQUE - ouvre les fichiers pertinents via Read pour le detail.)")"
 
-  claude -p "$REVIEW_PROMPT" --dangerously-skip-permissions --allowedTools "Read Grep Glob" > "$REVIEW_CLAUDE" 2>>"$LOG" &
-  PID_CLAUDE=$!
-  codex exec -s read-only --skip-git-repo-check "$REVIEW_PROMPT" > "$REVIEW_CODEX" 2>>"$LOG" &
-  PID_CODEX=$!
-  wait "$PID_CLAUDE" 2>/dev/null || echo "[$(date -u +%FT%TZ)] iter $i: review claude rc non-zero" >> "$LOG"
-  wait "$PID_CODEX" 2>/dev/null || echo "[$(date -u +%FT%TZ)] iter $i: review codex rc non-zero" >> "$LOG"
+  codex exec -s read-only --skip-git-repo-check "$REVIEW_PROMPT" > "$REVIEW_CODEX" 2>>"$LOG"
+  wait 2>/dev/null || echo "[$(date -u +%FT%TZ)] iter $i: review codex rc non-zero" >> "$LOG"
 
   # D-005 : un reviewer muet = echec infra (pas de relance immédiate admise).
-  if [ ! -s "$REVIEW_CLAUDE" ] || [ ! -s "$REVIEW_CODEX" ]; then
+  if [ ! -s "$REVIEW_CODEX" ]; then
     infra_fails=$((infra_fails+1))
-    echo "[$(date -u +%FT%TZ)] iter $i: review vide (claude=$( [ -s "$REVIEW_CLAUDE" ] && echo ok || echo vide ), codex=$( [ -s "$REVIEW_CODEX" ] && echo ok || echo vide )), infra_fails=$infra_fails/$MAX_INFRA_FAILS" >> "$LOG"
+    echo "[$(date -u +%FT%TZ)] iter $i: review codex vide, infra_fails=$infra_fails/$MAX_INFRA_FAILS" >> "$LOG"
     if [ "$infra_fails" -gt "$MAX_INFRA_FAILS" ]; then
       echo "WAITING_INFRA" > "$STATE_FILE"
       echo "[$(date -u +%FT%TZ)] $MAX_INFRA_FAILS echecs infra consecutifs -> STATE=WAITING_INFRA -> arret" >> "$LOG"

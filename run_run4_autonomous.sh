@@ -310,6 +310,119 @@ build_cur_prompt() {
   fi
 }
 
+# ====================================================================
+# D-013-ter (audit défensif complet de la mécanique stall/redirect) :
+# écriture atomique + nettoyage crash-safe des fichiers d'état de la redirection
+# (pending_redirect_PHASE.txt, redirect_attempt_PHASE.used, last_audit_PHASE.sha256).
+# Ces helpers ne touchent NI à la logique de décision (stall_action), NI à
+# build_cur_prompt, NI à FIX1/FIX2/FIX3, NI à D-001..D-012, NI à la machine à
+# états (state_kind/legal_transition/enforce_legal_transition_or_die) : ils ne
+# font que rendre atomiques et crash-safe les ÉCRITURES/SUPPRESSIONS de ces
+# fichiers. Testés réellement (nominal + simulation crash/interruption) par
+# tests/test_driver_helpers.bash.
+# ====================================================================
+
+# atomic_write_exact : écrit <content> À L'IDENTIQUE (aucun newline ajouté) dans
+# <path> via le pattern tmp-puis-mv (atomique au sens POSIX rename). Indispensable
+# pour last_audit_PHASE.sha256 dont la comparaison est byte-exacte (un newline
+# parasite casserait audit_same_as_previous -> faux négatif de stall). Retourne 0
+# si ok, 1 sinon (logge l'échec + purge le tmp ; l'appelant décide du fail-closed).
+atomic_write_exact() {
+  local path="$1" content="$2" tmp rc
+  tmp="${path}.tmp.$$"
+  if printf '%s' "$content" > "$tmp" 2>>"$LOG"; then
+    if mv -f "$tmp" "$path" 2>>"$LOG"; then
+      return 0
+    fi
+  fi
+  rc=$?
+  rm -f "$tmp" 2>/dev/null || true
+  echo "[$(date -u +%FT%TZ)] atomic_write_exact ECHEC sur $path (rc=$rc) -> fichier NON ecrit, tmp purge" >> "$LOG"
+  return 1
+}
+
+# purge_file_logged : supprime <path> SANS avaler l'erreur (remplace les
+# 'rm -f ... 2>/dev/null' muets sur les fichiers d'état de redirection). Logge
+# explicitement la suppression réussie et l'échec éventuel. Retourne 0 si le
+# fichier n'existe plus après (ou n'existait pas), 1 si la suppression a échoué.
+purge_file_logged() {
+  local path="$1" label="${2:-$1}"
+  [ -e "$path" ] || return 0
+  if rm -f "$path" 2>>"$LOG"; then
+    echo "[$(date -u +%FT%TZ)] purge $label : supprime ($path)" >> "$LOG"
+    return 0
+  fi
+  echo "[$(date -u +%FT%TZ)] purge $label : ECHEC suppression ($path)" >> "$LOG"
+  return 1
+}
+
+# enter_scoped_purge / exit_scoped_purge : pour la section critique (appel
+# opencode run), on ÉTEND temporairement le trap EXIT global du driver (SANS
+# remplacer sa déclaration dans main : on sauvegarde l'état exact des traps
+# EXIT/INT/TERM/HUP puis on le RESTAURE à l'identique après la section) afin que
+# <file> soit purgé même si le pilote est tué (SIGTERM/SIGINT/SIGHUP -> tous
+# 'exit 143' -> EXIT) ou crashe pendant la section. Les traps INT/TERM/HUP
+# eux-mêmes ne sont PAS modifiés : leur 'exit 143' global funnel vers EXIT, donc
+# la purge se déclenche quand même sur signal.
+_SCP_FILE=""; _SCP_SAVED=""
+enter_scoped_purge() {
+  _SCP_FILE="$1"
+  _SCP_SAVED="$(trap -p EXIT INT TERM HUP)"
+  # EXIT augmenté : purge le fichier PUIS invoque le cleanup original du driver
+  # (verrou + heartbeat). On rappelle cleanup explicitement car ré-armer un trap
+  # pendant un EXIT en cours ne l'exécute pas une seconde fois.
+  trap 'rm -f "$_SCP_FILE" 2>/dev/null || true; cleanup' EXIT
+}
+exit_scoped_purge() {
+  local line
+  trap - EXIT INT TERM HUP
+  while IFS= read -r line; do
+    [ -n "$line" ] && eval "$line"
+  done <<SCPHEREDOC
+$_SCP_SAVED
+SCPHEREDOC
+  _SCP_FILE=""; _SCP_SAVED=""
+}
+
+# commit_redirect : engagement TRANSACTIONNEL et atomique d'une redirection
+# chirurgicale. Écrit pending_redirect (tmp-puis-mv atomique) PUIS touche le
+# flag, le tout sous un scoped trap qui ROLLBACK (supprime pending + tmp + flag)
+# sur interruption entre les deux écritures -> JAMAIS d'état inconsistent :
+#   - jamais pending sans flag (re-injection + 2e redirection autorisée),
+#   - jamais flag sans pending (FAIL sans avoir délivré la redirection).
+# Ordre pending-puis-flag : en cas de signal non rattrapable (SIGKILL, hors
+# scope du trap), la fenêtre résiduelle laisse au pire pending-sans-flag (la
+# redirection est re-délivrée une fois, moins dangereux que flag-sans-pending
+# qui perdrait la tentative). Retourne 0 si ok, 1 sinon (fail-closed :
+# l'appelant ne doit PAS compter la redirection comme engagée).
+CR_SAVED=""; CR_PENDING=""; CR_TMP=""; CR_FLAG=""
+commit_redirect() {
+  local pending="$1" flag="$2" content="$3"
+  CR_SAVED="$(trap -p EXIT INT TERM HUP)"
+  CR_PENDING="$pending"; CR_TMP="${pending}.tmp.$$"; CR_FLAG="$flag"
+  # scoped rollback EXIT : interruption (signal -> exit 143 -> EXIT, ou crash)
+  # entre l'écriture de pending et le touch du flag -> on retire TOUT.
+  trap 'rm -f "$CR_PENDING" "$CR_TMP" "$CR_FLAG" 2>/dev/null || true' EXIT
+  printf '%s\n' "$content" > "$CR_TMP" 2>>"$LOG" || { _commit_redirect_fail; return 1; }
+  mv -f "$CR_TMP" "$pending" 2>>"$LOG"        || { _commit_redirect_fail; return 1; }
+  touch "$flag" 2>>"$LOG"                     || { _commit_redirect_fail; return 1; }
+  _cr_restore
+  return 0
+}
+_commit_redirect_fail() {
+  rm -f "$CR_TMP" "$CR_PENDING" 2>/dev/null || true
+  _cr_restore
+}
+_cr_restore() {
+  local line
+  trap - EXIT INT TERM HUP
+  while IFS= read -r line; do
+    [ -n "$line" ] && eval "$line"
+  done <<CRHEREDOC
+$CR_SAVED
+CRHEREDOC
+}
+
 # Decision de stall en 2 temps (D-013). Entrees :
 #   $1 = code retour du predicat audit_same_as_previous (0 = stalled, autre = non).
 #   $2 = chemin du flag redirect_attempt_PHASE.used.
@@ -577,7 +690,10 @@ $FINAL_AUDIT_PROMPT" > "$AUDIT_CODEX" 2>>"$LOG" \
             "$(basename "$AUDIT_CODEX")" "$(sha256_file "$RECEIPTS_DIR/checkpoint_p0/$(basename "$AUDIT_CODEX")")" \
             > "$RECEIPTS_DIR/checkpoint_p0/checkpoint.json"
           echo "P1" > "$PHASE_FILE"
-          rm -f "$RECEIPTS_DIR/last_audit_P0.sha256" "$RECEIPTS_DIR/last_audit_P1.sha256" 2>/dev/null
+          # D-013-ter : purge explicite + loggee des stall files (plus de
+          # 'rm -f ... 2>/dev/null' muet) a la transition P0 -> P1.
+          purge_file_logged "$RECEIPTS_DIR/last_audit_P0.sha256" "last_audit_P0 (transition P0->P1)"
+          purge_file_logged "$RECEIPTS_DIR/last_audit_P1.sha256" "last_audit_P1 (transition P0->P1)"
           audit_repairs=0
           echo "RUNNING" > "$STATE_FILE"
           echo "[$(date -u +%FT%TZ)] audit P0 OK (Codex seul) -> checkpoint P0 fige dans $RECEIPTS_DIR/checkpoint_p0 -> PHASE=P1, STATE=RUNNING" >> "$LOG"
@@ -626,8 +742,19 @@ $FINAL_AUDIT_PROMPT" > "$AUDIT_CODEX" 2>>"$LOG" \
           # resterait le BUILD_PROMPT statique et la redirection serait inerte
           # (GLM ne la verrait jamais). Le fichier est purge APRES l'appel
           # opencode run (usage unique).
-          printf '%s\n' "$REDIRECT_PROMPT" > "$RECEIPTS_DIR/pending_redirect_${PHASE}.txt"
-          touch "$REDIRECT_FLAG"
+          # D-013-ter : l'engagement (pending_redirect + flag redirect_attempt)
+          # est desormais TRANSACTIONNEL et atomique (commit_redirect) : aucune
+          # interruption (SIGTERM/SIGINT/crash) entre les deux écritures ne peut
+          # laisser un état inconsistent (rollback sous scoped trap). Échec
+          # d'écriture -> FAIL fail-closed (on ne peut pas engager la redirection
+          # sans risquer une boucle ou une perte silencieuse).
+          if commit_redirect "$RECEIPTS_DIR/pending_redirect_${PHASE}.txt" "$REDIRECT_FLAG" "$REDIRECT_PROMPT"; then
+            :
+          else
+            echo "FAIL" > "$STATE_FILE"
+            echo "[$(date -u +%FT%TZ)] STALL phase $PHASE : echec ecriture atomique (pending_redirect/redirect_attempt) -> STATE=FAIL fail-closed (redirection non engageable)" >> "$LOG"
+            exit 0
+          fi
           # NB : on NE consigne PAS le sha courant dans STALL_FILE et on N
           # incremente PAS audit_repairs. Le round de redirection doit etre
           # compare au MEME sha precedent (sinon un audit identique apres
@@ -649,12 +776,22 @@ $FINAL_AUDIT_PROMPT" > "$AUDIT_CODEX" 2>>"$LOG" \
           # redirection pour cette phase -- une NOUVELLE sequence de stall aura
           # droit a sa propre redirection (bornage par sequence, pas global).
           if [ -f "$REDIRECT_FLAG" ]; then
-            rm -f "$REDIRECT_FLAG"
+            # D-013-ter : purge explicite + loggee du flag (plus de rm muet).
+            purge_file_logged "$REDIRECT_FLAG" "redirect_attempt_${PHASE}.used (reset progres reel)"
             echo "[$(date -u +%FT%TZ)] phase $PHASE : audit different du precedent apres redirection -> progres reel, reset du flag redirect_attempt, boucle normale (budget audit_repairs standard)" >> "$LOG"
           fi ;;
       esac
       mkdir -p "$RECEIPTS_DIR"
-      printf '%s' "$(sha256_file "$AUDIT_CODEX")" > "$STALL_FILE"
+      # D-013-ter : écriture atomique (tmp-puis-mv) du sha : une écriture
+      # interrompue laisserait un sha partiel/vide -> audit_same_as_previous
+      # faussé (faux négatif de stall). Échec -> on purge le stall file (prochain
+      # round repart propre, pas de sha corrompu) + log explicite.
+      if atomic_write_exact "$STALL_FILE" "$(sha256_file "$AUDIT_CODEX")"; then
+        :
+      else
+        purge_file_logged "$STALL_FILE" "last_audit_${PHASE}.sha256"
+        echo "[$(date -u +%FT%TZ)] phase $PHASE : echec ecriture last_audit sha -> stall file purge, detection de stall reinitialisee au prochain round" >> "$LOG"
+      fi
       audit_repairs=$((audit_repairs+1))
       if [ "$audit_repairs" -gt "$MAX_REPAIR" ]; then
         echo "FAIL" > "$STATE_FILE"
@@ -714,13 +851,24 @@ $FINAL_AUDIT_PROMPT" > "$AUDIT_CODEX" 2>>"$LOG" \
   # D-013 etait structurellement presente mais fonctionnellement inerte.
   CUR_PROMPT="$(build_cur_prompt "$PHASE")"
   echo "[$(date -u +%FT%TZ)] iter $i (state=$ST, phase=$PHASE) -> GLM build (opencode, zai-coding-plan/glm-5.2 force)" >> "$LOG"
+  # D-013-ter : section critique. pending_redirect_PHASE.txt (s'il existe, ie
+  # juste apres une redirection D-013) doit etre purge meme si le pilote est tue
+  # (SIGTERM/SIGINT/SIGHUP) ou crashe pendant l'appel opencode run -- sinon la
+  # redirection fuierait vers un 2e tour (violation de l usage unique). On etend
+  # TEMPORAIREMENT le trap EXIT global (sauvegarde -> restauration exacte apres
+  # la section ; INT/TERM/HUP laisses intacts, ils funnel vers EXIT via 'exit
+  # 143'). Sans cette scoped trap, un kill pendant opencode laissait le fichier.
+  _prf="$RECEIPTS_DIR/pending_redirect_${PHASE}.txt"
+  enter_scoped_purge "$_prf"
   # ADAPTE CETTE LIGNE si le smoke-test opencode montre une autre syntaxe (mais garde TOUJOURS --model zai-coding-plan/*) :
   opencode run --model zai-coding-plan/glm-5.2 "$CUR_PROMPT" >> "$LOG" 2>&1
   rc=$?
-  # D-013-bis : purge du fichier pending_redirect APRES l'appel opencode run ->
-  # la redirection chirurgicale est consommee (GLM l a recue), usage UNIQUE :
-  # jamais de re-injection sur une iteration ulterieure.
-  rm -f "$RECEIPTS_DIR/pending_redirect_${PHASE}.txt" 2>/dev/null
+  # D-013-bis / D-013-ter : purge du fichier pending_redirect APRES l'appel
+  # opencode run -> la redirection chirurgicale est consommee (GLM l a recue),
+  # usage UNIQUE, jamais de re-injection. purge_file_logged : explicite + loggee
+  # (plus de 'rm -f ... 2>/dev/null' muet ; n avale pas l echec).
+  purge_file_logged "$_prf" "pending_redirect_${PHASE}"
+  exit_scoped_purge
   if [ "$rc" -eq 0 ]; then
     infra_fails=0
   else

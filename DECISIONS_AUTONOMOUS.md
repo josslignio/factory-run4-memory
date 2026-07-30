@@ -376,3 +376,114 @@ réversible, fail-closed, puis CONTINUE — master order §AUTONOMIE TOTALE).
   l'écriture du `pending_redirect`, l'appel `build_cur_prompt` ou le `rm -f`
   restore l'assignation statique de `CUR_PROMPT` sans toucher au reste de la
   machine à états ni à D-013).
+
+## D-013-ter — Audit défensif complet de la mécanique stall/redirect (écritures atomiques + nettoyage crash-safe + logging explicite)
+- **Contexte** : audit défensif des fichiers d'état de la redirection
+  (`pending_redirect_PHASE.txt`, `redirect_attempt_PHASE.used`,
+  `last_audit_PHASE.sha256`) introduits par D-013 / D-013-bis. La mécanique de
+  décision (`stall_action`) et le branchement (`build_cur_prompt`) étaient
+  corrects, mais les **écritures/suppressions** de ces fichiers n'étaient ni
+  atomiques ni crash-safe et avalaient les erreurs silencieusement. Problèmes
+  concrets trouvés et fixés :
+  1. **Purge non crash-safe de `pending_redirect` pendant `opencode run`** — la
+     purge (`rm -f ... 2>/dev/null`) ne se déclenchait qu'**après** le retour de
+     l'appel `opencode run`. Si le pilote était tué (`SIGTERM`/`SIGINT`/`SIGHUP`)
+     ou crashait **pendant** cet appel (fenêtre longue), le fichier survivait →
+     la redirection était **re-injectée** à l'itération suivante (violation de
+     l'usage unique, possible boucle de redirection déguisée). La suppression
+     `2>/dev/null` avalait en plus toute erreur.
+  2. **Exposition équivalente pour `redirect_attempt_PHASE.used` et
+     `last_audit_PHASE.sha256`** — même classe de défauts : écriture directe non
+     atomique (un `printf >` interrompu laisse un `sha256` partiel/vide →
+     `audit_same_as_previous` faussé = faux négatif de stall ; un `touch`/`rm`
+     muet sans logging).
+  3. **Écritures non atomiques** — `pending_redirect`, `last_audit` étaient
+     écrits par redirection directe (`printf ... > file`), non via le pattern
+     tmp-puis-mv : une interruption mid-écriture laissait un fichier partiel.
+  4. **Erreurs avalées** — les `rm -f ... 2>/dev/null` et les échecs d'écriture
+     sur ces fichiers étaient ignorés silencieusement (violation du principe
+     fail-closed / logging explicite).
+  5. **Race entre l'écriture de `pending_redirect` et le `touch` du flag
+     `redirect_attempt`** — dans la branche `redirect`, les deux écritures étaient
+     consécutives mais non transactionnelles : une interruption **entre** les
+     deux laissait un état **inconsistent** (`pending` sans flag = re-injection
+     + 2e redirection autorisée ; ou flag sans `pending` = `FAIL` sans avoir
+     délivré la redirection).
+- **Décision (option la plus sûre, réversible, fail-closed, puis CONTINUE)** :
+  rendre atomiques et crash-safe **uniquement les écritures/suppressions** de ces
+  fichiers, **sans toucher** à la logique de décision (`stall_action`), ni à
+  `build_cur_prompt`, ni à FIX1/FIX2/FIX3, ni à D-001..D-012, ni à la machine à
+  états (`state_kind`/`legal_transition`/`enforce_legal_transition_or_die`). Quatre
+  helpers testables (`atomic_write_exact`, `purge_file_logged`,
+  `enter_scoped_purge`/`exit_scoped_purge`, `commit_redirect`) sont extraits du
+  pilote pour être testés réellement :
+  1. **Purge crash-safe via scoped trap (point 1)** — autour de l'appel
+     `opencode run`, `enter_scoped_purge <file>` **étend temporairement** le trap
+     `EXIT` global du driver (en y ajoutant la purge du fichier, **puis** le
+     cleanup original) **sans remplacer sa déclaration dans `main()`** :
+     sauvegarde exacte des traps `EXIT/INT/TERM/HUP` (`trap -p`), installation du
+     trap scoped, puis `exit_scoped_purge` **restaure à l'identique**. Les traps
+     `INT/TERM/HUP` eux-mêmes ne sont **pas** modifiés : leur `exit 143` global
+     funnel vers `EXIT`, donc la purge se déclenche quand même sur signal. Un
+     `SIGTERM` pendant `opencode run` purge donc le fichier **et** chaîne le
+     cleanup (verrou + heartbeat) — la redirection ne peut plus fuiter.
+  2. **Traitement crash-safe équivalent pour `redirect_attempt` et `last_audit`
+     (point 2)** — écritures via `commit_redirect` (transaction, voir point 5)
+     / `atomic_write_exact`, purges via `purge_file_logged` (reset du flag en cas
+     de progrès réel, reset des stall files à la transition P0→P1).
+  3. **Écritures atomiques tmp-puis-mv (point 3)** — `atomic_write_exact`
+     écrit le contenu **à l'identique** (aucun newline ajouté — critique pour le
+     SHA byte-exact de `last_audit`) dans `<path>.tmp.$$` puis `mv -f` (atomique
+     POSIX rename) ; `commit_redirect` persiste `pending_redirect` via le même
+     pattern. Le `touch` du flag reste atomique par nature (création d'inode).
+  4. **Logging explicite + fail-closed (point 4)** — `purge_file_logged` remplace
+     tous les `rm -f ... 2>/dev/null` muets sur ces fichiers (loggé en cas de
+     suppression réussie **et** d'échec, retourne 1 sur échec). Les échecs
+     d'écriture sont fail-closed là où c'est approprié : échec de
+     `commit_redirect` en branche `redirect` → `STATE=FAIL` + `exit 0` (on ne
+     peut pas engager la redirection sans risquer une boucle) ; échec d'écriture
+     du `last_audit` sha → purge du stall file + log (le prochain round repart
+     propre, pas de sha corrompu faussant la détection de stall).
+  5. **Transaction atomique `pending_redirect` + `redirect_attempt` (point 5)** —
+     `commit_redirect(pending, flag, content)` engage les **deux** sous un scoped
+     trap qui **rollback** (supprime `pending` + tmp + flag) sur interruption
+     entre les deux écritures → **jamais** d'état inconsistent. Ordre
+     pending-puis-flag : la fenêtre résiduelle non rattrapable (`SIGKILL`, hors
+     scope de tout trap) laisse au pire `pending`-sans-flag (redirection
+     re-délivrée une fois — bénin, la purge crash-safe empêche la boucle) plutôt
+     que flag-sans-`pending` (qui perdrait la tentative). Retourne 0 si les deux
+     écritures réussissent, 1 sinon.
+- **Intact (confirmé par diff + tests)** : `stall_action` (logique de décision),
+  `build_cur_prompt`, `extract_findings`, `build_redirect_prompt`,
+  `audit_same_as_previous`, D-013 (décision en 2 temps, flag borné à 1,
+  FAIL au 2e stall), D-013-bis (branchement réel de la redirection), D-001 à
+  D-012, FIX1 (purge cache Codex), FIX2 (bruit CLI → `infra_fail`), FIX3 (noyau
+  de détection de stall), machine à états `MASTER_ORDER`
+  (`state_kind`/`legal_transition`/`enforce_legal_transition_or_die`). Le diff du
+  pilote ne supprime **que** les 9 anciennes lignes d'écriture/suppression
+  concernées (3 `printf`/`touch`, 4 `rm -f`, 2 blocs de commentaires) — aucune
+  ligne de logique de décision n'est modifiée. La contrainte Jocelyn reste
+  préservée : Claude hors du pilote, reviewer = Codex seul, redirection routée
+  vers GLM.
+- **Vérification réelle** : **155 pytest verts** (inchangés) + **245 checks bash
+  verts** (`test_driver_helpers.bash` : 211 driver dont **49 checks `d013ter`**
+  + `test_p0_reprise.bash` : 34). Les nouveaux tests ne se contentent pas de
+  preuves structurelles : (a) `atomic_write_exact` nominal/byte-exact/échec
+  rc=1+loggé/pas de tmp résiduel ; (b) `purge_file_logged`
+  nominal-loggé/absent-rc=0/échec-rc=1-loggé ; (c) **simulation SIGTERM réelle**
+  pendant la section critique → fichier scoped **purgé** + cleanup original
+  **chaîné**, et restauration **exacte** des traps après la section (avant ==
+  après) ; (d) `commit_redirect` nominal (pending+flag cohérents, contenu
+  correct)/échec rc=1 (rien créé)/**simulation crash réelle entre le `mv` du
+  pending et le `touch` du flag → rollback complet (ni pending ni flag ni tmp =
+  état consistent)** ; (e) régression : la redirection nominale fonctionne
+  toujours (`commit_redirect` produit un `pending` lisible par `build_cur_prompt`
+  avec le `BUILD_PROMPT` concaténé, flag posé). Les preuves structurelles
+  adaptées de D-013/D-013-bis (qui greppaient les anciennes écritures littérales)
+  vérifient désormais les nouveaux mécanismes (`commit_redirect`,
+  `purge_file_logged`, `enter/exit_scoped_purge`) — l'INTENTION comportementale
+  des tests D-013/D-013-bis est préservée.
+- **Réversible** : oui (chaque fix est un branchement isolé dans les helpers /
+  la branche `redirect` / la section `opencode` ; retirer un helper ou
+  restaurer l'ancienne écriture directe restore le comportement précédent sans
+  toucher à la logique de décision ni à la machine à états).

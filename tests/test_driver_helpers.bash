@@ -461,8 +461,8 @@ grep -qF 'REDIRECT_CHIRURGICAL (phase $PHASE' "$DRV" \
   && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013 branche redirect/REVIEW_CODEX absente du driver"; }
 grep -qF 'redirection chirurgicale vers GLM (1 seule tentative' "$DRV" \
   && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013 log de redirection STATE=RUNNING absent"; }
-grep -qF 'touch "$REDIRECT_FLAG"' "$DRV" \
-  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013 pose du flag redirect_attempt absent"; }
+grep -qF 'commit_redirect "$RECEIPTS_DIR/pending_redirect_${PHASE}.txt" "$REDIRECT_FLAG"' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013 pose du flag redirect_attempt absente (commit_redirect transactionnel)"; }
 
 # --- (b) apres redirection, audit SUIVANT encore identique (flag present) ->
 #     FAIL immediat ; message exact exige present dans le driver. ---
@@ -501,8 +501,8 @@ printf 'PHASE_P0_FAIL\nfactory/bin/x.py:42 : PARTIELLEMENT corrige (progres reel
 audit_same_as_previous "$SF_C" "$TMP/d013_c_r3"; chk "d013_c_r3_not_stalled_progress" "$?" "1"
 chk "d013_c_r3_action_normal" "$(stall_action 1 "$TMP/d013_c.used")" "normal"
 # main() reset le flag sur progres reel -> une NOUVELLE sequence a droit a sa redirection :
-grep -qF 'rm -f "$REDIRECT_FLAG"' "$DRV" \
-  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013 reset du flag redirect_attempt absent du driver"; }
+grep -qF 'purge_file_logged "$REDIRECT_FLAG"' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013 reset du flag redirect_attempt absent du driver (purge_file_logged)"; }
 grep -qF 'progres reel, reset du flag redirect_attempt, boucle normale (budget audit_repairs standard)' "$DRV" \
   && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013 log de reset flag (progres) absent"; }
 
@@ -522,15 +522,15 @@ chk "d013_tbl_stalled_noflag_redirect"   "$(stall_action 0 "$TMP/d013_tbl.used")
 touch "$TMP/d013_tbl.used"
 chk "d013_tbl_notstalled_flag_normal"    "$(stall_action 1 "$TMP/d013_tbl.used")" "normal"
 chk "d013_tbl_stalled_flag_fail"         "$(stall_action 0 "$TMP/d013_tbl.used")" "fail"
-# preuve de bornage : EXACTEMENT 1 seul 'touch "$REDIRECT_FLAG"' dans le driver
-# (pas de 2e pose -> jamais de boucle de redirection deguisee) :
-ntouch=$(grep -cF 'touch "$REDIRECT_FLAG"' "$DRV")
-chk "d013_only_one_redirect_touch" "$ntouch" "1"
+# preuve de bornage : EXACTEMENT 1 seul appel commit_redirect dans la branche
+# redirect (pas de 2e engagement -> jamais de boucle de redirection deguisee) :
+ncommit=$(grep -cF 'commit_redirect "$RECEIPTS_DIR/pending_redirect_${PHASE}.txt" "$REDIRECT_FLAG"' "$DRV")
+chk "d013_only_one_commit_redirect" "$ncommit" "1"
 # la redirection est immédiatement suivie d'un 'continue ;;' (sort d iteration,
 # ne re-redirige JAMAIS dans la meme iteration) :
-touch_line=$(grep -nF 'touch "$REDIRECT_FLAG"' "$DRV" | head -1 | cut -d: -f1)
-first_continue_after_touch=$(grep -nF 'continue ;;' "$DRV" | awk -F: -v t="$touch_line" '$1 > t {print $1; exit}')
-[ -n "$touch_line" ] && [ -n "$first_continue_after_touch" ] && [ "$first_continue_after_touch" -gt "$touch_line" ]
+commit_line=$(grep -nF 'commit_redirect "$RECEIPTS_DIR/pending_redirect_${PHASE}.txt" "$REDIRECT_FLAG"' "$DRV" | head -1 | cut -d: -f1)
+first_continue_after_commit=$(grep -nF 'continue ;;' "$DRV" | awk -F: -v t="$commit_line" '$1 > t {print $1; exit}')
+[ -n "$commit_line" ] && [ -n "$first_continue_after_commit" ] && [ "$first_continue_after_commit" -gt "$commit_line" ]
 chk "d013_redirect_branch_continues_no_loop" "$?" "0"
 # la declaration du flag borne la portee (1 fichier par phase) :
 grep -qF 'REDIRECT_FLAG="$RECEIPTS_DIR/redirect_attempt_${PHASE}.used"' "$DRV" \
@@ -564,17 +564,25 @@ grep -qF 'CUR_PROMPT="$(build_cur_prompt "$PHASE")"' "$DRV" \
 grep -qF 'pending_redirect_${PHASE}.txt' "$DRV" \
   && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013bis fichier pending_redirect non reference dans le driver"; }
 # la persistance dans la branche redirect (contenu du REDIRECT_PROMPT ecrit) :
-grep -qF 'printf '"'"'%s\n'"'"' "$REDIRECT_PROMPT" > "$RECEIPTS_DIR/pending_redirect_${PHASE}.txt"' "$DRV" \
-  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013bis branche redirect ne persiste pas REDIRECT_PROMPT"; }
+# D-013-ter : la persistance se fait via commit_redirect (atomique + transactionnel)
+# qui reçoit le contenu REDIRECT_PROMPT (test comportemental dédié section D-013-ter).
+grep -qF 'commit_redirect "$RECEIPTS_DIR/pending_redirect_${PHASE}.txt" "$REDIRECT_FLAG" "$REDIRECT_PROMPT"' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013bis branche redirect ne persiste pas REDIRECT_PROMPT (commit_redirect)"; }
 # la purge APRES l appel opencode run (usage unique) : un seul rm du fichier, et
 # il suit lexicalement l appel opencode (jamais avant -> pas de purge prematuree).
 nrmpending=$(grep -cF 'pending_redirect_${PHASE}.txt' "$DRV")
 [ "$nrmpending" -ge 2 ] && pass=$((pass+1)) \
   || { fail=$((fail+1)); echo "FAIL: d013bis pending_redirect insuffisamment reference (persist+purge)"; }
 opencode_line=$(grep -nF 'opencode run --model zai-coding-plan/glm-5.2 "$CUR_PROMPT"' "$DRV" | head -1 | cut -d: -f1)
-purge_line=$(grep -nF 'rm -f "$RECEIPTS_DIR/pending_redirect_${PHASE}.txt" 2>/dev/null' "$DRV" | head -1 | cut -d: -f1)
+purge_line=$(grep -nF 'purge_file_logged "$_prf"' "$DRV" | head -1 | cut -d: -f1)
 [ -n "$opencode_line" ] && [ -n "$purge_line" ] && [ "$purge_line" -gt "$opencode_line" ]
 chk "d013bis_purge_after_opencode" "$?" "0"
+# D-013-ter : la section critique est encadree par enter/exit_scoped_purge autour
+# d'opencode (sinon le scoped trap serait mort-ne) -- enter AVANT, exit APRES purge.
+enter_line=$(grep -nF 'enter_scoped_purge "$_prf"' "$DRV" | head -1 | cut -d: -f1)
+exit_line=$(grep -nF 'exit_scoped_purge' "$DRV" | awk -F: -v t="$purge_line" '$1 > t {print $1; exit}')
+[ -n "$enter_line" ] && [ -n "$exit_line" ] && [ "$enter_line" -lt "$opencode_line" ] && [ "$exit_line" -gt "$purge_line" ]
+chk "d013ter_scope_wraps_opencode" "$?" "0"
 # plus d assignation statique de CUR_PROMPT depuis BUILD_PROMPT seul (l ancien
 # bug) -- preuve que la redirection n est plus inerte :
 if grep -qF 'CUR_PROMPT="$BUILD_PROMPT_P1"; else CUR_PROMPT="$BUILD_PROMPT_P0"' "$DRV"; then
@@ -633,6 +641,205 @@ printf '%s' "$CUR1_HAS" | grep -qF 'PHASE P1' \
 
 # restauration du RECEIPTS_DIR global (proprete, autres tests non impactes).
 RECEIPTS_DIR="$SAVED_RECEIPTS_DIR"
+
+# ====================================================================
+# D-013-ter (audit défensif complet de la mécanique stall/redirect) :
+# (1) purge crash-safe de pending_redirect pendant opencode run via scoped trap
+#     (save/restore EXIT/INT/TERM/HUP, sans remplacer le trap global de main) ;
+# (2) même traitement crash-safe pour redirect_attempt_PHASE.used et
+#     last_audit_PHASE.sha256 (exposition équivalente : écritures atomiques +
+#     purges loggées) ;
+# (3) écritures atomiques tmp-puis-mv de pending_redirect / last_audit ;
+# (4) suppression des 'rm -f ... 2>/dev/null' muets -> purge_file_logged
+#     (logging explicite, fail-closed sur echec d'ecriture) ;
+# (5) transaction atomique (pending_redirect + redirect_attempt) -> aucune
+#     interruption entre les deux écritures ne laisse d'état inconsistent.
+# Tests RÉELS (nominal + simulation crash/interruption) + régression nominale.
+# Ne touche ni stall_action, ni build_cur_prompt, ni FIX1/2/3, ni D-001..D-012,
+# ni la machine à états (vérifié par les tests structurels ci-dessus, intacts).
+# ====================================================================
+
+# --- preuves structurelles : les helpers D-013-ter existent dans le driver. ---
+grep -qE '^atomic_write_exact\(\)' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013ter atomic_write_exact non defini"; }
+grep -qE '^purge_file_logged\(\)' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013ter purge_file_logged non defini"; }
+grep -qE '^enter_scoped_purge\(\)' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013ter enter_scoped_purge non defini"; }
+grep -qE '^exit_scoped_purge\(\)' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013ter exit_scoped_purge non defini"; }
+grep -qE '^commit_redirect\(\)' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013ter commit_redirect non defini"; }
+
+# --- (3) atomic_write_exact : nominal + byte-exact + échec rc=1 + pas de tmp. ---
+AWD="$TMP/d013ter_aw"; mkdir -p "$AWD"
+atomic_write_exact "$AWD/exact" "deadbeef"; chk "d013ter_aw_ok_rc" "$?" "0"
+chk "d013ter_aw_content" "$(cat "$AWD/exact")" "deadbeef"
+# byte-exact : AUCUN newline ajouté (8 octets, pas 9) -- critique pour le SHA.
+[ "$(wc -c < "$AWD/exact" | tr -d ' ')" = "8" ]; chk "d013ter_aw_no_extra_newline" "$?" "0"
+# aucun tmp résiduel (le tmp a été renommé par mv) :
+[ ! -e "$AWD/exact.tmp.$$" ]; chk "d013ter_aw_no_tmp_residue" "$?" "0"
+# échec : sous-répertoire inexistant -> printf échoue -> rc=1, rien créé, pas de tmp.
+atomic_write_exact "$AWD/no_such_sub/x" "X"; chk "d013ter_aw_fail_rc1" "$?" "1"
+[ ! -e "$AWD/no_such_sub" ]; chk "d013ter_aw_fail_no_partial" "$?" "0"
+# l'échec est LOGGÉ (plus d'erreur muette) :
+grep -q 'atomic_write_exact ECHEC sur '"$AWD"'/no_such_sub/x' "$LOG"; chk "d013ter_aw_fail_logged" "$?" "0"
+
+# --- (4) purge_file_logged : nominal loggé + absent rc=0 + échec rc=1 loggé. ---
+PFD="$TMP/d013ter_pf"; mkdir -p "$PFD"
+echo "data" > "$PFD/target"
+purge_file_logged "$PFD/target" "pf_label"; chk "d013ter_pf_remove_rc0" "$?" "0"
+[ ! -e "$PFD/target" ]; chk "d013ter_pf_removed" "$?" "0"
+grep -q 'purge pf_label : supprime' "$LOG"; chk "d013ter_pf_remove_logged" "$?" "0"
+# fichier absent -> rc=0 (pas d'erreur), n'écrit rien :
+purge_file_logged "$PFD/absent_xyz" "pf_absent"; chk "d013ter_pf_absent_rc0" "$?" "0"
+# échec : purge d'un répertoire (rm -f sur un dir échoue) -> rc=1 + loggé.
+mkdir -p "$PFD/adir"
+purge_file_logged "$PFD/adir" "pf_fail_label"; chk "d013ter_pf_fail_rc1" "$?" "1"
+grep -q 'purge pf_fail_label : ECHEC suppression' "$LOG"; chk "d013ter_pf_fail_logged" "$?" "0"
+rmdir "$PFD/adir" 2>/dev/null || true
+
+# --- (1) scoped trap : SIGTERM pendant la section critique purge le fichier
+#     ET préserve le cleanup original (chaînage). Preuve RÉELLE par sous-shell.
+#     D'abord : enter/exit restaur EXACTEMENT les traps (sans remplacer le global).
+#     NB : les chemins de trace sont des GLOBALES (pas des locals de la fonction)
+#     car cleanup() est appelée par le trap EXIT APRES le retour de la fonction --
+#     les locals seraient déjà détruits. ---
+_D013TER_TRACE=""; _D013TER_BEFORE=""; _D013TER_AFTER_ENTER=""; _D013TER_AFTER_EXIT=""
+_d013ter_scoped_nominal() {
+  local sf="$1"
+  _D013TER_TRACE="$2/trace"; _D013TER_BEFORE="$2/before"
+  _D013TER_AFTER_ENTER="$2/after_enter"; _D013TER_AFTER_EXIT="$2/after_exit"
+  cleanup() { echo "cleanup_marker" >> "$_D013TER_TRACE"; }   # mimique du cleanup driver
+  trap 'cleanup' EXIT
+  trap 'exit 143' TERM INT HUP
+  printf '%s\n' "$(trap -p EXIT TERM INT HUP)" > "$_D013TER_BEFORE"
+  enter_scoped_purge "$sf"
+  printf '%s\n' "$(trap -p EXIT)" > "$_D013TER_AFTER_ENTER"
+  touch "$sf"
+  exit_scoped_purge
+  printf '%s\n' "$(trap -p EXIT TERM INT HUP)" > "$_D013TER_AFTER_EXIT"
+}
+SCD="$TMP/d013ter_scope"; mkdir -p "$SCD"; SNT="$SCD/sent"; : > "$SCD/trace"
+( _d013ter_scoped_nominal "$SNT" "$SCD" )
+# pendant la section, le trap EXIT contient la purge du fichier scoped :
+grep -qF 'rm -f "$_SCP_FILE"' "$SCD/after_enter"; chk "d013ter_scoped_exit_augmented" "$?" "0"
+# après exit_scoped_purge : restauration EXACTE (after_exit == before) :
+[ "$(cat "$SCD/before")" = "$(cat "$SCD/after_exit")" ]; chk "d013ter_scoped_restore_exact" "$?" "0"
+# le cleanup original a tourné au exit normal du sous-shell (chaînage préservé) :
+grep -q cleanup_marker "$SCD/trace"; chk "d013ter_scoped_chains_cleanup_normal" "$?" "0"
+
+# --- (1 suite) SIGTERM PENDANT la section -> fichier purgé + cleanup chaîné. ---
+_d013ter_scoped_crash() {
+  local sf="$1"
+  _D013TER_TRACE="$2/trace"; _D013TER_READY="$2/ready"
+  cleanup() { echo "cleanup_marker" >> "$_D013TER_TRACE"; }
+  trap 'cleanup' EXIT
+  trap 'exit 143' TERM INT HUP
+  enter_scoped_purge "$sf"
+  touch "$sf"
+  echo ready > "$_D013TER_READY"
+  sleep 3   # fenêtre = appel opencode run pendant lequel le kill arrive
+  exit_scoped_purge
+}
+SNT2="$SCD/sent2"
+( _d013ter_scoped_crash "$SNT2" "$SCD" ) &
+CRASH_BG=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -f "$SCD/ready" ] && break; sleep 0.2; done
+[ -f "$SCD/ready" ] && kill -TERM "$CRASH_BG" 2>/dev/null
+wait "$CRASH_BG" 2>/dev/null
+# le fichier scoped est PURGÉ malgré le SIGTERM pendant la section :
+[ ! -e "$SNT2" ]; chk "d013ter_scoped_sigterm_purges_file" "$?" "0"
+# le cleanup original a QUAND MÊME tourné (chaînage via exit143 -> EXIT scoped) :
+grep -q cleanup_marker "$SCD/trace"; chk "d013ter_scoped_sigterm_chains_cleanup" "$?" "0"
+
+# --- (5) transaction commit_redirect : nominal + échec + crash entre les 2
+#     écritures -> ROLLBACK (ni pending ni flag ni tmp -> état CONSISTANT). ---
+CRD="$TMP/d013ter_cr"; mkdir -p "$CRD"
+# nominal : pending + flag cohérents, rc 0, contenu correct, pas de tmp.
+commit_redirect "$CRD/pending.txt" "$CRD/flag.used" "CONTENU_REDIRECT_42"; chk "d013ter_cr_ok_rc" "$?" "0"
+chk "d013ter_cr_pending_content" "$(cat "$CRD/pending.txt")" "CONTENU_REDIRECT_42"
+[ -e "$CRD/flag.used" ]; chk "d013ter_cr_flag_created" "$?" "0"
+[ ! -e "$CRD/pending.txt.tmp.$$" ]; chk "d013ter_cr_no_tmp" "$?" "0"
+# échec d'écriture (sous-répertoire inexistant) -> rc=1, NI pending NI flag NI tmp.
+commit_redirect "$CRD/no_sub/p.txt" "$CRD/no_sub/f.used" "X"; chk "d013ter_cr_fail_rc1" "$?" "1"
+[ ! -e "$CRD/no_sub" ]; chk "d013ter_cr_fail_no_partial" "$?" "0"
+# preuve structurelle : commit_redirect installe un rollback EXIT couvrant les
+# 3 artefacts (pending + tmp + flag) -> interruption = rollback complet.
+grep -qF 'rm -f "$CR_PENDING" "$CR_TMP" "$CR_FLAG"' "$DRV"; chk "d013ter_cr_rollback_covers_all" "$?" "0"
+# preuve structurelle : ordre pending-pUIS-flag dans commit_redirect (le mv du
+# pending précède lexicalement le touch du flag).
+_cr_mv=$(grep -nF 'mv -f "$CR_TMP" "$pending"' "$DRV" | head -1 | cut -d: -f1)
+_cr_touch=$(grep -nF 'touch "$flag"' "$DRV" | head -1 | cut -d: -f1)
+[ -n "$_cr_mv" ] && [ -n "$_cr_touch" ] && [ "$_cr_mv" -lt "$_cr_touch" ]; chk "d013ter_cr_pending_before_flag" "$?" "0"
+
+# simulation crash ENTRE le mv du pending et le touch du flag : on reproduit la
+# MÊME section critique (même scoped rollback trap) à la main, on envoie SIGTERM
+# après le mv et avant le touch, puis on vérifie le rollback (rien ne reste).
+_d013ter_cr_midcrash() {
+  local pending="$1" flag="$2" out="$3"
+  trap ':' EXIT
+  trap 'exit 143' TERM INT HUP
+  # reproduit commit_redirect jusqu'au point de crash :
+  CR_SAVED="$(trap -p EXIT INT TERM HUP)"
+  CR_PENDING="$pending"; CR_TMP="${pending}.tmp.$$"; CR_FLAG="$flag"
+  trap 'rm -f "$CR_PENDING" "$CR_TMP" "$CR_FLAG" 2>/dev/null || true' EXIT
+  printf '%s\n' "PENDING" > "$CR_TMP" && mv -f "$CR_TMP" "$pending"
+  echo ready > "$out/cr_ready"
+  sleep 3   # <- SIGTERM arrive ici : pending existe, flag PAS ENCORE touché
+  touch "$flag"   # atteint seulement sans signal
+  # mimique de _cr_restore (sortie normale de commit_redirect) : on restaure les
+  # traps originaux pour que la sortie NORMALE conserve pending+flag (et thus
+  # prouve que le test ne passe QUE si le signal a effectivement déclenché le rollback).
+  local line
+  trap - EXIT INT TERM HUP
+  while IFS= read -r line; do [ -n "$line" ] && eval "$line"; done <<D013TERMID
+$CR_SAVED
+D013TERMID
+}
+MIDP="$CRD/mid_p.txt"; MIDF="$CRD/mid_f.used"; : > "$CRD/cr_ready" 2>/dev/null || true; rm -f "$CRD/cr_ready"
+( _d013ter_cr_midcrash "$MIDP" "$MIDF" "$CRD" ) &
+MID_BG=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -f "$CRD/cr_ready" ] && break; sleep 0.2; done
+[ -f "$CRD/cr_ready" ] && kill -TERM "$MID_BG" 2>/dev/null
+wait "$MID_BG" 2>/dev/null
+# après rollback : NI pending NI flag NI tmp -> état CONSISTANT (rien).
+[ ! -e "$MIDP" ]; chk "d013ter_cr_midcrash_no_pending" "$?" "0"
+[ ! -e "$MIDF" ]; chk "d013ter_cr_midcrash_no_flag" "$?" "0"
+_tmpc=0; for _t in "$CRD"/*.tmp.*; do [ -e "$_t" ] && _tmpc=$((_tmpc+1)); done
+chk "d013ter_cr_midcrash_no_tmp" "$_tmpc" "0"
+
+# --- (2) traitement crash-safe pour redirect_attempt + last_audit :
+#     écritures atomiques + purges loggées (exposition équivalente couverte). ---
+grep -qF 'atomic_write_exact "$STALL_FILE"' "$DRV"; chk "d013ter_last_audit_atomic" "$?" "0"
+grep -qF 'purge_file_logged "$RECEIPTS_DIR/last_audit_P0.sha256"' "$DRV"; chk "d013ter_last_audit_p0_purge_logged" "$?" "0"
+grep -qF 'purge_file_logged "$RECEIPTS_DIR/last_audit_P1.sha256"' "$DRV"; chk "d013ter_last_audit_p1_purge_logged" "$?" "0"
+# le flag redirect_attempt est engagé via la transaction commit_redirect (couvert
+# ci-dessus) et reset via purge_file_logged (déjà vérifié par d013 structurel) :
+grep -qF 'purge_file_logged "$REDIRECT_FLAG"' "$DRV"; chk "d013ter_flag_reset_logged" "$?" "0"
+# plus AUCUN 'rm -f ... 2>/dev/null' muet ciblant ces fichiers d'état :
+if grep -qE 'rm -f .*(pending_redirect_\$\{PHASE\}|last_audit_P[01]\.sha256).*2>/dev/null' "$DRV"; then
+  fail=$((fail+1)); echo "FAIL: d013ter un 'rm -f ... 2>/dev/null' muet cible encore un fichier d etat redirection"
+else pass=$((pass+1)); fi
+# l'échec d'écriture du pending en branche redirect est fail-closed (FAIL) :
+grep -qF 'echec ecriture atomique (pending_redirect/redirect_attempt) -> STATE=FAIL fail-closed' "$DRV"; chk "d013ter_redirect_write_fail_closed" "$?" "0"
+# le sha de last_audit est écrit SANS newline parasite (audit_same_as_previous byte-exact) :
+# preuve intégrée au miroir sha ci-dessus via atomic_write_exact ; on vérifie ici
+# que le driver n'utilise plus de 'printf > "$STALL_FILE"' direct (non atomique) :
+if grep -qF 'printf '"'"'%s'"'"' "$(sha256_file "$AUDIT_CODEX")" > "$STALL_FILE"' "$DRV"; then
+  fail=$((fail+1)); echo "FAIL: d013ter last_audit toujours ecrit en ecriture directe non atomique"
+else pass=$((pass+1)); fi
+
+# --- régression : la redirection nominale fonctionne TOUJOURS (commit_redirect
+#     produit un pending lisible par build_cur_prompt, + BUILD_PROMPT concaténé). ---
+RGD="$TMP/d013ter_reg"; mkdir -p "$RGD"
+_SAVED_RR="$RECEIPTS_DIR"; RECEIPTS_DIR="$RGD"
+commit_redirect "$RECEIPTS_DIR/pending_redirect_P0.txt" "$RECEIPTS_DIR/redirect_attempt_P0.used" "REGRESSION_REDIRECT_SENTINEL"
+_REGCUR="$(build_cur_prompt P0)"
+printf '%s' "$_REGCUR" | grep -qF 'REGRESSION_REDIRECT_SENTINEL'; chk "d013ter_regression_redirect_visible" "$?" "0"
+printf '%s' "$_REGCUR" | grep -qF 'PHASE P0 UNIQUEMENT'; chk "d013ter_regression_build_appended" "$?" "0"
+[ -e "$RECEIPTS_DIR/redirect_attempt_P0.used" ]; chk "d013ter_regression_flag_set" "$?" "0"
+RECEIPTS_DIR="$_SAVED_RR"
 
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

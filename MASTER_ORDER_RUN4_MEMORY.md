@@ -56,7 +56,7 @@ Protocole à figer AVANT l'exécution (même discipline que M5 §16) :
 `main = UNCHANGED`, aucun push/tag/deploy. État final : `CAMPAIGN_STATE=WAITING_HUMAN_BOSS_GO`. Attends le GO explicite de Jocelyn avant tout merge.
 
 ---
-*Rappel process (rituel de review, appliqué automatiquement par le driver headless — voir `run_run4_autonomous.sh`) : GLM construit une tranche → commit → Claude ET Codex review cette tranche EN PARALLÈLE, chacun indépendamment (diff uniquement, rapide) → si l'un des deux relève un P1/High reproduit, GLM le fixe avant de continuer → à la toute fin du run, Claude ET Codex font CHACUN un audit exhaustif indépendant de l'intégralité du code produit (pas juste le dernier diff) avant de passer en `WAITING_HUMAN_BOSS_GO`. Ni Claude ni Codex ne construisent jamais — seul GLM écrit du code produit (séparation constructeur/contrôleur stricte, règle 2).*
+*Rappel process (rituel de review, appliqué automatiquement par le driver headless — voir `run_run4_autonomous.sh`) : GLM construit une tranche → commit → Codex review cette tranche (diff uniquement, rapide) → si Codex relève un P1/High reproduit, GLM le fixe avant de continuer → à la toute fin du run, Codex fait un audit exhaustif indépendant de l'intégralité du code produit (pas juste le dernier diff) avant de passer en `WAITING_HUMAN_BOSS_GO`. (Relevé 30/07 Jocelyn : Claude retiré de la boucle de review/audit pour économie de quota — Codex seul, reviewer indépendant en lecture seule.) Ni Claude ni Codex ne construisent jamais — seul GLM écrit du code produit (séparation constructeur/contrôleur stricte, règle 2).*
 
 ---
 
@@ -69,12 +69,12 @@ Cette section est la SEULE autorité des états, phases et transitions du pilote
 - `factory/campaigns/CAMPAIGN_PHASE` — phase courante : `P0` (réparation des 6 défauts du cœur) ou `P1` (Sharp Core minimal). Aucune autre valeur. Jamais réinitialisée silencieusement.
 - `factory/campaigns/PILOT_HEARTBEAT` — JSON écrit toutes les 60 s par une boucle de fond indépendante des appels agents (timestamp, pid, state, phase, iter). Preuve de vie, PAS preuve de réussite.
 - `factory/campaigns/PILOT_ITER` — numéro d'itération courant (consommé par le heartbeat).
-- `$HOME/.factory-receipts/factory-run4-memory/` — receipts hors du repo : `resume_receipt.json`, `checkpoint_p0/` (checkpoint.json + copies des 2 audits + leurs SHA-256), verrou `driver.lock.d/`. Séparés du worktree et protégés par le séquencement, mais PAS tamper-proof face à un processus du même utilisateur macOS (limite V1 assumée et documentée).
+- `$HOME/.factory-receipts/factory-run4-memory/` — receipts hors du repo : `resume_receipt.json`, `checkpoint_p0/` (checkpoint.json + copie de l'audit Codex + son SHA-256), verrou `driver.lock.d/`. Séparés du worktree et protégés par le séquencement, mais PAS tamper-proof face à un processus du même utilisateur macOS (limite V1 assumée et documentée).
 
 ### États autorisés (autorité unique, appliquée par `state_kind` dans `run_run4_autonomous.sh`)
 Tout état lu dans `CAMPAIGN_STATE` hors de cette liste est `illegal` : le pilote s'arrête en **fail-closed** (jamais de réparation silencieuse en `RUNNING`). La fonction `state_kind` du pilote est l'implémentation exacte de cette liste (testée par `tests/test_driver_helpers.bash`).
 - `RUNNING` → `build` (construction).
-- `READY_FOR_FINAL_AUDIT` (transition interne, écrite par le builder en fin de phase) → `audit` double.
+- `READY_FOR_FINAL_AUDIT` (transition interne, écrite par le builder en fin de phase) → `audit` (Codex seul — Claude retiré de la boucle 30/07).
 - `WAITING_INFRA` → `infra_stop` (arrêt quota/réseau).
 - `WAITING_HUMAN_BOSS_GO` (terminal succès, fin de run) ; `WAITING_HUMAN` (terminal : attente humaine générique).
 - `FAIL` (terminal échec, après épuisement du budget de repair).
@@ -82,10 +82,10 @@ Tout état lu dans `CAMPAIGN_STATE` hors de cette liste est `illegal` : le pilot
 - `MEMORY_SYSTEM_FAIL` (terminal : mémoire de leçons invalide ou injecteur en panne — aucun agent n'est appelé dans cet état).
 
 ### Transitions légales
-- `RUNNING → READY_FOR_FINAL_AUDIT` (builder, fin de phase) → audit double (Claude + Codex, tokens exacts en première ligne : `PHASE_P0_PASS`/`PHASE_P0_FAIL` en P0, `PHASE_P1_PASS`/`PHASE_P1_FAIL` en P1).
-- Audit P0 double-PASS → checkpoint P0 figé (commit, worktree, SHA-256 des audits) → `CAMPAIGN_PHASE=P1`, budget de repair réinitialisé, `RUNNING`.
-- Audit P1 double-PASS → `WAITING_HUMAN_BOSS_GO` → arrêt. La suite (merge) est 100 % humaine.
-- Audit non-PASS → repair round (budget : `MAX_P0_REPAIR=4`, `MAX_P1_REPAIR=4` par phase) ; budget épuisé → `FAIL`.
+- `RUNNING → READY_FOR_FINAL_AUDIT` (builder, fin de phase) → audit simple Codex (Claude retire de la boucle 30/07, tokens exacts en première ligne : `PHASE_P0_PASS`/`PHASE_P0_FAIL` en P0, `PHASE_P1_PASS`/`PHASE_P1_FAIL` en P1).
+- Audit P0 PASS (Codex seul) → checkpoint P0 figé (commit, worktree, SHA-256 de l'audit) → `CAMPAIGN_PHASE=P1`, budget de repair réinitialisé, `RUNNING`.
+- Audit P1 PASS (Codex seul) → `WAITING_HUMAN_BOSS_GO` → arrêt. La suite (merge) est 100 % humaine.
+- Audit non-PASS → repair round (budget : `MAX_P0_REPAIR=30`, `MAX_P1_REPAIR=30` par phase — relevé 30/07 Jocelyn) ; budget épuisé → `FAIL`.
 - `FAIL → RUNNING` : UNIQUEMENT via `RESUME_AFTER_FAIL=1` explicite, avec `resume_receipt.json` écrit (old_state, new_state, phase, commit, timestamp, reason). Reprise phase-aware : phase absente → reprise legacy en P0 (loggée) ; phase P0 → reprise P0 ; phase P1 → reprise P1 SEULEMENT si le checkpoint P0 se re-vérifie (hashes recalculés) ; phase inconnue ou checkpoint invalide → refus.
 - Mémoire de leçons : avant chaque itération builder, `lesson_injector.py --format quiet` est exécuté. Contrat strict : rc=0, ou rc=2 avec stderr vide (= mémoire valide, aucune leçon pertinente). Tout autre résultat → `MEMORY_SYSTEM_FAIL`. Note documentée : en V1, les reviewers de tranche reçoivent le diff, pas d'injection de leçons — la garde mémoire couvre le chemin builder.
 

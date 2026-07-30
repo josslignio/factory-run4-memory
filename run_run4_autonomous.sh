@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Pilote headless Run #4 (Mémoire / Experience Compiler).
-# GLM (via opencode, zai-coding-plan) construit ; Claude ET Codex reviewent chaque tranche
-# EN PARALLÈLE (deux avis indépendants) et font chacun l'audit final exhaustif.
+# GLM (via opencode, zai-coding-plan) construit ; Codex review chaque tranche
+# (avis indépendant, lecture seule) et fait l'audit final exhaustif.
+# (Relevé 30/07 Jocelyn : Claude retiré de la boucle de review/audit — Codex seul.)
 # Ne s'arrête jamais tout seul sauf état terminal explicite.
 #
 # ATTENTION AVANT DE LANCER EN LONGUE DURÉE — deux smoke-tests de 30s à faire d'abord (UN PAR UN,
@@ -35,10 +36,10 @@ AUDIT_CODEX="reports/RUN4_FINAL_AUDIT_CODEX.md"
 
 BUILD_BRANCH="run4/build"
 MAX_ITERS=300
-MAX_INFRA_FAILS=3            # D-005 : max 3 retries infra (règle 6)
+MAX_INFRA_FAILS=10           # releve 30/07 (Jocelyn) : tolerer plus de hoquets infra transitoires (ex. codex_models_manager cache TTL) avant WAITING_INFRA
 BACKOFFS=(30 120 300)        # D-005 : backoff 30s/120s/300s
-MAX_P0_REPAIR=4             # ordre fusionne 29/07 : budget repair phase P0 (6 fixes coeur)
-MAX_P1_REPAIR=4             # ordre fusionne 29/07 : budget repair phase P1 (Sharp Core minimal)
+MAX_P0_REPAIR=30            # releve 30/07 (Jocelyn) : run jusqu au bout de P1 sans interruption artificielle -- reste fail-closed sur memoire corrompue/etat illegal
+MAX_P1_REPAIR=30            # releve 30/07 (Jocelyn) : meme raison, coherence P0/P1
 PHASE_FILE="factory/campaigns/CAMPAIGN_PHASE"
 RECEIPTS_DIR="$HOME/.factory-receipts/factory-run4-memory"   # receipts hors du repo (hors perimetre builder)
 LOCK_DIR="$RECEIPTS_DIR/driver.lock.d"   # verrou d execution atomique (mkdir), detenu toute la vie du driver
@@ -91,7 +92,7 @@ read_phase() {
 # de build = traité de fait comme RUNNING, ce qui était une réparation
 # silencieuse.) États légaux et leur action :
 #   RUNNING                       -> build   (continue vers la construction)
-#   READY_FOR_FINAL_AUDIT         -> audit   (audit double Claude + Codex)
+#   READY_FOR_FINAL_AUDIT         -> audit   (audit simple Codex -- Claude retire de la boucle 30/07)
 #   WAITING_INFRA                 -> infra_stop
 #   WAITING_HUMAN_BOSS_GO|WAITING_HUMAN|FAIL|DONE|MEMORY_SYSTEM_FAIL -> terminal
 # Testé par tests/test_driver_helpers.bash.
@@ -123,7 +124,7 @@ state_kind() {
 #     quota/réseau indispo ou mémoire corrompue (terminal, écrit puis exit).
 #   - READY_FOR_FINAL_AUDIT -> RUNNING : audit résolu (P0 PASS -> P1, ou
 #     non-PASS -> repair round, retour build).
-#   - READY_FOR_FINAL_AUDIT -> WAITING_HUMAN_BOSS_GO : audit P1 double-PASS.
+#   - READY_FOR_FINAL_AUDIT -> WAITING_HUMAN_BOSS_GO : audit P1 PASS (Codex seul).
 #   - READY_FOR_FINAL_AUDIT -> FAIL : budget de repair épuisé.
 #   - FAIL -> RUNNING : UNIQUEMENT via RESUME_AFTER_FAIL=1 (traité au
 #     démarrage, pas en boucle).
@@ -337,7 +338,7 @@ main() {
     exit 1
   fi
   start_heartbeat
-  echo "[$(date -u +%FT%TZ)] === RUN4 DRIVER START (dual review Claude+Codex, fixes D-001..D-005) ===" >> "$LOG"
+  echo "[$(date -u +%FT%TZ)] === RUN4 DRIVER START (review Codex seul -- Claude retire 30/07, fixes D-001..D-005) ===" >> "$LOG"
   ensure_build_branch
 
   local infra_fails=0 audit_repairs=0
@@ -396,11 +397,11 @@ $FINAL_AUDIT_PROMPT" > "$AUDIT_CODEX" 2>>"$LOG" \
           echo "P1" > "$PHASE_FILE"
           audit_repairs=0
           echo "RUNNING" > "$STATE_FILE"
-          echo "[$(date -u +%FT%TZ)] audits P0 OK x2 -> checkpoint P0 fige dans $RECEIPTS_DIR/checkpoint_p0 -> PHASE=P1, STATE=RUNNING" >> "$LOG"
+          echo "[$(date -u +%FT%TZ)] audit P0 OK (Codex seul) -> checkpoint P0 fige dans $RECEIPTS_DIR/checkpoint_p0 -> PHASE=P1, STATE=RUNNING" >> "$LOG"
           continue
         fi
         echo "WAITING_HUMAN_BOSS_GO" > "$STATE_FILE"
-        echo "[$(date -u +%FT%TZ)] audits P1 OK (PRET A MERGER x2) -> STATE=WAITING_HUMAN_BOSS_GO -> arret pilote" >> "$LOG"
+        echo "[$(date -u +%FT%TZ)] audit P1 OK (Codex seul, PRET A MERGER) -> STATE=WAITING_HUMAN_BOSS_GO -> arret pilote" >> "$LOG"
         exit 0
       fi
       audit_repairs=$((audit_repairs+1))
@@ -409,10 +410,10 @@ $FINAL_AUDIT_PROMPT" > "$AUDIT_CODEX" 2>>"$LOG" \
         echo "[$(date -u +%FT%TZ)] audits phase $PHASE non-OK apres $MAX_REPAIR rounds de repair -> STATE=FAIL -> arret" >> "$LOG"
         exit 0
       fi
-      { echo "AUDIT_REPAIR_NEEDED (phase $PHASE, round $audit_repairs)"; echo "--- Claude audit ---"; cat "$AUDIT_CLAUDE" 2>/dev/null; echo; echo "--- Codex audit ---"; cat "$AUDIT_CODEX" 2>/dev/null; } > "$REVIEW_CLAUDE"
+      { echo "AUDIT_REPAIR_NEEDED (phase $PHASE, round $audit_repairs)"; echo "--- Codex audit ---"; cat "$AUDIT_CODEX" 2>/dev/null; } > "$REVIEW_CLAUDE"
       cp "$REVIEW_CLAUDE" "$REVIEW_CODEX"
       echo "RUNNING" > "$STATE_FILE"
-      echo "[$(date -u +%FT%TZ)] audits phase $PHASE non-OK (round $audit_repairs) -> findings routes vers review, STATE=RUNNING, boucle" >> "$LOG"
+      echo "[$(date -u +%FT%TZ)] audit phase $PHASE non-OK (round $audit_repairs) -> findings Codex routees vers review, STATE=RUNNING, boucle" >> "$LOG"
       continue ;;
     build)
       : ;;   # RUNNING (etat nominal) -> on continue vers la boucle de build
@@ -485,8 +486,9 @@ $DIFF
 ------------------8<------------------
 $([ "$DIFF_TRUNC" = 1 ] && echo "(DIFF TRONQUE - ouvre les fichiers pertinents via Read pour le detail.)")"
 
-  codex exec -s read-only --skip-git-repo-check "$REVIEW_PROMPT" > "$REVIEW_CODEX" 2>>"$LOG"
-  wait 2>/dev/null || echo "[$(date -u +%FT%TZ)] iter $i: review codex rc non-zero" >> "$LOG"
+  if ! codex exec -s read-only --skip-git-repo-check "$REVIEW_PROMPT" > "$REVIEW_CODEX" 2>>"$LOG"; then
+    echo "[$(date -u +%FT%TZ)] iter $i: review codex rc non-zero" >> "$LOG"
+  fi
 
   # D-005 : un reviewer muet = echec infra (pas de relance immédiate admise).
   if [ ! -s "$REVIEW_CODEX" ]; then

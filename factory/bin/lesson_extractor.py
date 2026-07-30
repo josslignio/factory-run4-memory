@@ -461,11 +461,31 @@ def _write_jsonl_fresh(path: Path, lessons: List[dict]) -> None:
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         _, existing_ids = _read_existing_ids(path)
-        collisions = existing_ids & {l["id"] for l in lessons}
+        our_ids = {l["id"] for l in lessons}
+        collisions = existing_ids & our_ids
         if collisions:
             raise LessonError(
                 f"collision d'ids détectée sous verrou (--out/append "
                 f"concurrent ?) : {sorted(collisions)}")
+        # Reprise FAIL 27/07 (P1 audit Codex) : un --out vers un fichier
+        # contenant d'AUTRES ids valides (course gagnée par un autre --out aux
+        # ids distincts, ou overwrite involontaire) détruirait SILEENCIEUSEMENT
+        # ce contenu valide — le second process ne voyait aucune collision puis
+        # exécutait os.replace, effaçant le résultat du premier. --out est une
+        # écriture FRAÎCHE : on n'accepte d'écrire que sur un fichier
+        # absent/vide. Les mêmes ids sont déjà une collision (ci-dessus) ; tout
+        # id valide ÉTRANGER à cette écriture -> refus fail-closed (aucune
+        # perte silencieuse). Vérifié SOUS verrou (autoritaire face à la course
+        # entre le pré-check hors-verrou de main() et l'écriture effective).
+        foreign = existing_ids - our_ids
+        if foreign:
+            raise LessonError(
+                f"le fichier destination contient {len(foreign)} id(s) "
+                f"valide(s) absent(s) de cette écriture fraîche "
+                f"(ex: {sorted(foreign)[:3]}) — refus d'écraser du contenu "
+                f"valide (--out = écriture fraîche sur fichier vide/absent ; "
+                f"utilisez --append pour ajouter, ou supprimez le fichier "
+                f"avant).")
         fd, tmp_name = tempfile.mkstemp(
             dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
         tmp = Path(tmp_name)

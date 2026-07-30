@@ -281,6 +281,60 @@ class TestOutConcurrentSerialization(unittest.TestCase):
         leftovers = list(Path(self.tmp).glob("*.tmp"))
         self.assertEqual(leftovers, [], f".tmp résiduels : {leftovers}")
 
+    def test_two_concurrent_out_distinct_ids_no_silent_loss(self):
+        # Reprise FAIL 27/07 (P1 audit Codex) : deux --out concurrents avec des
+        # ids DIFFÉRENTS (extraction-ts distincts) sur le même fichier. Avant le
+        # fix, le second ne voyait aucune collision puis exécutait os.replace ->
+        # effaçait SILEENCIEUSEMENT le résultat valide du premier (les deux rc=0,
+        # perte). Maintenant le flock sérialise : le second voit les ids étrangers
+        # SOUS verrou et REFUSE proprement (rc=1) ; le contenu du gagnant est
+        # préservé (aucune perte, aucun JSON partiel).
+        import subprocess
+        base = Path(self.tmp) / "lessons.jsonl"
+        cli = str(REPO / "factory" / "bin" / "lesson_extractor.py")
+        cmd_a = [sys.executable, cli, str(FIXTURE), "--out", str(base),
+                 "--extraction-ts", "20260727T160000Z"]
+        cmd_b = [sys.executable, cli, str(FIXTURE), "--out", str(base),
+                 "--extraction-ts", "20260727T170000Z"]   # ids distincts
+        p1 = subprocess.Popen(cmd_a, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL)
+        p2 = subprocess.Popen(cmd_b, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL)
+        rc1 = p1.wait(timeout=30)
+        rc2 = p2.wait(timeout=30)
+        # Exactement un gagnant (rc=0) + un refus propre (rc=1). JAMAIS les deux
+        # rc=0 (perte silencieuse), jamais rc=2 (traceback/corruption).
+        codes = sorted([rc1, rc2])
+        self.assertEqual(codes, [0, 1],
+                         f"attendu [0,1] (un gagnant + un refus propre, pas de "
+                         f"perte silencieuse), eu rc1={rc1} rc2={rc2}")
+        # Le contenu du gagnant est INTACT (3 leçons valides) — pas écrasé.
+        rows = load_jsonl(base)
+        self.assertEqual(len(rows), 3, "le gagnant écrit 3 leçons valides, "
+                                       "préservées (pas de perte)")
+        # Aucun résidu `.tmp` (mkstemp unique + nettoyage finally).
+        leftovers = list(Path(self.tmp).glob("*.tmp"))
+        self.assertEqual(leftovers, [], f".tmp résiduels : {leftovers}")
+
+    def test_out_refuses_foreign_ids_no_overwrite(self):
+        # Déterministe (sans course) : un fichier contenant des ids ÉTRANGERS à
+        # l'écriture fraîche doit être refusé (--out ne détruit jamais du contenu
+        # valide). Contrat : --out n'écrit que sur un fichier absent/vide.
+        base = Path(self.tmp) / "lessons.jsonl"
+        # Pré-écrire un fichier avec des ids différents (autre extraction-ts).
+        rc = ex.main([str(FIXTURE), "--out", str(base),
+                      "--extraction-ts", "20260801T000000Z"])
+        self.assertEqual(rc, 0)
+        before = load_jsonl(base)
+        self.assertEqual(len(before), 3)
+        # Réécrire --out avec des ids DIFFÉRENTS -> refus (préserve l'existant).
+        rc2 = ex.main([str(FIXTURE), "--out", str(base),
+                       "--extraction-ts", "20260802T000000Z"])
+        self.assertEqual(rc2, 1, "--out sur ids étrangers doit échouer (rc=1)")
+        after = load_jsonl(base)
+        self.assertEqual([l["id"] for l in after], [l["id"] for l in before],
+                         "le contenu existant est INTACT (rien écrasé)")
+
 
 class TestCliStdout(unittest.TestCase):
     def test_main_stdout_emits_jsonl(self):

@@ -237,6 +237,60 @@ audit_same_as_previous() {
   [ "$prev" = "$(sha256_file "$cur_file")" ]
 }
 
+# --- D-013 (post-post-mortem 30/07 : FIX 3 trop brutal) : redirection
+# CHIRURGICALE bornee a UNE SEULE tentative quand le verdict Codex est identique
+# au round precedent. Au lieu du FAIL immediat de FIX 3 au 1er stall (2 audits
+# identiques) -- qui abandonnait trop tot un point potentiellement fixable en
+# une derniere tentative ciblee -- on extrait les findings du dernier rapport
+# Codex et on redirige GLM UNE fois avec un prompt chirurgical. Un 2e stall
+# identique APRES redirection -> FAIL immediat (flag redirect_attempt_PHASE.used).
+# Objectif mesurable : un blocage reel ne depasse JAMAIS 3 rounds Codex avant
+# FAIL (1 normal + 1 stall + 1 redirection), au lieu de boucler jusqu au plafond
+# MAX_*_REPAIR (29 rounds observes) ou de FAIL trop tot. Jamais de boucle, meme
+# deguisee : la redirection est strictement bornee a 1 tentative par sequence.
+
+# Extract les lignes de finding (motif fichier:numero) d un rapport Codex, pour
+# la redirection chirurgicale. Aucune regex de parsing de finding n existait
+# ailleurs dans le pilote -> motif raisonnable fichier.(py|sh|md|json):numero,
+# capture les lignes ENTIERES (contexte utile pour GLM). Une ligne sans
+# localisation fichier:numero est ecartee (bruit non exploitable). Si rien ne
+# matche, renvoie vide (le prompt partira avec un placeholder d ambiguïte).
+# Teste reellement par tests/test_driver_helpers.bash.
+extract_findings() {
+  local f="$1"
+  [ -s "$f" ] || return 0
+  grep -E '[a-zA-Z0-9_./]+\.(py|sh|md|json):[0-9]+' "$f" 2>/dev/null || return 0
+}
+
+# Construit le REDIRECT_PROMPT chirurgical (texte fixe D-013 + findings extraits).
+# Prompt court, cible, DERNIERE tentative avant FAIL. Teste reellement par
+# tests/test_driver_helpers.bash.
+build_redirect_prompt() {
+  local findings="${1:-}"
+  if [ -z "$findings" ]; then
+    findings="<aucun finding fichier:ligne extrait -- le rapport Codex ne cite pas de localisation exploitable ; traite l ambiguite explicitement dans ton commit plutot que de re-tenter en aveugle>"
+  fi
+  printf 'Ta derniere tentative n a RIEN change au probleme signale (verdict Codex identique au round precedent). N ESSAIE PAS la meme chose une deuxieme fois. Voici EXACTEMENT et UNIQUEMENT le(s) finding(s) a corriger, extrait du dernier rapport Codex :\n%s\nApplique un patch MINIMAL et CHIRURGICAL qui cible precisement cette ligne/ce comportement, ne touche a AUCUN autre fichier ni AUCUNE autre logique. Si le finding te semble deja corrige ou ambigu, dis-le explicitement dans ton commit plutot que de re-tenter en aveugle. C est ta DERNIERE tentative sur ce point avant arret FAIL du pilote et intervention humaine.' "$findings"
+}
+
+# Decision de stall en 2 temps (D-013). Entrees :
+#   $1 = code retour du predicat audit_same_as_previous (0 = stalled, autre = non).
+#   $2 = chemin du flag redirect_attempt_PHASE.used.
+# Renvoie 'redirect' / 'fail' / 'normal' :
+#   - non stalled                          -> 'normal'  (progres reel : reset flag, boucle standard)
+#   - stalled + flag ABSENT (1er stall)    -> 'redirect' (1 redirection chirurgicale vers GLM)
+#   - stalled + flag PRESENT (deja tente)  -> 'fail'     (FAIL immediat fail-closed, pas de 3e tentative)
+# Extrait en fonction nommee (vs inline) pour que tests/test_driver_helpers.bash
+# appelle la VRAIE table de decision de production (meme discipline que
+# enforce_legal_transition_or_die / audit_same_as_previous : le test appelle le
+# VRAI predicat, pas une copie locale).
+stall_action() {
+  local stalled="$1" flag="$2"
+  [ "$stalled" = "0" ] || { printf 'normal'; return 0; }
+  if [ -f "$flag" ]; then printf 'fail'; return 0; fi
+  printf 'redirect'
+}
+
 # --- Verrou d execution atomique (mkdir) : SEULE autorite anti-double-pilote (pgrep = diagnostic). ---
 LOCK_ACQUIRED=0
 HB_PID=""
@@ -412,6 +466,7 @@ main() {
   local ST rc i DIFF DIFF_TRUNC REVIEW_PROMPT PID_CLAUDE PID_CODEX
   local PHASE PHASE_NOTE MAX_REPAIR CUR_PROMPT INJ_RC INJ_ERR TOKEN WT_DIRTY WT_STATE WT_DIFF_SHA
   local PREV_ST
+  local STALL_FILE REDIRECT_FLAG STALL_RC EXTRACTED REDIRECT_PROMPT
   # P0 finding 6 : état consommé au démarrage (post-resume). Sert de référence
   # pour valider chaque transition lue en tête de boucle via legal_transition.
   PREV_ST="$(read_state)"
@@ -495,22 +550,66 @@ $FINAL_AUDIT_PROMPT" > "$AUDIT_CODEX" 2>>"$LOG" \
         echo "[$(date -u +%FT%TZ)] audit P1 OK (Codex seul, PRET A MERGER) -> STATE=WAITING_HUMAN_BOSS_GO -> arret pilote" >> "$LOG"
         exit 0
       fi
-      # FIX 3 : detection de boucle sur audit IDENTIQUE, AVANT d'incrementer
-      # audit_repairs. Si le verdict Codex de ce round est identique mot pour
-      # mot (SHA-256) a celui du round precedent, GLM n a produit AUCUN
-      # changement reel sur le finding signale -> on s'arrete IMMEDIATEMENT en
-      # FAIL (fail-closed), sans boucler jusqu'au plafond MAX_*_REPAIR.
-      # (Post-mortem 30/07 : 6h/16+ rounds perdus a re-emettre le meme finding
-      # sans rien changer ; auparavant une 'tentative diversifiee' laissait
-      # encore 1 round de grace -- desormais FAIL immediat des le 2e round
-      # identique, intervention humaine necessaire.) Le SHA du round courant
-      # est consigne pour la comparaison au round suivant.
+      # --- D-013 (post-post-mortem 30/07 : FIX 3 trop brutal) : detection de
+      # stall en 2 TEMPS, bornee a MAXIMUM 1 redirection chirurgicale vers GLM.
+      # FIX 3 faisait FAIL IMMEDIAT des le 1er stall (2 audits identiques) -- un
+      # point qui aurait pu etre fixe en une derniere tentative ciblee etait
+      # abandonne trop tot. Desormais :
+      #   Round N (audit identique au round N-1, detecte par audit_same_as_previous) :
+      #     - flag redirect_attempt_PHASE.used ABSENT -> extraire les findings du
+      #       rapport Codex, construire un REDIRECT_PROMPT chirurgical, le router
+      #       vers GLM via REVIEW_CLAUDE/REVIEW_CODEX (comme la review de tranche),
+      #       STATE=RUNNING, poser le flag, UNE SEULE fois. Pas de FAIL immediat.
+      #     - flag PRESENT (redirection deja tentee) -> FAIL IMMEDIAT.
+      #   Round N+1 :
+      #     - audit ENCORE identique (sha256 strict via audit_same_as_previous) ->
+      #       stall + flag present -> FAIL IMMEDIAT fail-closed, message exact.
+      #     - audit DIFFERENT (progres reel, meme partiel) -> branche normale,
+      #       reset du flag + nouveau sha consigne, budget audit_repairs standard.
+      # Objectif mesurable : un blocage reel sur un finding non resolu ne JAMAIS
+      # depasser 3 rounds Codex avant FAIL (1 normal + 1 stall + 1 redirection),
+      # au lieu de boucler jusqu au plafond MAX_*_REPAIR (29 rounds observes).
+      # Jamais de boucle, meme deguisee : la redirection est strictement bornee a
+      # 1 tentative par sequence de stall (le flag l interdit physiquement). ---
       STALL_FILE="$RECEIPTS_DIR/last_audit_${PHASE}.sha256"
-      if audit_same_as_previous "$STALL_FILE" "$AUDIT_CODEX"; then
-        echo "FAIL" > "$STATE_FILE"
-        echo "[$(date -u +%FT%TZ)] STALL_DETECTED phase $PHASE : meme finding P1 non resolu apres 2 rounds identiques -> arret fail-closed, intervention humaine necessaire (pas d attente du budget $MAX_REPAIR)" >> "$LOG"
-        exit 0
-      fi
+      REDIRECT_FLAG="$RECEIPTS_DIR/redirect_attempt_${PHASE}.used"
+      STALL_RC=1
+      audit_same_as_previous "$STALL_FILE" "$AUDIT_CODEX" && STALL_RC=0
+      case "$(stall_action "$STALL_RC" "$REDIRECT_FLAG")" in
+        redirect)
+          # 1er stall de la sequence : redirection chirurgicale UNE fois vers GLM.
+          EXTRACTED="$(extract_findings "$AUDIT_CODEX")"
+          REDIRECT_PROMPT="$(build_redirect_prompt "$EXTRACTED")"
+          { echo "REDIRECT_CHIRURGICAL (phase $PHASE, stall : verdict Codex identique au round precedent -- D-013 DERNIERE tentative avant FAIL)";
+            echo "--- REDIRECT_PROMPT ---"; printf '%s\n' "$REDIRECT_PROMPT"; } > "$REVIEW_CLAUDE"
+          cp "$REVIEW_CLAUDE" "$REVIEW_CODEX"
+          mkdir -p "$RECEIPTS_DIR"
+          touch "$REDIRECT_FLAG"
+          # NB : on NE consigne PAS le sha courant dans STALL_FILE et on N
+          # incremente PAS audit_repairs. Le round de redirection doit etre
+          # compare au MEME sha precedent (sinon un audit identique apres
+          # redirection ne serait plus detecte comme stalled). Le sha precedent
+          # reste donc valide pour le round N+1, et la presence du flag force le
+          # FAIL si l audit est encore identique.
+          echo "RUNNING" > "$STATE_FILE"
+          echo "[$(date -u +%FT%TZ)] STALL_DETECTED phase $PHASE : verdict Codex identique au round precedent -> redirection chirurgicale vers GLM (1 seule tentative, flag redirect_attempt_${PHASE}.used pose), STATE=RUNNING, pas de FAIL immediat" >> "$LOG"
+          continue ;;
+        fail)
+          # 2e stall APRES redirection deja tentee : FAIL immediat fail-closed,
+          # message exact exige par D-013. Pas de 3e tentative, pas d attente du
+          # plafond MAX_*_REPAIR.
+          echo "FAIL" > "$STATE_FILE"
+          echo "[$(date -u +%FT%TZ)] STALL_DETECTED phase $PHASE : meme finding non resolu APRES tentative de redirection chirurgicale -> arret fail-closed, intervention humaine necessaire (pas d attente du budget $MAX_REPAIR)" >> "$LOG"
+          exit 0 ;;
+        normal)
+          # Pas stalled : progres reel (audit different). Reset du flag de
+          # redirection pour cette phase -- une NOUVELLE sequence de stall aura
+          # droit a sa propre redirection (bornage par sequence, pas global).
+          if [ -f "$REDIRECT_FLAG" ]; then
+            rm -f "$REDIRECT_FLAG"
+            echo "[$(date -u +%FT%TZ)] phase $PHASE : audit different du precedent apres redirection -> progres reel, reset du flag redirect_attempt, boucle normale (budget audit_repairs standard)" >> "$LOG"
+          fi ;;
+      esac
       mkdir -p "$RECEIPTS_DIR"
       printf '%s' "$(sha256_file "$AUDIT_CODEX")" > "$STALL_FILE"
       audit_repairs=$((audit_repairs+1))

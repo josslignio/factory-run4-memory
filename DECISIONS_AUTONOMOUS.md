@@ -260,3 +260,62 @@ réversible, fail-closed, puis CONTINUE — master order §AUTONOMIE TOTALE).
   lesson_injector/lesson_schema, aucun `run_gate.py` ni `promote`).
 - **Réversible** : oui (aucune modification de code produit ; `CAMPAIGN_STATE`
   reposé sur `READY_FOR_FINAL_AUDIT` = valeur déjà commitée à HEAD).
+
+## D-013 — Détection de stall en 2 temps (1 redirection chirurgicale bornée) — remplace le FAIL immédiat de FIX 3
+- **Contexte** : le fix 28c90de (FIX 3) faisait `FAIL` **immédiat** au 1er stall
+  détecté (2 audits Codex identiques consécutifs, SHA-256 égal). C'était la
+  réaction correcte au post-mortem (29 rounds / 6h+ perdus à boucler sur le même
+  finding), MAIS elle s'est révélée **trop brutale** en pratique : un finding qui
+  aurait pu être résolu en **une** dernière tentative ciblée était abandonné dès
+  le 2e round identique, déclenchant `FAIL` → intervention humaine alors qu'une
+  redirection chirurgicale de GLM aurait suffi. À l'inverse, l'ancien plafond
+  `MAX_*_REPAIR` (boucler jusqu'au budget) était **trop lent** (29 rounds). Ni
+  l'un ni l'autre ne donne le bon compromis vitesse/quota : on veut converger
+  VITE vers un vrai PASS propre, sans boucler 30 fois pour rien ni abandonner
+  trop tôt.
+- **Décision (option la plus sûre, réversible, fail-closed, puis CONTINUE)** :
+  remplacer le `FAIL` immédiat au 1er stall par une détection de stall **en 2
+  temps, bornée à maximum 1 redirection** (jamais une boucle) :
+  1. **Round N** (verdict Codex identique au round N-1, détecté par
+     `audit_same_as_previous` existant) : **ne pas FAIL**. À la place,
+     `extract_findings` extrait les lignes de finding (`fichier.(py|sh|md|json):numéro`)
+     du dernier rapport Codex, `build_redirect_prompt` construit un prompt court
+     et chirurgical, routé vers GLM via `REVIEW_CLAUDE`/`REVIEW_CODEX`
+     (`STATE=RUNNING`, `continue`) — **exactement comme la review de tranche
+     existante**. Un flag `RECEIPTS_DIR/redirect_attempt_${PHASE}.used` est posé
+     pour garantir qu'on ne fait **jamais 2 redirections consécutives**.
+  2. **Round N+1** :
+     - audit **encore identique** (sha256 strict via `audit_same_as_previous`) →
+       stall + flag présent → `FAIL` **immédiat** fail-closed (message exact
+       `meme finding non resolu APRES tentative de redirection chirurgicale ->
+       arret fail-closed`). Pas de 3e tentative, pas d'attente du plafond
+       `MAX_*_REPAIR`.
+     - audit **différent** (progrès réel, même partiel) → branche normale,
+       reset du flag + nouveau sha consigné, budget `audit_repairs` standard.
+  - La table de décision vit dans `stall_action(stalled_rc, flag_path)` →
+    `redirect`/`fail`/`normal` (fonction de production testée réellement).
+- **Objectif mesurable (atteint)** : un blocage réel sur un finding non résolu
+  ne dépasse **JAMAIS 3 rounds Codex** avant `FAIL` (1 normal + 1 stall détecté
+  + 1 redirection chirurgicale), au lieu du plafond `MAX_*_REPAIR` (6) ou de
+  l'ancien comportement observé (29 rounds). La redirection reste **toujours
+  bornée à 1 tentative** (preuve structurelle : exactement 1 seul
+  `touch "$REDIRECT_FLAG"` dans le driver, suivi immédiatement d'un `continue ;;`
+  → jamais de boucle, même déguisée).
+- **Contrainte préservée (Jocelyn)** : Claude reste **HORS** du pilote. Le
+  reviewer est **Codex SEUL** ; aucun appel `claude -p` n'a été réintroduit (la
+  redirection est routée vers **GLM**, pas vers un second reviewer). La
+  boucle reste GLM↔Codex ; on rend seulement cette boucle plus intelligente
+  quand elle mouline.
+- **Intact** : purge cache Codex avant chaque `codex exec` (FIX 1), routage
+  `infra_fail` sur le bruit du bug CLI connu (FIX 2), machine à états
+  `MASTER_ORDER`, D-001 à D-011.
+- **Vérification réelle** : **155 pytest verts** + **184 checks bash verts**
+  (150 driver dont 4 cas (a)-(b)-(c)-(d) + 34 P0-reprise). Les tests prouvent :
+  (a) 1er stall → redirection vers GLM (`REVIEW_CODEX` contient le
+  `REDIRECT_PROMPT` + findings extraits), `STATE=RUNNING`, pas de FAIL ;
+  (b) stall encore identique après redirection → FAIL immédiat, message exact
+  présent ; (c) audit différent après redirection → `normal`, flag reset ;
+  (d) jamais 2 redirections consécutives (stalled + flag = toujours `fail`).
+- **Réversible** : oui (la redirection est un branchement de plus dans le bloc
+  audit ; retirer la branche `redirect` ou le flag restore le FAIL immédiat de
+  FIX 3 sans toucher au reste de la machine à états).

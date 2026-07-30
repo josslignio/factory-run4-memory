@@ -382,10 +382,13 @@ sim_round=1   # round 1 a incremente audit_repairs (cas normal, non stalled)
 cp "$TMP/audit_r1" "$TMP/audit_r2"
 audit_same_as_previous "$STALL_TEST" "$TMP/audit_r2"
 chk "fix3_round2_identical_stalled" "$?" "0"
-# le FAIL se declenche au round 2, strictement AVANT le plafond budgetaire :
+# D-013 : au 1er stall on NE FAIL PLUS immediatement (redirection chirurgical).
+# Le FAIL intervient au PLUS TARD au 3e round Codex (1 normal + 1 stall + 1
+# redirection), strictement AVANT le plafond budgetaire MAX_*_REPAIR :
 plafond=$(grep -oE '^MAX_P0_REPAIR=[0-9]+' "$DRV" | head -1 | cut -d= -f2)
-[ -n "$plafond" ] && [ "$sim_round" -lt "$plafond" ]
-chk "fix3_fail_at_round2_before_plafond($plafond)" "$?" "0"
+sim_fail_round=3
+[ -n "$plafond" ] && [ "$sim_fail_round" -lt "$plafond" ]
+chk "fix3_fail_at_most_round3_before_plafond($plafond)" "$?" "0"
 # anti-faux-positif : deux audits DIFFERENTS ne declenchent PAS le stall.
 printf 'PHASE_P0_FAIL\nautre finding totalement different fichier:ligne\n' > "$TMP/audit_r3"
 audit_same_as_previous "$STALL_TEST" "$TMP/audit_r3"
@@ -399,11 +402,143 @@ chk "fix3_no_prev_file_not_stalled" "$?" "1"
 stall_call=$(grep -nF 'audit_same_as_previous "$STALL_FILE" "$AUDIT_CODEX"' "$DRV" | head -1 | cut -d: -f1)
 [ -n "$stall_call" ] && [ "$stall_call" -lt "$inc_line" ]
 chk "fix3_stall_call_before_audit_repairs_inc" "$?" "0"
-grep -qF 'meme finding P1 non resolu apres 2 rounds identiques -> arret fail-closed, intervention humaine necessaire' "$DRV" \
-  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: FIX3 message de stall fail-closed absent"; }
-# plus de 'tentative diversifiee' (FIX 3 = FAIL immediat, pas de 3e round de grace) :
+# D-013 : message EXACT de FAIL fail-closed APRES redirection chirurgicale
+# (l'ancien message FIX3 'meme finding P1 ... 2 rounds identiques' est remplacé
+# par la 2e etape de la detection de stall bornee a 1 redirection).
+grep -qF 'meme finding non resolu APRES tentative de redirection chirurgicale -> arret fail-closed, intervention humaine necessaire' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: D-013 message de FAIL apres redirection chirurgical absent"; }
+# plus d'ancien mecanisme de diversification obsolete (remplace par D-013 :
+# redirection chirurgical bornee a 1, qui N EST PAS une boucle deguisee) :
 if grep -qiE 'diversified_attempt|STRATEGY_CHANGE_REQUIRED|tentative de strategie' "$DRV"; then
-  fail=$((fail+1)); echo "FAIL: FIX3 mecanisme de diversification obsolete toujours present (doit etre FAIL immediat)"
+  fail=$((fail+1)); echo "FAIL: ancien mecanisme de diversification obsolete toujours present (D-013 le remplace par 1 redirection bornee)"
+else
+  pass=$((pass+1))
+fi
+
+# ====================================================================
+# D-013 (post-post-mortem 30/07) : detection de stall en 2 TEMPS, bornee a
+# max 1 redirection chirurgicale. Remplace le FAIL immediat de FIX 3 au 1er
+# stall par : (N) 1er stall -> extraction findings + redirection GLM (1 fois,
+# flag redirect_attempt_PHASE.used) ; (N+1) stall encore identique OU flag
+# present -> FAIL immediat ; (N+1) audit different -> reset flag, boucle normale.
+# Tests (a)-(d) exiges par le brief : preuves REELLES via les predicats de prod
+# (stall_action, extract_findings, build_redirect_prompt, audit_same_as_previous)
+# + preuves structurelles sur le driver de production.
+# ====================================================================
+
+# --- (a) 1er stall (2 audits identiques, PAS de flag) -> redirection chirurgical
+#     vers GLM, STATE=RUNNING, PAS de FAIL immediat. Preuve par execution REELLE
+#     de stall_action (source: pilote) + extract_findings + build_redirect_prompt. ---
+rm -f "$TMP/d013_a.used"
+chk "d013_a_stall_noflag_redirect" "$(stall_action 0 "$TMP/d013_a.used")" "redirect"
+chk "d013_a_notstall_normal"       "$(stall_action 1 "$TMP/d013_a.used")" "normal"
+# extraction REELLE des findings depuis un faux AUDIT_CODEX :
+printf 'PHASE_P0_FAIL\nfactory/bin/x.py:42 : bug reel P1 non resolu\nfactory/bin/y.sh:10 : autre finding\nbruit sans localisation exploitable\n' > "$TMP/d013_audit_a"
+EXTRACTED="$(extract_findings "$TMP/d013_audit_a")"
+printf '%s\n' "$EXTRACTED" | grep -qF 'factory/bin/x.py:42 : bug reel P1 non resolu' \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013 extract_findings ne capture pas x.py:42"; }
+printf '%s\n' "$EXTRACTED" | grep -qF 'factory/bin/y.sh:10 : autre finding' \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013 extract_findings ne capture pas y.sh:10"; }
+# la ligne sans localisation fichier:numero est ecartee (pas de bruit non exploitable) :
+if printf '%s\n' "$EXTRACTED" | grep -qF 'bruit sans localisation exploitable'; then
+  fail=$((fail+1)); echo "FAIL: d013 extract_findings garde du bruit sans localisation fichier:ligne"
+else pass=$((pass+1)); fi
+# fichier vide/absent -> extraction vide (pas de crash, redirection part en aveugle) :
+chk "d013_extract_empty_returns_empty" "$(extract_findings "$TMP/d013_audit_vide_inexistant")" ""
+# le REDIRECT_PROMPT contient les findings extraits + les instructions chirurgicales :
+RP="$(build_redirect_prompt "$EXTRACTED")"
+printf '%s' "$RP" | grep -qF 'factory/bin/x.py:42 : bug reel P1 non resolu' \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013 REDIRECT_PROMPT sans finding extrait"; }
+printf '%s' "$RP" | grep -qiE 'DERNIERE tentative|patch MINIMAL et CHIRURGICAL|N ESSAIE PAS la meme chose' \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013 REDIRECT_PROMPT sans instructions chirurgicales"; }
+# si aucun finding fichier:ligne, le prompt reste coherent (placeholder d ambiguite) :
+RP_EMPTY="$(build_redirect_prompt '')"
+printf '%s' "$RP_EMPTY" | grep -qiE 'ambiguit|ambigu' \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013 REDIRECT_PROMPT vide sans note d ambiguite"; }
+# preuve structurelle (a) : la branche 'redirect)' route vers GLM via REVIEW_CODEX
+# et maintient STATE=RUNNING (pas de FAIL immediat au 1er stall) :
+grep -qF 'REDIRECT_CHIRURGICAL (phase $PHASE' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013 branche redirect/REVIEW_CODEX absente du driver"; }
+grep -qF 'redirection chirurgicale vers GLM (1 seule tentative' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013 log de redirection STATE=RUNNING absent"; }
+grep -qF 'touch "$REDIRECT_FLAG"' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013 pose du flag redirect_attempt absent"; }
+
+# --- (b) apres redirection, audit SUIVANT encore identique (flag present) ->
+#     FAIL immediat ; message exact exige present dans le driver. ---
+touch "$TMP/d013_b.used"
+chk "d013_b_stall_flag_fail" "$(stall_action 0 "$TMP/d013_b.used")" "fail"
+# (b) preuve REELLE sur 3 rounds simules avec le VRAI sha256_file + le VRAI
+# predicat audit_same_as_previous, faithful au branchement de main() :
+SF_B="$TMP/last_audit_P0_b.sha256"; rm -f "$SF_B" "$TMP/d013_b.used"
+# round 1 : audit A non-PASS, pas de prev -> non stalled -> consigne sha(A).
+printf 'PHASE_P0_FAIL\nfactory/bin/x.py:42 : bug reel P1 non resolu\n' > "$TMP/d013_r1"
+audit_same_as_previous "$SF_B" "$TMP/d013_r1"; chk "d013_b_r1_not_stalled" "$?" "1"
+printf '%s' "$(sha256_file "$TMP/d013_r1")" > "$SF_B"
+# round 2 : audit IDENTIQUE -> stalled, PAS de flag -> redirect (on pose le flag).
+cp "$TMP/d013_r1" "$TMP/d013_r2"
+audit_same_as_previous "$SF_B" "$TMP/d013_r2"; chk "d013_b_r2_stalled" "$?" "0"
+chk "d013_b_r2_action_redirect" "$(stall_action 0 "$TMP/d013_b.used")" "redirect"
+touch "$TMP/d013_b.used"   # main() pose le flag apres redirection
+# round 3 : audit ENCORE IDENTIQUE -> stalled + flag present -> FAIL immediat.
+cp "$TMP/d013_r1" "$TMP/d013_r3"
+audit_same_as_previous "$SF_B" "$TMP/d013_r3"; chk "d013_b_r3_stalled_again" "$?" "0"
+chk "d013_b_r3_action_fail" "$(stall_action 0 "$TMP/d013_b.used")" "fail"
+# le FAIL arrive au round 3, AVANT le plafond MAX_*_REPAIR (jamais plus de 3) :
+[ "3" -lt "$plafond" ]; chk "d013_b_fail_round3_before_plafond($plafond)" "$?" "0"
+
+# --- (c) apres redirection, audit SUIVANT DIFFERENT -> normal, flag reset,
+#     boucle standard avec budget audit_repairs. ---
+touch "$TMP/d013_c.used"
+chk "d013_c_diffaudit_normal_with_flag" "$(stall_action 1 "$TMP/d013_c.used")" "normal"
+# (c) preuve REELLE : round 3 produit un audit B different de A -> non stalled,
+# le flag (encore present) est reset par main(), nouvelle sequence possible.
+SF_C="$TMP/last_audit_P0_c.sha256"; rm -f "$SF_C" "$TMP/d013_c.used"
+printf 'PHASE_P0_FAIL\nfactory/bin/x.py:42 : bug reel P1 non resolu\n' > "$TMP/d013_c_r1"
+printf '%s' "$(sha256_file "$TMP/d013_c_r1")" > "$SF_C"
+touch "$TMP/d013_c.used"   # round 2 a redirige
+printf 'PHASE_P0_FAIL\nfactory/bin/x.py:42 : PARTIELLEMENT corrige (progres reel)\n' > "$TMP/d013_c_r3"
+audit_same_as_previous "$SF_C" "$TMP/d013_c_r3"; chk "d013_c_r3_not_stalled_progress" "$?" "1"
+chk "d013_c_r3_action_normal" "$(stall_action 1 "$TMP/d013_c.used")" "normal"
+# main() reset le flag sur progres reel -> une NOUVELLE sequence a droit a sa redirection :
+grep -qF 'rm -f "$REDIRECT_FLAG"' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013 reset du flag redirect_attempt absent du driver"; }
+grep -qF 'progres reel, reset du flag redirect_attempt, boucle normale (budget audit_repairs standard)' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013 log de reset flag (progres) absent"; }
+
+# --- (d) JAMAIS 2 redirections consecutives pour le meme stall : le flag
+#     empeche une 2e redirection, force le FAIL. Preuve par la table de decision
+#     stall_action (stalled + flag = TOUJOURS fail, jamais redirect) + preuve
+#     structurelle que le driver ne touche le flag QU'UNE fois (1 seul touch). ---
+touch "$TMP/d013_d.used"
+chk "d013_d_stalled_flag_forces_fail" "$(stall_action 0 "$TMP/d013_d.used")" "fail"
+# apres reset (progres reel), une NOUVELLE sequence a droit a 1 redirection :
+rm -f "$TMP/d013_d.used"
+chk "d013_d_new_sequence_allows_redirect" "$(stall_action 0 "$TMP/d013_d.used")" "redirect"
+# table de decision complete de stall_action (anti-regression) :
+rm -f "$TMP/d013_tbl.used"
+chk "d013_tbl_notstalled_noflag_normal"  "$(stall_action 1 "$TMP/d013_tbl.used")" "normal"
+chk "d013_tbl_stalled_noflag_redirect"   "$(stall_action 0 "$TMP/d013_tbl.used")" "redirect"
+touch "$TMP/d013_tbl.used"
+chk "d013_tbl_notstalled_flag_normal"    "$(stall_action 1 "$TMP/d013_tbl.used")" "normal"
+chk "d013_tbl_stalled_flag_fail"         "$(stall_action 0 "$TMP/d013_tbl.used")" "fail"
+# preuve de bornage : EXACTEMENT 1 seul 'touch "$REDIRECT_FLAG"' dans le driver
+# (pas de 2e pose -> jamais de boucle de redirection deguisee) :
+ntouch=$(grep -cF 'touch "$REDIRECT_FLAG"' "$DRV")
+chk "d013_only_one_redirect_touch" "$ntouch" "1"
+# la redirection est immédiatement suivie d'un 'continue ;;' (sort d iteration,
+# ne re-redirige JAMAIS dans la meme iteration) :
+touch_line=$(grep -nF 'touch "$REDIRECT_FLAG"' "$DRV" | head -1 | cut -d: -f1)
+first_continue_after_touch=$(grep -nF 'continue ;;' "$DRV" | awk -F: -v t="$touch_line" '$1 > t {print $1; exit}')
+[ -n "$touch_line" ] && [ -n "$first_continue_after_touch" ] && [ "$first_continue_after_touch" -gt "$touch_line" ]
+chk "d013_redirect_branch_continues_no_loop" "$?" "0"
+# la declaration du flag borne la portee (1 fichier par phase) :
+grep -qF 'REDIRECT_FLAG="$RECEIPTS_DIR/redirect_attempt_${PHASE}.used"' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013 REDIRECT_FLAG non declare dans le driver"; }
+# anti-regression : aucun appel 'claude -p' reintroduit (Claude reste HORS du
+# pilote, reviewer = Codex SEUL -- contrainte Jocelyn) :
+if grep -qE 'claude[[:space:]]+-p|claude[[:space:]]+--print' "$DRV"; then
+  fail=$((fail+1)); echo "FAIL: d013 un appel 'claude -p' a ete reintroduit dans le pilote (interdit)"
 else
   pass=$((pass+1))
 fi

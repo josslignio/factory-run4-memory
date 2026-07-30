@@ -218,5 +218,71 @@ else
   done
 fi
 
+# --- P0 finding 6 (round 16, contre-audit Codex PHASE_P0_FAIL) : l'AUTORITÉ
+# UNIQUE documentée doit être EXTERNE au code ET cohérente. L'audit citait
+# deux contradictions d'autorité désormais corrigées :
+#   (a) MASTER_ORDER § AUTONOMIE énumérait un sous-ensemble de 4 états +
+#       « après 2 repairs », en désaccord avec le § MACHINE À ÉTATS (8 états,
+#       budgets de 30) — seconde autorité contradictoire.
+#   (b) le driver étiquetait la garde mémoire « P1.4 cote driver » alors que
+#       le § MACHINE À ÉTATS (point « Mémoire de leçons ») en fait une garde
+#       P0 — seconde autorité contradictoire.
+# On verrouille les deux corrections + la cohérence croisée état<->doc. ---
+# (a1) plus aucune contradiction « après 2 repairs » dans MASTER_ORDER :
+if grep -qE 'après 2 repairs|apres 2 repairs' "$REPO/MASTER_ORDER_RUN4_MEMORY.md"; then
+  fail=$((fail+1)); echo "FAIL: MASTER_ORDER contient encore 'après 2 repairs' (autorité budget contradictoire)"
+else
+  pass=$((pass+1))
+fi
+# (a2) la section AUTONOMIE ne doit PLUS énumérer un sous-ensemble d'états
+#      (seconde autorité) : on extrait sa 1ère ligne et on exige qu'elle
+#      DEFÉRE au § MACHINE À ÉTATS plutôt que de lister RUNNING/WAITING_INFRA/
+#      FAIL/WAITING_HUMAN_BOSS_GO comme « SEULS arrêts ».
+if grep -E 'Les SEULS arrêts' "$REPO/MASTER_ORDER_RUN4_MEMORY.md" | grep -qE 'MACHINE À ÉTATS|AUTORITÉ UNIQUE'; then
+  pass=$((pass+1))
+else
+  fail=$((fail+1)); echo "FAIL: section AUTONOMIE ne défère pas à l'autorité MACHINE À ÉTATS (énumération contradictoire)"
+fi
+# (a3) non-régression : la section AUTONOMIE ne liste plus les 4 états en
+#      guise de « SEULS » (on vérifie l'absence du pattern 'RUNNING',
+#      'WAITING_INFRA' ... sur la ligne 'SEULS arrêts').
+seulsl=$(grep -E 'Les SEULS arrêts' "$REPO/MASTER_ORDER_RUN4_MEMORY.md" || true)
+if printf '%s' "$seulsl" | grep -qE 'RUNNING.*WAITING_INFRA.*FAIL'; then
+  fail=$((fail+1)); echo "FAIL: section AUTONOMIE énumère encore un sous-ensemble d'états (seconde autorité)"
+else
+  pass=$((pass+1))
+fi
+# (b1) plus aucune étiquette « P1.4 cote driver » (seconde autorité) :
+if grep -qE 'P1\.4 cote driver|P1\.4 côté driver' "$REPO/run_run4_autonomous.sh"; then
+  fail=$((fail+1)); echo "FAIL: driver étiquette encore la garde mémoire 'P1.4 cote driver' (autorité contradictoire)"
+else
+  pass=$((pass+1))
+fi
+# (b2) la garde mémoire du driver défère désormais au § MACHINE À ÉTATS :
+if grep -qE 'MASTER_ORDER § MACHINE À ÉTATS.*Mémoire de leçons|Mémoire de leçons.*MASTER_ORDER § MACHINE À ÉTATS' "$REPO/run_run4_autonomous.sh"; then
+  pass=$((pass+1))
+else
+  fail=$((fail+1)); echo "FAIL: la garde mémoire du driver ne référence pas l'autorité MASTER_ORDER § MACHINE À ÉTATS"
+fi
+
+# (c) cohérence croisée : chacun des 8 états canoniques doit être (i) reconnu
+#     par state_kind (action définie, pas 'illegal') ET (ii) documenté dans le
+#     § MACHINE À ÉTATS du MASTER_ORDER. Réciproquement, aucun état reconnu en
+#     dehors de ces 8 (déjà couvert par les kind_*_BAD ci-dessus). ---
+CANONICAL_STATES="RUNNING READY_FOR_FINAL_AUDIT WAITING_INFRA WAITING_HUMAN_BOSS_GO WAITING_HUMAN FAIL DONE MEMORY_SYSTEM_FAIL"
+for s in $CANONICAL_STATES; do
+  act="$(state_kind "$s")"
+  if [ "$act" = "illegal" ]; then
+    fail=$((fail+1)); echo "FAIL: état canonique $s non reconnu par state_kind (illegal)"
+  else
+    pass=$((pass+1))
+  fi
+  if grep -qF "\`$s\`" "$REPO/MASTER_ORDER_RUN4_MEMORY.md"; then
+    pass=$((pass+1))
+  else
+    fail=$((fail+1)); echo "FAIL: état canonique $s absent du MASTER_ORDER (autorité doc incomplète)"
+  fi
+done
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

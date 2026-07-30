@@ -451,7 +451,14 @@ $FINAL_AUDIT_PROMPT" > "$AUDIT_CODEX" 2>>"$LOG" \
       exit 1 ;;
   esac
 
-  # --- Ordre fusionne 29/07 (P1.4 cote driver) : memoire fail-closed AVANT tout appel agent. ---
+  # --- Garde mémoire fail-closed AVANT tout appel agent (AUTORITÉ UNIQUE :
+  # MASTER_ORDER § MACHINE À ÉTATS, point « Mémoire de leçons »). C'est une
+  # garde P0 de la machine à états, applicable à CHAQUE itération builder
+  # toutes phases confondues — PAS une fonction P1. L'ancien commentaire la
+  # présentait comme un livrable P1 du driver : SECONDE autorité contradictoire
+  # (le prompt P1 point 4 ne fait qu'AJOUTER le test formel de ce hook déjà
+  # existant : « le hook driver existe deja ») ; corrigé pour que la SEULE
+  # autorité des états/gardes soit MASTER_ORDER § MACHINE À ÉTATS. ---
   # rc=0 (leçons trouvees) et rc=2 (memoire valide, aucune leçon pertinente) sont sains ;
   # rc=1 (store corrompu/schema invalide) ou injecteur manquant = MEMORY_SYSTEM_FAIL.
   if [ ! -f "factory/bin/lesson_injector.py" ]; then

@@ -7,7 +7,7 @@ Construire l'**Experience Compiler** : un système qui capture les leçons tiré
 Rien de tout ceci ne remplace un jugement humain — c'est un accélérateur de rappel, pas une automatisation de la décision.
 
 ## AUTONOMIE TOTALE — LE RUN NE S'ARRÊTE JAMAIS POUR DEMANDER (non négociable)
-NE POSE JAMAIS de question à l'humain. N'utilise JAMAIS d'outil de question/clarification/menu. Sur TOUTE ambiguïté → choisis l'option la plus sûre, réversible, fail-closed, écris-la dans `DECISIONS_AUTONOMOUS.md`, et CONTINUE. Les SEULS arrêts autorisés sont des états machine explicites dans `CAMPAIGN_STATE` : `RUNNING`, `WAITING_INFRA` (quota/réseau indisponible), `FAIL` (échec dur après 2 repairs), `WAITING_HUMAN_BOSS_GO` (uniquement en fin de run, mission prouvée ou honnêtement bloquée).
+NE POSE JAMAIS de question à l'humain. N'utilise JAMAIS d'outil de question/clarification/menu. Sur TOUTE ambiguïté → choisis l'option la plus sûre, réversible, fail-closed, écris-la dans `DECISIONS_AUTONOMOUS.md`, et CONTINUE. Les SEULS arrêts autorisés sont les états machine explicites de `CAMPAIGN_STATE` définis par l'**AUTORITÉ UNIQUE** « MACHINE À ÉTATS » ci-dessous (liste complète des états, transitions légales et budgets `MAX_*_REPAIR`). Aucune autre section n'énumère d'état ni de budget : toute liste ailleurs serait une seconde autorité contradictoire et a été retirée (contre-audit : cette ligne listait jadis un sous-ensemble de 4 états et « 2 repairs », en désaccord avec la liste de 8 états et les budgets de 30 — seul tranche le § MACHINE À ÉTATS).
 
 ## RÈGLES ABSOLUES (héritées, non négociables)
 1. stdlib Python uniquement. Aucune dépendance externe, aucune clé API payante, coût additionnel strictement nul.

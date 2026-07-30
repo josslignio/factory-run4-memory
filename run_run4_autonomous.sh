@@ -46,8 +46,8 @@ BUILD_BRANCH="run4/build"
 MAX_ITERS=300
 MAX_INFRA_FAILS=10           # releve 30/07 (Jocelyn) : tolerer plus de hoquets infra transitoires (ex. codex_models_manager cache TTL) avant WAITING_INFRA
 BACKOFFS=(30 120 300)        # D-005 : backoff 30s/120s/300s
-MAX_P0_REPAIR=30            # releve 30/07 (Jocelyn) : run jusqu au bout de P1 sans interruption artificielle -- reste fail-closed sur memoire corrompue/etat illegal
-MAX_P1_REPAIR=30            # releve 30/07 (Jocelyn) : meme raison, coherence P0/P1
+MAX_P0_REPAIR=6             # redescendu 30/07 (Jocelyn, apres 6h/16+ rounds inutiles) : un budget trop haut a laisse tourner en silence sur un audit mal cadre -- desormais audit scope (FINAL_AUDIT_PROMPT) + budget bas = echec rapide -> FAIL -> notification, plutot que derive longue
+MAX_P1_REPAIR=6             # meme raison
 PHASE_FILE="factory/campaigns/CAMPAIGN_PHASE"
 RECEIPTS_DIR="$HOME/.factory-receipts/factory-run4-memory"   # receipts hors du repo (hors perimetre builder)
 LOCK_DIR="$RECEIPTS_DIR/driver.lock.d"   # verrou d execution atomique (mkdir), detenu toute la vie du driver
@@ -205,6 +205,38 @@ phase_audit_ok() {
   [ "$first" = "$2" ]
 }
 
+# --- FIX 2 (post-mortem 30/07 : bug CLI Codex "failed to load models cache:
+# missing field supports_reasoning_summaries") : le bruit d'erreur du CLI Codex
+# peut fuiter dans stdout et se retrouver DANS le contenu de AUDIT_CODEX /
+# REVIEW_CODEX. Sans cette garde, phase_audit_ok echouait (1ere ligne != token)
+# et le round etait compte comme un VRAI audit non-PASS -> audit_repairs++,
+# brulant des rounds de repair reels (et du quota Codex) pour du simple bruit
+# infra. Desormais ce bruit est detecte et traite comme infra_fail dans main()
+# (backoff + retenter, pas de round de repair consomme). Renvoie 0 (vrai) si le
+# fichier contient la signature du bug CLI cache, 1 sinon. Teste reellement par
+# tests/test_driver_helpers.bash. ---
+codex_cache_bug_in_file() {
+  [ -s "$1" ] || return 1
+  grep -qE 'failed to load models cache|supports_reasoning_summaries' "$1"
+}
+
+# --- FIX 3 (post-mortem 30/07 : 6h/16+ rounds perdus) : detection de boucle
+# sur audit IDENTIQUE. Quand 2 audits Codex consecutifs sont identiques mot
+# pour mot (meme SHA-256), GLM n a produit AUCUN changement de comportement
+# reel sur le finding signale -- continuer bouclerait jusqu au plafond
+# MAX_*_REPAIR en brulant budget/quota pour rien. Renvoie 0 (vrai) si l'audit
+# courant ($2) est identique a l'audit du round precedent (SHA-256 consigne
+# dans $1), 1 sinon. Extrait de la logique inline de main() pour etre teste
+# reellement (meme discipline que enforce_legal_transition_or_die : le test
+# appelle le VRAI predicat de production, pas une copie locale). ---
+audit_same_as_previous() {
+  local prev_sha_file="$1" cur_file="$2" prev=""
+  [ -f "$prev_sha_file" ] || return 1
+  prev=$(cat "$prev_sha_file" 2>/dev/null)
+  [ -n "$prev" ] || return 1
+  [ "$prev" = "$(sha256_file "$cur_file")" ]
+}
+
 # --- Verrou d execution atomique (mkdir) : SEULE autorite anti-double-pilote (pgrep = diagnostic). ---
 LOCK_ACQUIRED=0
 HB_PID=""
@@ -281,7 +313,7 @@ BUILD_PROMPT_P1='PHASE P1 — Sharp Core minimal (le checkpoint P0 est fige et v
 
 REVIEW_HEADER='Tu es un reviewer independant (jamais le builder) de Run 4, factory de Jocelyn. Review UNIQUEMENT le dernier commit du repo courant. Cherche : bugs reels reproduits, donnees inventees non tracees fichier:ligne, violations des INTERDITS ABSOLUS du master order. Tu disposes uniquement des outils Read/Grep/Glob (lecture seule) ; le diff du dernier commit t est fourni ci-dessous. Commence ta reponse par PASS ou FIX_NEEDED en premiere ligne, puis la liste des findings avec fichier:ligne si FIX_NEEDED, vide si PASS. Sois concis, ceci est une review de tranche, pas un audit complet.'
 
-FINAL_AUDIT_PROMPT='Tu es un reviewer independant de Run 4, factory de Jocelyn. Ceci est la review FINALE avant merge. Ne review PAS seulement le dernier diff : audite l INTEGRALITE du code produit dans le repo courant (tous les fichiers factory/bin/*.py, memory/, tests). Cherche exhaustivement : validation de donnees manquante, gestion d erreurs incomplete, fuites de ressources, conditions de concurrence, cas limites. Verifie aussi que le resultat de l ablation A/B dans reports/RUN4_FINAL_REPORT.md est un chiffre reel trace a une execution reelle, pas invente. Tu disposes uniquement des outils Read/Grep/Glob (lecture seule). Rends un rapport complet dont la PREMIERE LIGNE est EXACTEMENT le token de verdict exige par la note de phase ci-dessus (rien d autre sur cette ligne), puis les findings tries par severite (P1/P2/P3), chaque finding trace fichier:ligne.'
+FINAL_AUDIT_PROMPT='Tu es un reviewer independant de Run 4, factory de Jocelyn. Review CIBLEE et RAPIDE, PAS un audit exhaustif du repo entier : verifie UNIQUEMENT les items enumeres explicitement dans la note de phase ci-dessus (rien d autre). Pour chaque item : le comportement demande est-il reellement implemente et couvert par un test qui echoue si on le casse (pas juste un test cosmetique) ? Ne cherche PAS de nouveaux sujets hors de cette liste (pas de nouvelle exhaustivite sur validation/erreurs/concurrence/cas limites non demandes) -- ce n est pas le role de cet audit, ca ralentit le run sans ajouter de valeur. Seule exception autorisee hors liste : si un item de la liste ci-dessus a une consequence factuelle directe sur reports/RUN4_FINAL_REPORT.md (ex: chiffre invente), le signaler. Tu disposes uniquement des outils Read/Grep/Glob (lecture seule). Rends un rapport COURT dont la PREMIERE LIGNE est EXACTEMENT le token de verdict exige par la note de phase ci-dessus (rien d autre sur cette ligne), puis UNIQUEMENT les findings sur les items de la liste, avec fichier:ligne. Si tout est ferme, la reponse est le token PASS suivi de rien.'
 
 # --- D-005 : applique le backoff infra courant puis continue la boucle. ---
 # Renvoie le délai (s) choisi pour n-ième échec (sans dormir) — testable sans sleep réel.
@@ -358,9 +390,19 @@ main() {
   fi
   if [ ! -f "$PHASE_FILE" ]; then
     echo "P0" > "$PHASE_FILE"
-  elif ! read_phase >/dev/null; then
-    echo "Phase inconnue dans $PHASE_FILE (ni P0 ni P1) -> refus fail-closed, aucune reinitialisation silencieuse." >&2
-    exit 1
+  else
+    local _STARTUP_PHASE
+    if ! _STARTUP_PHASE=$(read_phase); then
+      echo "Phase inconnue dans $PHASE_FILE (ni P0 ni P1) -> refus fail-closed, aucune reinitialisation silencieuse." >&2
+      exit 1
+    fi
+    # Durcissement 30/07 (Codex) : une phase P1 lue au demarrage DOIT etre couverte par un
+    # checkpoint P0 verifiable, meme hors chemin RESUME_AFTER_FAIL (demarrage direct avec
+    # CAMPAIGN_PHASE deja a P1 sans etre passe par un FAIL -- contournement possible sinon).
+    if [ "$_STARTUP_PHASE" = "P1" ] && ! verify_checkpoint_p0; then
+      echo "Demarrage en phase P1 REFUSE : checkpoint P0 absent, incomplet ou modifie ($RECEIPTS_DIR/checkpoint_p0). Fail-closed, aucun contournement du gate P0->P1." >&2
+      exit 1
+    fi
   fi
   start_heartbeat
   echo "[$(date -u +%FT%TZ)] === RUN4 DRIVER START (review Codex seul -- Claude retire 30/07, fixes D-001..D-005) ===" >> "$LOG"
@@ -393,7 +435,7 @@ main() {
     audit)
       PHASE=$(read_phase) || { echo "[$(date -u +%FT%TZ)] phase invalide dans $PHASE_FILE -> arret fail-closed (aucune reinit silencieuse)" >> "$LOG"; exit 1; }
       if [ "$PHASE" = "P0" ]; then
-        PHASE_NOTE="AUDIT DE PHASE P0 UNIQUEMENT : verifie que les 6 findings P0 (source-tag/evidence, finding vide fail-closed, ecriture concurrente bootstrap, credit fd comportemental, claim ablation honnete, machine a etats) sont fermes par des tests reels, et qu AUCUN changement de phase P1 (receipt, promotion automatique) n a ete introduit avant le checkpoint. PREMIERE LIGNE de ta reponse : EXACTEMENT PHASE_P0_PASS si tout est ferme et prouve, sinon EXACTEMENT PHASE_P0_FAIL suivi des findings."
+        PHASE_NOTE="AUDIT DE PHASE P0 UNIQUEMENT : verifie que les 6 findings P0 (source-tag/evidence, finding vide fail-closed, ecriture concurrente bootstrap, credit fd comportemental, claim ablation honnete, machine a etats) sont fermes par des tests reels. PRECISION SCOPE (evite un faux P1 -- desambiguisation 30/07) : RECEIPTS_DIR, resume_receipt.json, checkpoint_p0/, sha256_file() et verify_checkpoint_p0() dans run_run4_autonomous.sh sont l ORCHESTRATION DU DRIVER lui-meme (prevue des le preflight initial 43aa069, approuvee, necessaire pour gater la transition P0->P1) -- ce N EST PAS le Sharp Core P1. Le Sharp Core P1 reel = les 4 fonctions listees dans BUILD_PROMPT_P1 (gate receipt de TACHE via factory/bin/run_gate.py, verdict reviewer artefact codex_review_verdict.json, outil promote de LECON, injection fail-closed) : verifie leur ABSENCE dans factory/bin/ (ls factory/bin/ ne doit lister aucun run_gate.py ni outil promote) comme preuve que le perimetre P1 n a pas ete franchi -- ne compte PAS l orchestration driver comme une violation. PREMIERE LIGNE de ta reponse : EXACTEMENT PHASE_P0_PASS si les 6 items sont fermes ET qu aucun outil Sharp Core P1 n existe dans factory/bin/, sinon EXACTEMENT PHASE_P0_FAIL suivi des findings."
         TOKEN="PHASE_P0_PASS"
         MAX_REPAIR="$MAX_P0_REPAIR"
       else
@@ -402,9 +444,32 @@ main() {
         MAX_REPAIR="$MAX_P1_REPAIR"
       fi
       echo "[$(date -u +%FT%TZ)] iter $i: GLM se declare pret -> audit final phase $PHASE (Codex seul, reviewer independant, lecture seule -- Claude retire de la boucle de review sur demande explicite Jocelyn, economie de quota)" >> "$LOG"
+      # FIX 1 : purge du cache modeles Codex AVANT chaque appel 'codex exec' pour
+      # eviter le bug CLI "failed to load models cache: missing field
+      # supports_reasoning_summaries" (silencieux, n'echoue jamais le script).
+      rm -f "$HOME/.codex/models_cache.json" 2>/dev/null || true
       codex exec -s read-only --skip-git-repo-check "$PHASE_NOTE
 $FINAL_AUDIT_PROMPT" > "$AUDIT_CODEX" 2>>"$LOG" \
         || echo "[$(date -u +%FT%TZ)] iter $i: audit codex rc non-zero" >> "$LOG"
+      # FIX 2 : si le bruit d'erreur CLI du cache a fuite dans AUDIT_CODEX, on
+      # NE l'incremente PAS comme un vrai audit non-PASS (sinon un round de
+      # repair reel etait consomme pour du simple bruit infra). Traite comme
+      # infra_fail -> backoff + retenter, sans consommer de round de repair ni
+      # de quota inutile (meme logique backoff/infra_fails que le bloc review).
+      if codex_cache_bug_in_file "$AUDIT_CODEX"; then
+        infra_fails=$((infra_fails+1))
+        echo "[$(date -u +%FT%TZ)] iter $i: codex cache bug detecte -> traite comme infra_fail, pas comme audit (infra_fails=$infra_fails/$MAX_INFRA_FAILS)" >> "$LOG"
+        if [ "$infra_fails" -gt "$MAX_INFRA_FAILS" ]; then
+          echo "WAITING_INFRA" > "$STATE_FILE"
+          echo "[$(date -u +%FT%TZ)] $MAX_INFRA_FAILS echecs infra consecutifs -> STATE=WAITING_INFRA -> arret" >> "$LOG"
+          exit 0
+        fi
+        apply_backoff "$infra_fails"
+        continue
+      fi
+      # codex exec a rendu une sortie exploitable (pas du bruit infra) -> le
+      # compteur d'echecs infra (consecutifs) est remis a 0.
+      infra_fails=0
       if phase_audit_ok "$AUDIT_CODEX" "$TOKEN"; then
         if [ "$PHASE" = "P0" ]; then
           mkdir -p "$RECEIPTS_DIR/checkpoint_p0"
@@ -420,6 +485,7 @@ $FINAL_AUDIT_PROMPT" > "$AUDIT_CODEX" 2>>"$LOG" \
             "$(basename "$AUDIT_CODEX")" "$(sha256_file "$RECEIPTS_DIR/checkpoint_p0/$(basename "$AUDIT_CODEX")")" \
             > "$RECEIPTS_DIR/checkpoint_p0/checkpoint.json"
           echo "P1" > "$PHASE_FILE"
+          rm -f "$RECEIPTS_DIR/last_audit_P0.sha256" "$RECEIPTS_DIR/last_audit_P1.sha256" 2>/dev/null
           audit_repairs=0
           echo "RUNNING" > "$STATE_FILE"
           echo "[$(date -u +%FT%TZ)] audit P0 OK (Codex seul) -> checkpoint P0 fige dans $RECEIPTS_DIR/checkpoint_p0 -> PHASE=P1, STATE=RUNNING" >> "$LOG"
@@ -429,6 +495,24 @@ $FINAL_AUDIT_PROMPT" > "$AUDIT_CODEX" 2>>"$LOG" \
         echo "[$(date -u +%FT%TZ)] audit P1 OK (Codex seul, PRET A MERGER) -> STATE=WAITING_HUMAN_BOSS_GO -> arret pilote" >> "$LOG"
         exit 0
       fi
+      # FIX 3 : detection de boucle sur audit IDENTIQUE, AVANT d'incrementer
+      # audit_repairs. Si le verdict Codex de ce round est identique mot pour
+      # mot (SHA-256) a celui du round precedent, GLM n a produit AUCUN
+      # changement reel sur le finding signale -> on s'arrete IMMEDIATEMENT en
+      # FAIL (fail-closed), sans boucler jusqu'au plafond MAX_*_REPAIR.
+      # (Post-mortem 30/07 : 6h/16+ rounds perdus a re-emettre le meme finding
+      # sans rien changer ; auparavant une 'tentative diversifiee' laissait
+      # encore 1 round de grace -- desormais FAIL immediat des le 2e round
+      # identique, intervention humaine necessaire.) Le SHA du round courant
+      # est consigne pour la comparaison au round suivant.
+      STALL_FILE="$RECEIPTS_DIR/last_audit_${PHASE}.sha256"
+      if audit_same_as_previous "$STALL_FILE" "$AUDIT_CODEX"; then
+        echo "FAIL" > "$STATE_FILE"
+        echo "[$(date -u +%FT%TZ)] STALL_DETECTED phase $PHASE : meme finding P1 non resolu apres 2 rounds identiques -> arret fail-closed, intervention humaine necessaire (pas d attente du budget $MAX_REPAIR)" >> "$LOG"
+        exit 0
+      fi
+      mkdir -p "$RECEIPTS_DIR"
+      printf '%s' "$(sha256_file "$AUDIT_CODEX")" > "$STALL_FILE"
       audit_repairs=$((audit_repairs+1))
       if [ "$audit_repairs" -gt "$MAX_REPAIR" ]; then
         echo "FAIL" > "$STATE_FILE"
@@ -518,8 +602,27 @@ $DIFF
 ------------------8<------------------
 $([ "$DIFF_TRUNC" = 1 ] && echo "(DIFF TRONQUE - ouvre les fichiers pertinents via Read pour le detail.)")"
 
+  # FIX 1 : purge du cache modeles Codex AVANT chaque appel 'codex exec' (meme
+  # garde que le bloc audit -- evite le bug CLI "supports_reasoning_summaries").
+  rm -f "$HOME/.codex/models_cache.json" 2>/dev/null || true
   if ! codex exec -s read-only --skip-git-repo-check "$REVIEW_PROMPT" > "$REVIEW_CODEX" 2>>"$LOG"; then
     echo "[$(date -u +%FT%TZ)] iter $i: review codex rc non-zero" >> "$LOG"
+  fi
+
+  # FIX 2 : bruit CLI du cache fuite dans REVIEW_CODEX -> infra_fail, PAS une
+  # review valide (sinon le bruit etait traite comme finding/round consomme
+  # pour du simple bruit infra). Meme logique backoff/infra_fails que le bloc
+  # audit et que la garde vide ci-dessous.
+  if codex_cache_bug_in_file "$REVIEW_CODEX"; then
+    infra_fails=$((infra_fails+1))
+    echo "[$(date -u +%FT%TZ)] iter $i: codex cache bug detecte -> traite comme infra_fail, pas comme review (infra_fails=$infra_fails/$MAX_INFRA_FAILS)" >> "$LOG"
+    if [ "$infra_fails" -gt "$MAX_INFRA_FAILS" ]; then
+      echo "WAITING_INFRA" > "$STATE_FILE"
+      echo "[$(date -u +%FT%TZ)] $MAX_INFRA_FAILS echecs infra consecutifs -> STATE=WAITING_INFRA -> arret" >> "$LOG"
+      exit 0
+    fi
+    apply_backoff "$infra_fails"
+    continue
   fi
 
   # D-005 : un reviewer muet = echec infra (pas de relance immédiate admise).

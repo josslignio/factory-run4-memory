@@ -292,5 +292,121 @@ for s in $CANONICAL_STATES; do
   fi
 done
 
+# ====================================================================
+# FIX 1+2+3 (post-mortem 30/07 : bug CLI Codex « failed to load models cache:
+# missing field supports_reasoning_summaries » + boucle sur finding identique).
+# Regression reelle : le bruit d'erreur CLI fuyait DANS AUDIT_CODEX/REVIEW_CODEX
+# et etait compte comme un VRAI audit/review non-PASS -> audit_repairs++ (round
+# de repair reel consomme pour du simple bruit infra), jusqu'a 29/30 rounds et
+# plusieurs heures / quota Codex perdus. Ces tests prouvent que desormais :
+# (FIX 2/a) un output contenant le bruit CLI -> infra_fail, audit_repairs intact ;
+# (FIX 3/b) deux audits IDENTIQUES consecutifs -> FAIL immediat (avant plafond).
+# ====================================================================
+
+# --- FIX 1 : purge du cache Codex AVANT CHAQUE 'codex exec'. Il y a exactement
+# 2 appels 'codex exec' (audit final + review de tranche) -> exactement 2 purges,
+# chacune precedant lexicalement son appel (intercalage p1 < c1 < p2 < c2). ---
+DRV="$REPO/run_run4_autonomous.sh"
+purge_lines=($(grep -nF 'rm -f "$HOME/.codex/models_cache.json"' "$DRV" | cut -d: -f1))
+codex_lines=($(grep -nE 'codex exec -s read-only' "$DRV" | cut -d: -f1))
+chk "fix1_two_cache_purges"  "${#purge_lines[@]}" "2"
+chk "fix1_two_codex_exec"    "${#codex_lines[@]}" "2"
+# intercalage strict : purge1 < codex1 < purge2 < codex2 (chaque codex exec est
+# precede de sa purge, dans le bon bloc ; jamais de codex exec avant la 1re purge).
+if [ "${#purge_lines[@]}" -eq 2 ] && [ "${#codex_lines[@]}" -eq 2 ] \
+   && [ "${purge_lines[0]}" -lt "${codex_lines[0]}" ] \
+   && [ "${codex_lines[0]}" -lt "${purge_lines[1]}" ] \
+   && [ "${purge_lines[1]}" -lt "${codex_lines[1]}" ]; then
+  pass=$((pass+1))
+else
+  fail=$((fail+1)); echo "FAIL: FIX1 purge(s) cache non intercalees avant chaque codex exec (p=${purge_lines[*]} c=${codex_lines[*]})"
+fi
+# la purge doit etre silencieuse et ne jamais faire echouer le script :
+grep -qF 'rm -f "$HOME/.codex/models_cache.json" 2>/dev/null || true' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: FIX1 purge cache non silencieuse/fail-safe"; }
+
+# --- FIX 2 (a) : un output codex contenant le bruit CLI du cache est traite
+# comme infra_fail, PAS comme un audit valide -> n'incremente PAS audit_repairs.
+# Preuve unitaire par execution REELLE du predicat de production
+# codex_cache_bug_in_file (source: pilote). ---
+printf 'PHASE_P0_FAIL\nfactory/bin/x.py:42 bug reel\n' > "$TMP/clean_audit"
+printf 'ERROR codex_models_manager::cache: failed to load models cache: missing field `supports_reasoning_summaries` at line 88 column 5\n' > "$TMP/bug_cache"
+printf 'supports_reasoning_summaries absent du schema\nPHASE_P0_FAIL\n' > "$TMP/bug_field"
+: > "$TMP/empty_audit"
+chk "fix2_clean_audit_not_bug"   "$(codex_cache_bug_in_file "$TMP/clean_audit";   echo $?)" "1"
+chk "fix2_bug_failedtoload_is_bug" "$(codex_cache_bug_in_file "$TMP/bug_cache";  echo $?)" "0"
+chk "fix2_bug_supportsfield_is_bug" "$(codex_cache_bug_in_file "$TMP/bug_field"; echo $?)" "0"
+chk "fix2_empty_not_bug"         "$(codex_cache_bug_in_file "$TMP/empty_audit";  echo $?)" "1"
+chk "fix2_missing_not_bug"       "$(codex_cache_bug_in_file "$TMP/nope";         echo $?)" "1"
+# Preuve comportementale : on rejoue la branche exacte du bloc audit avec un
+# faux AUDIT_CODEX contenant le bruit CLI -> on entre dans infra_fail et on
+# n'atteint JAMAIS l'increment audit_repairs (round de repair non consomme).
+sim_ar=0; sim_inf=0
+printf 'failed to load models cache: missing field `supports_reasoning_summaries`\n' > "$TMP/sim_audit"
+if codex_cache_bug_in_file "$TMP/sim_audit"; then
+  sim_inf=$((sim_inf+1))     # traite comme infra_fail (ce que fait main)
+else
+  sim_ar=$((sim_ar+1))       # branche VRAI audit non-PASS (inatteignable ici)
+fi
+chk "fix2_sim_buggy_increments_infra"     "$sim_inf" "1"
+chk "fix2_sim_buggy_leaves_audit_repairs" "$sim_ar"  "0"
+# Preuve structurelle : dans main(), la garde cache-bug du bloc audit est placee
+# AVANT tout 'audit_repairs=$((audit_repairs+1))' (donc inatteignable si bug).
+guard_line=$(grep -nF 'if codex_cache_bug_in_file "$AUDIT_CODEX"' "$DRV" | head -1 | cut -d: -f1)
+inc_line=$(grep -nF 'audit_repairs=$((audit_repairs+1))' "$DRV" | head -1 | cut -d: -f1)
+[ -n "$guard_line" ] && [ -n "$inc_line" ] && [ "$guard_line" -lt "$inc_line" ]
+chk "fix2_cache_guard_before_audit_repairs_inc" "$?" "0"
+grep -qF 'codex cache bug detecte -> traite comme infra_fail, pas comme audit' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: FIX2 ne logge pas le routage infra_fail (audit)"; }
+grep -qF 'codex cache bug detecte -> traite comme infra_fail, pas comme review' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: FIX2 ne logge pas le routage infra_fail (review)"; }
+# la garde cache-bug du bloc audit route bien vers infra_fails (PAS audit_repairs) :
+audit_block_bug=$(grep -nE 'infra_fails=\$\(\(infra_fails\+1\)\)' "$DRV" | head -1 | cut -d: -f1)
+[ -n "$audit_block_bug" ] && [ "$audit_block_bug" -gt "$guard_line" ] && [ "$audit_block_bug" -lt "$inc_line" ]
+chk "fix2_infra_inc_between_guard_and_audit_inc" "$?" "0"
+
+# --- FIX 3 (b) : deux audits Codex IDENTIQUES consecutifs declenchent FAIL
+# IMMEDIATEMENT, sans attendre le plafond MAX_*_REPAIR. Preuve par execution
+# REELLE du predicat audit_same_as_previous (source: pilote) + mecanisme de
+# consignation SHA, sur 2 rounds simules avec le VRAI sha256_file. ---
+STALL_TEST="$TMP/last_audit_P0.sha256"
+rm -f "$STALL_TEST"
+# round 1 : audit non-PASS, aucun SHA precedent -> pas stalled (cas normal).
+printf 'PHASE_P0_FAIL\nfactory/bin/x.py:42 : bug reel P1 non resolu\n' > "$TMP/audit_r1"
+audit_same_as_previous "$STALL_TEST" "$TMP/audit_r1"
+chk "fix3_round1_not_stalled" "$?" "1"
+# main() consigne le SHA du round courant pour la comparaison suivante :
+printf '%s' "$(sha256_file "$TMP/audit_r1")" > "$STALL_TEST"
+sim_round=1   # round 1 a incremente audit_repairs (cas normal, non stalled)
+# round 2 : GLM n a RIEN change -> audit IDENTIQUE mot pour mot.
+cp "$TMP/audit_r1" "$TMP/audit_r2"
+audit_same_as_previous "$STALL_TEST" "$TMP/audit_r2"
+chk "fix3_round2_identical_stalled" "$?" "0"
+# le FAIL se declenche au round 2, strictement AVANT le plafond budgetaire :
+plafond=$(grep -oE '^MAX_P0_REPAIR=[0-9]+' "$DRV" | head -1 | cut -d= -f2)
+[ -n "$plafond" ] && [ "$sim_round" -lt "$plafond" ]
+chk "fix3_fail_at_round2_before_plafond($plafond)" "$?" "0"
+# anti-faux-positif : deux audits DIFFERENTS ne declenchent PAS le stall.
+printf 'PHASE_P0_FAIL\nautre finding totalement different fichier:ligne\n' > "$TMP/audit_r3"
+audit_same_as_previous "$STALL_TEST" "$TMP/audit_r3"
+chk "fix3_different_audit_not_stalled" "$?" "1"
+# predicat robuste : pas de fichier memoire -> pas stalled (1er round d'une phase).
+rm -f "$STALL_TEST"
+audit_same_as_previous "$STALL_TEST" "$TMP/audit_r1"
+chk "fix3_no_prev_file_not_stalled" "$?" "1"
+# Preuve structurelle : main() appelle le VRAI predicat et ecrit FAIL + message
+# exact, AVANT tout 'audit_repairs=$((audit_repairs+1))' (FAIL prioritaire sur budget).
+stall_call=$(grep -nF 'audit_same_as_previous "$STALL_FILE" "$AUDIT_CODEX"' "$DRV" | head -1 | cut -d: -f1)
+[ -n "$stall_call" ] && [ "$stall_call" -lt "$inc_line" ]
+chk "fix3_stall_call_before_audit_repairs_inc" "$?" "0"
+grep -qF 'meme finding P1 non resolu apres 2 rounds identiques -> arret fail-closed, intervention humaine necessaire' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: FIX3 message de stall fail-closed absent"; }
+# plus de 'tentative diversifiee' (FIX 3 = FAIL immediat, pas de 3e round de grace) :
+if grep -qiE 'diversified_attempt|STRATEGY_CHANGE_REQUIRED|tentative de strategie' "$DRV"; then
+  fail=$((fail+1)); echo "FAIL: FIX3 mecanisme de diversification obsolete toujours present (doit etre FAIL immediat)"
+else
+  pass=$((pass+1))
+fi
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

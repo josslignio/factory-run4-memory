@@ -3,9 +3,10 @@
 > Preuve par ablation de l'efficacité de la mémoire injectée. Chiffres
 > RÉELS produits par `factory/bin/ablation_checker.py` (bug-detector
 > déterministe, stdlib, **7 règles statiques sur 8 + L-16 comportementale**
-> (elle exécute le source de `acquire_lock` sous un faux `os`/`fcntl` pour
-> compter les fd réellement fermés — voir §7), 8 règles validées par
-> `tests/test_ablation_checker.py` 40/40 OK). Aucun chiffre inventé.
+> (elle exécute le source de `acquire_lock` sous un bac à sable à liste
+> blanche d'imports + builtins restreints pour compter les fd réellement
+> fermés — voir §7), 8 règles validées par
+> `tests/test_ablation_checker.py` 43/43 OK). Aucun chiffre inventé.
 > Trace d'exécution datée et reproductible archivée dans
 > `ablation/ABLATION_RUN_LOG.txt` (append-only **par convention d'écriture**,
 > NON tamper-evident, NON scellé cryptographiquement — voir §8 ; 2 blocs :
@@ -127,14 +128,18 @@ rappel de l'injecteur, pas du mécanisme de mémoire lui-même.
   A/B ci-dessus ne dépendent donc pas d'une exécution. Les défauts non
   visibles dans le source (deadlocks subtils, perf, comportement OS-spécifique)
   restent non mesurés. Les 8 règles sont validées sur snippets défectueux ET
-  sains (**40/40 tests**, incluant 4 mutants L-16 à fermeture textuelle mais
+  sains (**43/43 tests**, incluant 4 mutants L-16 à fermeture textuelle mais
   fuite réelle : `return False` sans close, `.close()` sur ressource sans
-  rapport, `if False: os.close(fd)` mortelle, `os.close(0)` mauvais fd).
-  Limite du bac à sable (honnête) : seuls `os`/`fcntl` sont fakes ; tout
-  autre effet de bord top-level d'un fichier analysé s'exécuterait réellement.
-  Dans cette ablation les sources analysées sont des fichiers contrôlés du
-  repo (les deux bras) — pas du code non fiable. Ne pointez pas le checker
-  sur du code adversarial sans isoler par subprocess/timeout.
+  rapport, `if False: os.close(fd)` mortelle, `os.close(0)` mauvais fd ; plus
+  3 tests de neutralisation du bac à sable — reprise FAIL 27/07, P1 audit
+  Codex #2).
+  Bac à sable (honnête) : `__import__` est intercepté en **liste blanche**
+  (`os`/`fcntl` = fakes sans effet de bord OS ; `pathlib` = réel et sûr, requis
+  par le bras GOOD_LOCK mesuré ; tout autre module `subprocess`/`socket`/…
+  REFUSÉ) et les builtins dangereux (`open`/`exec`/`eval`/`compile`) sont
+  retirés → un source analysé ne peut ni faire d'I/O fichier ni importer de
+  module dangereux au top-level. Défense en profondeur, **pas une frontière de
+  sécurité dure** : pour du code adversarial, isoler par subprocess/timeout.
 - **Pas de boucle reviewer** : la métrique « nombre de tours de review
   avant PASS » du master order §4 n'est pas mesurable en exécution
   headless autonome (pas de reviewer disponible dans la boucle d'ablation).

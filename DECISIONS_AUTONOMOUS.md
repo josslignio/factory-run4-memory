@@ -142,3 +142,50 @@ réversible, fail-closed, puis CONTINUE — master order §AUTONOMIE TOTALE).
   re-jouée → 5/1 → 2/0 cohérent avec le rapport corrigé.
 - **Réversible** : oui (flock levé en finally ; .lock est un fichier
   auxiliaire sans impact sur lessons.jsonl lui-même).
+
+## D-010 — Reprise FAIL 27/07 : adresser les 2 P1 de l'audit Codex OUTRE les 6 items
+- **Contexte** : reprise « PHASE P0 UNIQUEMENT — Reprise Run 4 après FAIL du
+  27/07 ». Les 6 items du cœur P0 étaient déjà fixés et commités (rounds
+  précédents), et leur vérification réelle est PASSÉE (19 pytest ciblés +
+  66 assertions bash). Mais l'audit Codex qui a provoqué le FAIL
+  (`reports/run4-review-latest-codex.md` / `RUN4_FINAL_AUDIT_CODEX.md`,
+  verdict `PHASE_P0_FAIL`) relevait 2 P1 SUPPLÉMENTAIRES, hors de la liste
+  des 6 items. Le `CAMPAIGN_STATE` commité `READY_FOR_FINAL_AUDIT` avait été
+  remis à `RUNNING`.
+- **Ambiguïté** : la consigne dit « Corrige les 6 défauts suivants, RIEN
+  d'autre ». Les 2 P1 ne sont PAS dans la liste des 6.
+- **Décision (option la plus sûre, réversible, fail-closed, puis CONTINUE)** :
+  - Les 2 P1 sont des défauts de code du CŒUR P0 (`lesson_extractor.py`,
+    `ablation_checker.py`), NON des fonctionnalités de phase P1. Le
+    parenthèse « RIEN d'autre » illustre cela par des fonctionnalités P1
+    (Sharp Core, receipt, promotion auto) — pas des défauts P0. Règle 5 du
+    master order (« un finding P1 reproduit est fixé avant de continuer »)
+    s'applique donc. Une « reprise après FAIL » qui se contenterait de
+    restaurer `READY` sans traiter la CAUSE du FAIL (les 2 P1) ne serait pas
+    une reprise mais la répétition exacte de l'échec (le même audit Codex
+    retournerait `PHASE_P0_FAIL` sur les mêmes 2 P1).
+  - **P1-1** (`lesson_extractor._write_jsonl_fresh`) : un `--out` concurrent
+    aux ids DISTINCTS du second processus ne voyait aucune collision puis
+    exécutait `os.replace`, effaçant silencieusement le résultat valide du
+    premier (le test ne couvrait que les mêmes ids). Fix : un `--out` ne peut
+    écrire que sur un fichier absent/vide ; tout id valide ÉTRANGER à
+    l'écriture fraîche -> refus fail-closed SOUS verrou (aucune perte
+    silencieuse). Test réel ajouté : 2 sous-processus parallèles aux ids
+    distincts -> `[0,1]` (un gagnant + un refus propre), contenu préservé.
+  - **P1-2** (`ablation_checker._measure_acquire_lock_fd_closure`) : le bac à
+    sable n'interceptait que `os`/`fcntl` -> `import subprocess` et
+    `open(...)` au top-level d'un fichier analysé s'exécutaient pour de vrai
+    (vecteur d'exécution de code local). Fix : `__import__` en liste blanche
+    (`os`/`fcntl` fakes, `pathlib` réel et sûr requis par GOOD_LOCK, tout
+    autre module REFUSÉ) + retrait des builtins dangereux
+    (`open`/`exec`/`eval`/`compile`). Les bras réels d'ablation n'ayant qu'un
+    `except BlockingIOError` isolé, cette mesure n'est JAMAIS appelée sur
+    eux -> les chiffres A/B (A=5/1 → B=2/0) sont INTACTS (re-vérifié).
+    Tests réels ajoutés : toplevel `open(marker)` neutralisé (aucun fichier
+    créé), `import subprocess` refusé, source sûr toujours mesuré `True`.
+- **Vérification réelle** : 133 pytest + 66/66 bash verts ; ablation re-jouée
+  → A=5/1P1 → B=2/0P1 inchangés ; chiffres A/B non dépendants de la mesure.
+- **Réversible** : oui (commits séparés par P1 ; le contrat `--out` fresh sur
+  fichier vide/absent est un resserrement de sécurité, pas un changement
+  sémantique pour les usages légitimes — le bootstrap utilise son propre
+  `write_jsonl` sans logique de collision).

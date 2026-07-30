@@ -64,7 +64,7 @@
       "severity": "P2",
       "status": "present",
       "evidence": "ablation/arm_b_lock_manager.py:44 except BlockingIOError:",
-      "rule": "acquire_lock : except BlockingIOError seul → fuite fd sur autre OSError"
+      "rule": "acquire_lock : except BlockingIOError SANS filet large → fuite fd sur toute autre OSError"
     }
   ],
   "stats": {

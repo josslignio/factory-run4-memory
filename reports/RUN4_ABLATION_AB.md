@@ -9,8 +9,10 @@
 > `tests/test_ablation_checker.py` 43/43 OK). Aucun chiffre inventé.
 > Trace d'exécution datée et reproductible archivée dans
 > `ablation/ABLATION_RUN_LOG.txt` (append-only **par convention d'écriture**,
-> NON tamper-evident, NON scellé cryptographiquement — voir §8 ; 2 blocs :
-> run initial + re-run post-durcissement round-2).
+> NON tamper-evident, NON scellé cryptographiquement — voir §8). Chaque bloc
+> est désormais **auto-écrit** par `ablation/run_ablation.sh` qui ré-exécute
+> le checker déterministe sur les deux bras (preuve d'exécution réelle, pas
+> seulement de reproductibilité — contre-audit Codex P1 #1).
 
 ## 1. Protocole (figé AVANT exécution — `ablation/PROTOCOL.md`)
 
@@ -157,25 +159,31 @@ rappel de l'injecteur, pas du mécanisme de mémoire lui-même.
   `ablation/arm_{a,b}_measurements.json`). Une **trace d'exécution datée**,
   append-only **par convention d'écriture** (`ablation/ABLATION_RUN_LOG.txt`),
   capture l'horodatage UTC, le hash HEAD du repo et la sortie complète du
-  checker pour chaque exécution. **Honnêtement** : cette trace n'est PAS
+  checker pour chaque exécution. **Preuve d'exécution (contre-audit Codex
+  P1 #1)** : le script `ablation/run_ablation.sh` ré-exécute RÉELLEMENT le
+  checker sur les deux bras et APPEND automatiquement le bloc daté dans le
+  journal (test réel `tests/test_ablation_runner.py`) — l'exécution est donc
+  prouvée, pas seulement reproductible. **Honnêtement** : cette trace n'est PAS
   tamper-evident et n'est PAS scellée cryptographiquement (fichier texte
   ordinaire — voir §8) ; l'exigence de traçabilité du contre-audit est
-  satisfaite au niveau « repère daté + reproductible », pas au niveau
-  « preuve d'intégrité ».
+  satisfaite au niveau « exécution réelle datée + reproductible », pas au
+  niveau « preuve d'intégrité ».
 
-## 8. Traçabilité de l'exécution (contre-audit Codex P1 #2) — honnêteté V1
+## 8. Traçabilité de l'exécution (contre-audit Codex P1 #1/#2) — honnêteté V1
 
 Le contre-audit demandait une trace horodatée des exécutions, pas seulement
 la cohérence statique des JSON archivés. Celle-ci vit dans
 `ablation/ABLATION_RUN_LOG.txt`. **Honnêtement (limite V1 assumée)** :
 
-- Le fichier est **append-only PAR CONVENTION D'ÉCRITURE seulement** : chaque
-  exécution (ajoutée manuellement — voir ci-dessous) y inscrit un bloc daté. Il
-  **n'est PAS tamper-evident** et **n'est PAS cryptographiquement scellé** : c'est
-  un fichier texte ordinaire, modifiable par tout processus du même utilisateur
-  macOS (même limite V1 que les receipts documentée dans MASTER_ORDER §« MACHINE
-  À ÉTATS »). **Aucun chaînage cryptographique n'a été construit** (et on n'en
-  prétend pas un) : cela sortirait du périmètre stdlib/honnête de Run 4.
+- Le fichier est **append-only PAR CONVENTION D'ÉCRITURE** : le script
+  `ablation/run_ablation.sh` n'utilise QUE l'opérateur `>>` (jamais `>` ni
+  truncate), donc chaque exécution y insère un bloc daté sans rien écraser.
+  Il **n'est PAS tamper-evident** et **n'est PAS cryptographiquement scellé** :
+  c'est un fichier texte ordinaire, modifiable par tout processus du même
+  utilisateur macOS (même limite V1 que les receipts documentée dans
+  MASTER_ORDER §« MACHINE À ÉTATS »). **Aucun chaînage cryptographique n'a été
+  construit** (et on n'en prétend pas un) : cela sortirait du périmètre
+  stdlib/honnête de Run 4 (P0 finding 5 l'interdit explicitement).
 - Le `hash HEAD du repo` consigné dans l'en-tête prouve **quel commit a
   produit** chaque exécution (reproductibilité) ; il **ne scelle pas** le
   fichier de trace contre une modification ultérieure. C'est un repère
@@ -184,12 +192,14 @@ la cohérence statique des JSON archivés. Celle-ci vit dans
   HEAD du repo ; sortie JSON complète du checker pour chaque bras ; ligne de
   verdict consolidée (`p1 A->B`, `total A->B`).
 
-**Reproduction vs journal** : la commande
+**Exécution réelle prouvée (contre-audit Codex P1 #1)** : contrairement au
+rapport précédent qui admettait qu'AUCUN script n'écrivait le journal (recopie
+manuelle → l'exécution n'était que reproductible, pas prouvée),
+`ablation/run_ablation.sh` exécute désormais RÉELLEMENT le checker sur les deux
+bras et append automatiquement le bloc daté. La reproduction manuelle reste
+possible via
 `python3 factory/bin/ablation_checker.py ablation/arm_{a,b}_lock_manager.py --json`
-rejoue la mesure et imprime le JSON sur stdout (JSON aussi archivés dans
-`ablation/arm_{a,b}_measurements.json`). En revanche, **aucun script n'écrit ni
-n'appende automatiquement** `ABLATION_RUN_LOG.txt` : l'ajout d'un bloc daté
-(`===== RUN <ts> =====`) est une opération **manuelle** (un humain recopie la
-sortie datée dans le journal). Cohérent avec la limite V1 ci-dessus (journal non
-scellé, non tamper-evident) : la traçabilité repose sur la reproductibilité de
-la commande + le repère de commit, pas sur un mécanisme automatique d'intégrité.
+(JSON archivés dans `ablation/arm_{a,b}_measurements.json`). La traçabilité
+repose donc sur **une exécution réelle datée** (le script) + **la
+reproductibilité** de la commande + le repère de commit — mais TOUJOURS sans
+mécanisme d'intégrité cryptographique (limite V1 assumée, honnêtement).

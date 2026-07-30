@@ -319,3 +319,60 @@ réversible, fail-closed, puis CONTINUE — master order §AUTONOMIE TOTALE).
 - **Réversible** : oui (la redirection est un branchement de plus dans le bloc
   audit ; retirer la branche `redirect` ou le flag restore le FAIL immédiat de
   FIX 3 sans toucher au reste de la machine à états).
+
+## D-013-bis — Correctif de branchement : la redirection D-013 était structurellement présente mais fonctionnellement inerte (CUR_PROMPT ne lisait jamais REDIRECT_PROMPT)
+- **Contexte** : revue indépendante Codex sur le commit `b674838`
+  (`run_run4_autonomous.sh`). Le mécanisme D-013 de redirection chirurgicale
+  vers GLM en cas de stall était **structurellement présent mais
+  fonctionnellement inerte**. Le `REDIRECT_PROMPT` était bien construit
+  (`build_redirect_prompt`), écrit dans `REVIEW_CLAUDE` puis copié dans
+  `REVIEW_CODEX` (`run_run4_autonomous.sh:~583`), **mais** `CUR_PROMPT` (la
+  valeur **réellement** passée à `opencode run`, l'appel GLM qui construit, à
+  `run_run4_autonomous.sh:~666`) était **toujours assigné depuis
+  `BUILD_PROMPT_P0`/`BUILD_PROMPT_P1` statique** et ne lisait **jamais**
+  `REVIEW_CLAUDE`, `REVIEW_CODEX` ni `REDIRECT_PROMPT`. Conséquence : au 1er
+  stall détecté, le `REDIRECT_PROMPT` chirurgical était bien produit et écrit
+  dans les fichiers de review — mais GLM ne le voyait **jamais**, recevait
+  uniquement le `BUILD_PROMPT` standard, et reproduisait donc à l'identique le
+  comportement non résolu → stall suivant → `FAIL`. La redirection ne produisait
+  **aucun effet ciblé**.
+- **Décision (correctif minimal, isolé dans une fonction testable, puis
+  CONTINUE)** : brancher **réellement** la redirection, sans toucher au reste
+  de D-013 ni de D-001 à D-012 ni de FIX1/FIX2/FIX3.
+  1. **Persistance du redirect** : au moment où `REDIRECT_PROMPT` est construit
+     (branche `redirect` du `case stall_action`), son contenu est persisté dans
+     un fichier `RECEIPTS_DIR/pending_redirect_${PHASE}.txt` (`PHASE` = `P0` ou
+     `P1` selon le contexte).
+  2. **Lecture effective à l'assignation de `CUR_PROMPT`** : la construction de
+     `CUR_PROMPT` est isolée dans une fonction **testable**
+     `build_cur_prompt(PHASE)` qui renvoie la valeur à utiliser. Si
+     `pending_redirect_${PHASE}.txt` existe, `CUR_PROMPT` = **contenu du fichier
+     PUIS** `BUILD_PROMPT_P0`/`BUILD_PROMPT_P1` (redirection **en plus** du
+     prompt de build standard, jamais à la place) ; sinon `CUR_PROMPT` =
+     `BUILD_PROMPT` standard seul. GLM reçoit donc **effectivement** le contenu
+     de redirection en plus du prompt de build standard.
+  3. **Usage unique** : **après** l'appel `opencode run`, le fichier
+     `pending_redirect_${PHASE}.txt` est supprimé (`rm -f`), pour garantir un
+     usage unique — jamais de re-injection sur une itération ultérieure
+     (qu'elle réussisse ou échoue côté infra).
+- **Intact** : tout le reste de D-013 (décision de stall en 2 temps, `stall_action`,
+  `extract_findings`, `build_redirect_prompt`, `audit_same_as_previous`, flag
+  `redirect_attempt_${PHASE}.used`, FAIL au 2e stall), D-001 à D-012, FIX1
+  (purge cache Codex), FIX2 (bruit CLI → `infra_fail`), FIX3 (noyau de
+  détection de stall), machine à états `MASTER_ORDER`. La contrainte Jocelyn
+  est préservée : Claude reste **hors** du pilote, le reviewer reste Codex
+  seul, la redirection reste routée vers **GLM**.
+- **Vérification réelle** : **155 pytest verts** + **200 checks bash verts**
+  (166 driver dont 16 nouveaux `d013bis` vérifiant le **contenu réel** de
+  `CUR_PROMPT` produit par `build_cur_prompt` + 34 P0-reprise). Les nouveaux
+  tests ne se contentent pas de vérifier l'existence des fonctions D-013 :
+  (cas 1) `pending_redirect` existe → `CUR_PROMPT` **contient** le contenu de
+  redirection **en tête**, suivi du `BUILD_PROMPT` standard (jamais remplacé),
+  sans duplication ; (cas 2) `pending_redirect` absent → `CUR_PROMPT` est
+  **exactement** égal au `BUILD_PROMPT` seul (P0 et P1, aucun préfixe
+  parasite) ; isolation cross-phase (`pending_redirect_P1` ne fuit pas vers
+  `build_cur_prompt P0`).
+- **Réversible** : oui (le correctif est un branchement de plus ; retirer
+  l'écriture du `pending_redirect`, l'appel `build_cur_prompt` ou le `rm -f`
+  restore l'assignation statique de `CUR_PROMPT` sans toucher au reste de la
+  machine à états ni à D-013).

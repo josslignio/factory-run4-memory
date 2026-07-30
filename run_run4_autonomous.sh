@@ -273,6 +273,43 @@ build_redirect_prompt() {
   printf 'Ta derniere tentative n a RIEN change au probleme signale (verdict Codex identique au round precedent). N ESSAIE PAS la meme chose une deuxieme fois. Voici EXACTEMENT et UNIQUEMENT le(s) finding(s) a corriger, extrait du dernier rapport Codex :\n%s\nApplique un patch MINIMAL et CHIRURGICAL qui cible precisement cette ligne/ce comportement, ne touche a AUCUN autre fichier ni AUCUNE autre logique. Si le finding te semble deja corrige ou ambigu, dis-le explicitement dans ton commit plutot que de re-tenter en aveugle. C est ta DERNIERE tentative sur ce point avant arret FAIL du pilote et intervention humaine.' "$findings"
 }
 
+# --- D-013-bis (correctif de branchement, post-revue independante Codex sur
+# le commit b674838) : le mecanisme D-013 de redirection chirurgicale vers GLM
+# en cas de stall etait STRUCTURELLEMENT present mais FONCTIONNELLEMENT INERTE.
+# Le REDIRECT_PROMPT etait ecrit dans REVIEW_CLAUDE puis copie dans REVIEW_CODEX,
+# mais CUR_PROMPT (la valeur REELLEMENT passee a `opencode run`, l'appel GLM qui
+# construit) etait TOUJOURS assigne depuis BUILD_PROMPT_P0/P1 statique et ne
+# lisait JAMAIS REVIEW_CLAUDE, REVIEW_CODEX ni REDIRECT_PROMPT. Resultat : GLM
+# ne voyait JAMAIS le contenu de redirection, meme apres un stall detecte -- la
+# redirection ne produisait aucun effet cible.
+#
+# Ce correctif branche REELLEMENT la redirection. Isoler la construction de
+# CUR_PROMPT dans une fonction testable build_cur_prompt(PHASE) :
+#   - au moment ou REDIRECT_PROMPT est construit (branche redirect du case
+#     stall_action), son contenu est persiste dans
+#     RECEIPTS_DIR/pending_redirect_PHASE.txt (PHASE = P0 ou P1) ;
+#   - build_cur_prompt(PHASE) verifie ce fichier : s'il existe, CUR_PROMPT =
+#     contenu du fichier PUIS BUILD_PROMPT_P0/P1 (redirection EN PLUS du prompt
+#     de build standard, jamais a la place) ; sinon CUR_PROMPT = BUILD_PROMPT
+#     standard seul ;
+#   - APRES l'appel opencode run, le fichier pending_redirect est supprime ->
+#     usage UNIQUE, jamais de re-injection sur une iteration ulterieure.
+# Teste reellement par tests/test_driver_helpers.bash (verification du CONTENU
+# reel de CUR_PROMPT produit, pas seulement l'existence des fonctions D-013). ---
+build_cur_prompt() {
+  local phase="$1" base pr
+  if [ "$phase" = "P1" ]; then base="$BUILD_PROMPT_P1"; else base="$BUILD_PROMPT_P0"; fi
+  pr="$RECEIPTS_DIR/pending_redirect_${phase}.txt"
+  if [ -f "$pr" ]; then
+    # Redirection chirurgicale D-013 EN TETE du prompt : GLM recoit le contenu de
+    # redirection AVANT le build standard, pour garantir qu'il est effectivement
+    # pris en compte. $(cat ...) evite le bruit d'une commande vide.
+    printf '%s\n\n%s' "$(cat "$pr")" "$base"
+  else
+    printf '%s' "$base"
+  fi
+}
+
 # Decision de stall en 2 temps (D-013). Entrees :
 #   $1 = code retour du predicat audit_same_as_previous (0 = stalled, autre = non).
 #   $2 = chemin du flag redirect_attempt_PHASE.used.
@@ -584,6 +621,12 @@ $FINAL_AUDIT_PROMPT" > "$AUDIT_CODEX" 2>>"$LOG" \
             echo "--- REDIRECT_PROMPT ---"; printf '%s\n' "$REDIRECT_PROMPT"; } > "$REVIEW_CLAUDE"
           cp "$REVIEW_CLAUDE" "$REVIEW_CODEX"
           mkdir -p "$RECEIPTS_DIR"
+          # D-013-bis : persiste le REDIRECT_PROMPT pour que build_cur_prompt le
+          # lise au prochain tour de build. Sans cette persistance, CUR_PROMPT
+          # resterait le BUILD_PROMPT statique et la redirection serait inerte
+          # (GLM ne la verrait jamais). Le fichier est purge APRES l'appel
+          # opencode run (usage unique).
+          printf '%s\n' "$REDIRECT_PROMPT" > "$RECEIPTS_DIR/pending_redirect_${PHASE}.txt"
           touch "$REDIRECT_FLAG"
           # NB : on NE consigne PAS le sha courant dans STALL_FILE et on N
           # incremente PAS audit_repairs. Le round de redirection doit etre
@@ -663,13 +706,24 @@ $FINAL_AUDIT_PROMPT" > "$AUDIT_CODEX" 2>>"$LOG" \
     exit 1
   fi
   PHASE=$(read_phase) || { echo "[$(date -u +%FT%TZ)] phase invalide dans $PHASE_FILE -> arret fail-closed (aucune reinit silencieuse)" >> "$LOG"; exit 1; }
-  if [ "$PHASE" = "P1" ]; then CUR_PROMPT="$BUILD_PROMPT_P1"; else CUR_PROMPT="$BUILD_PROMPT_P0"; fi
+  # D-013-bis : CUR_PROMPT est construit par build_cur_prompt, qui PREPEND le
+  # contenu d une eventuelle redirection chirurgicale D-013 (fichier
+  # pending_redirect_PHASE.txt) au BUILD_PROMPT standard. Avant ce branchement,
+  # CUR_PROMPT etait TOUJOURS assigne statiquement depuis BUILD_PROMPT_P0/P1 et
+  # ne lisait JAMAIS REVIEW_CLAUDE/REVIEW_CODEX/REDIRECT_PROMPT -> la redirection
+  # D-013 etait structurellement presente mais fonctionnellement inerte.
+  CUR_PROMPT="$(build_cur_prompt "$PHASE")"
   echo "[$(date -u +%FT%TZ)] iter $i (state=$ST, phase=$PHASE) -> GLM build (opencode, zai-coding-plan/glm-5.2 force)" >> "$LOG"
   # ADAPTE CETTE LIGNE si le smoke-test opencode montre une autre syntaxe (mais garde TOUJOURS --model zai-coding-plan/*) :
-  if opencode run --model zai-coding-plan/glm-5.2 "$CUR_PROMPT" >> "$LOG" 2>&1; then
+  opencode run --model zai-coding-plan/glm-5.2 "$CUR_PROMPT" >> "$LOG" 2>&1
+  rc=$?
+  # D-013-bis : purge du fichier pending_redirect APRES l'appel opencode run ->
+  # la redirection chirurgicale est consommee (GLM l a recue), usage UNIQUE :
+  # jamais de re-injection sur une iteration ulterieure.
+  rm -f "$RECEIPTS_DIR/pending_redirect_${PHASE}.txt" 2>/dev/null
+  if [ "$rc" -eq 0 ]; then
     infra_fails=0
   else
-    rc=$?
     infra_fails=$((infra_fails+1))
     echo "[$(date -u +%FT%TZ)] iter $i: opencode rc=$rc, infra_fails=$infra_fails/$MAX_INFRA_FAILS" >> "$LOG"
     if [ "$infra_fails" -gt "$MAX_INFRA_FAILS" ]; then

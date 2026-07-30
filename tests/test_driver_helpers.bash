@@ -543,5 +543,96 @@ else
   pass=$((pass+1))
 fi
 
+# ====================================================================
+# D-013-bis (correctif de branchement, post-revue independante Codex b674838) :
+# la redirection D-013 etait INERTE -- CUR_PROMPT etait JAMAIS alimente par
+# REDIRECT_PROMPT (assigne statiquement depuis BUILD_PROMPT_P0/P1). Desormais
+# build_cur_prompt(PHASE) lit RECEIPTS_DIR/pending_redirect_PHASE.txt et, s'il
+# existe, PREPEND son contenu au BUILD_PROMPT standard. Ces tests verifient le
+# CONTENU REEL de CUR_PROMPT produit par build_cur_prompt (pas seulement
+# l'existence des fonctions D-013) : un cas ou pending_redirect existe, un cas
+# ou il n existe pas.
+# ====================================================================
+
+# Preuves structurelles D-013-bis : le driver declare build_cur_prompt,
+# l'utilise REELLEMENT pour assigner CUR_PROMPT, persiste le REDIRECT_PROMPT
+# dans pending_redirect_PHASE.txt et purge ce fichier APRES l'appel opencode.
+grep -qE '^build_cur_prompt\(\)' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013bis build_cur_prompt non defini"; }
+grep -qF 'CUR_PROMPT="$(build_cur_prompt "$PHASE")"' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013bis CUR_PROMPT n est pas assigne par build_cur_prompt (redirection inerte)"; }
+grep -qF 'pending_redirect_${PHASE}.txt' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013bis fichier pending_redirect non reference dans le driver"; }
+# la persistance dans la branche redirect (contenu du REDIRECT_PROMPT ecrit) :
+grep -qF 'printf '"'"'%s\n'"'"' "$REDIRECT_PROMPT" > "$RECEIPTS_DIR/pending_redirect_${PHASE}.txt"' "$DRV" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013bis branche redirect ne persiste pas REDIRECT_PROMPT"; }
+# la purge APRES l appel opencode run (usage unique) : un seul rm du fichier, et
+# il suit lexicalement l appel opencode (jamais avant -> pas de purge prematuree).
+nrmpending=$(grep -cF 'pending_redirect_${PHASE}.txt' "$DRV")
+[ "$nrmpending" -ge 2 ] && pass=$((pass+1)) \
+  || { fail=$((fail+1)); echo "FAIL: d013bis pending_redirect insuffisamment reference (persist+purge)"; }
+opencode_line=$(grep -nF 'opencode run --model zai-coding-plan/glm-5.2 "$CUR_PROMPT"' "$DRV" | head -1 | cut -d: -f1)
+purge_line=$(grep -nF 'rm -f "$RECEIPTS_DIR/pending_redirect_${PHASE}.txt" 2>/dev/null' "$DRV" | head -1 | cut -d: -f1)
+[ -n "$opencode_line" ] && [ -n "$purge_line" ] && [ "$purge_line" -gt "$opencode_line" ]
+chk "d013bis_purge_after_opencode" "$?" "0"
+# plus d assignation statique de CUR_PROMPT depuis BUILD_PROMPT seul (l ancien
+# bug) -- preuve que la redirection n est plus inerte :
+if grep -qF 'CUR_PROMPT="$BUILD_PROMPT_P1"; else CUR_PROMPT="$BUILD_PROMPT_P0"' "$DRV"; then
+  fail=$((fail+1)); echo "FAIL: d013bis ancienne assignation statique CUR_PROMPT toujours presente (redirection inerte)"
+else pass=$((pass+1)); fi
+
+# --- Test de CONTENU REEL (cas 1) : pending_redirect EXISTE -> CUR_PROMPT
+#     contient le contenu de redirection EN TETE, suivi du BUILD_PROMPT (en
+#     PLUS, jamais a la place). build_cur_prompt lit RECEIPTS_DIR global, qu on
+#     surcharge proprement vers un temp (sauvegarde/restauration). ---
+D013BIS_DIR="$TMP/receipts_d013bis"; mkdir -p "$D013BIS_DIR"
+SAVED_RECEIPTS_DIR="$RECEIPTS_DIR"
+RECEIPTS_DIR="$D013BIS_DIR"
+# on persiste un contenu de redirection distinctif dans pending_redirect_P0.txt :
+printf 'REDIR_SENTINEL_42 : corrige factory/bin/x.py:42 chirurgicalement\n' > "$RECEIPTS_DIR/pending_redirect_P0.txt"
+CUR0="$(build_cur_prompt P0)"
+# le contenu de redirection est BIEN present dans CUR_PROMPT (redirection effective) :
+printf '%s' "$CUR0" | grep -qF 'REDIR_SENTINEL_42 : corrige factory/bin/x.py:42 chirurgicalement' \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013bis cas1 contenu de redirection absent de CUR_PROMPT"; }
+# le BUILD_PROMPT_P0 standard est AUSSI present (concatene, jamais remplace) :
+printf '%s' "$CUR0" | grep -qF 'PHASE P0 UNIQUEMENT' \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013bis cas1 BUILD_PROMPT_P0 absent du CUR_PROMPT concatene"; }
+# la redirection PRECEDE le build (redirection d abord, build ensuite) -- via
+# position du prefixe :
+case "$CUR0" in
+  REDIR_SENTINEL_42*) chk "d013bis_cas1_redirect_precedes_build" "prefix" "prefix" ;;
+  *) chk "d013bis_cas1_redirect_precedes_build" "no-prefix" "prefix" ;;
+esac
+# le contenu de redirection n apparait qu UNE seule fois (pas de duplication) :
+[ "$(printf '%s' "$CUR0" | grep -cF 'REDIR_SENTINEL_42')" -eq 1 ]
+chk "d013bis_cas1_redirect_once" "$?" "0"
+
+# --- Test de CONTENU REEL (cas 2) : pending_redirect ABSENT -> CUR_PROMPT egal
+#     EXACTEMENT au BUILD_PROMPT seul (aucune redirection, aucun prefixe parasite,
+#     aucun bruit). Verifie P0 et P1. ---
+rm -f "$RECEIPTS_DIR/pending_redirect_P0.txt" "$RECEIPTS_DIR/pending_redirect_P1.txt"
+CUR0_NO="$(build_cur_prompt P0)"
+[ "$CUR0_NO" = "$BUILD_PROMPT_P0" ]
+chk "d013bis_cas2_no_redirect_equals_build_p0" "$?" "0"
+CUR1_NO="$(build_cur_prompt P1)"
+[ "$CUR1_NO" = "$BUILD_PROMPT_P1" ]
+chk "d013bis_cas2_no_redirect_equals_build_p1" "$?" "0"
+
+# isolation cross-phase : un pending_redirect P1 ne fuite PAS vers build_cur_prompt P0.
+printf 'REDIR_SENTINEL_P1_ONLY\n' > "$RECEIPTS_DIR/pending_redirect_P1.txt"
+CUR0_ISOL="$(build_cur_prompt P0)"
+if printf '%s' "$CUR0_ISOL" | grep -qF 'REDIR_SENTINEL_P1_ONLY'; then
+  fail=$((fail+1)); echo "FAIL: d013bis build_cur_prompt P0 lit le pending_redirect P1 (fuite cross-phase)"
+else pass=$((pass+1)); fi
+# et build_cur_prompt P1 lit bien le sien (+ BUILD_PROMPT_P1 en plus) :
+CUR1_HAS="$(build_cur_prompt P1)"
+printf '%s' "$CUR1_HAS" | grep -qF 'REDIR_SENTINEL_P1_ONLY' \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013bis build_cur_prompt P1 ne lit pas son pending_redirect"; }
+printf '%s' "$CUR1_HAS" | grep -qF 'PHASE P1' \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: d013bis build_cur_prompt P1 sans BUILD_PROMPT_P1 concatene"; }
+
+# restauration du RECEIPTS_DIR global (proprete, autres tests non impactes).
+RECEIPTS_DIR="$SAVED_RECEIPTS_DIR"
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

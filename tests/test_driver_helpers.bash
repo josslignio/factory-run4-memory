@@ -135,5 +135,27 @@ else
   fail=$((fail+1)); echo "FAIL: main() n'appelle pas enforce_legal_transition_or_die (garde de transition absent)"
 fi
 
+# --- P0 finding 6 (autorité UNIQUE cohérente) : les budgets documentés dans
+# MASTER_ORDER_RUN4_MEMORY.md DOIVENT correspondre aux constantes du driver
+# run_run4_autonomous.sh. Une contradiction (ex: « Max 2 repairs » dans une
+# règle absolue vs MAX_*_REPAIR=30 dans le code) violait « une seule autorité
+# documentée ». On extrait chaque budget des deux sources et on compare. ---
+drv_p0=$(grep -oE 'MAX_P0_REPAIR=[0-9]+' "$REPO/run_run4_autonomous.sh" | head -1 | cut -d= -f2)
+drv_p1=$(grep -oE 'MAX_P1_REPAIR=[0-9]+' "$REPO/run_run4_autonomous.sh" | head -1 | cut -d= -f2)
+drv_infra=$(grep -oE 'MAX_INFRA_FAILS=[0-9]+' "$REPO/run_run4_autonomous.sh" | head -1 | cut -d= -f2)
+mo_p0=$(grep -oE 'MAX_P0_REPAIR=[0-9]+' "$REPO/MASTER_ORDER_RUN4_MEMORY.md" | head -1 | cut -d= -f2)
+mo_p1=$(grep -oE 'MAX_P1_REPAIR=[0-9]+' "$REPO/MASTER_ORDER_RUN4_MEMORY.md" | head -1 | cut -d= -f2)
+mo_infra=$(grep -oE 'MAX_INFRA_FAILS=[0-9]+' "$REPO/MASTER_ORDER_RUN4_MEMORY.md" | head -1 | cut -d= -f2)
+chk "authority_budget_p0_coherent"    "$drv_p0"    "$mo_p0"
+chk "authority_budget_p1_coherent"    "$drv_p1"    "$mo_p1"
+chk "authority_budget_infra_coherent" "$drv_infra" "$mo_infra"
+# plus aucune contradiction « Max 2 repairs »/« Max 3 retries » héritée dans
+# le MASTER_ORDER (l'ancienne règle absolue contredisait le driver réel) :
+if grep -qE 'Max 2 repairs|Max 3 retries' "$REPO/MASTER_ORDER_RUN4_MEMORY.md"; then
+  fail=$((fail+1)); echo "FAIL: MASTER_ORDER contient encore 'Max 2 repairs'/'Max 3 retries' (autorité non cohérente)"
+else
+  pass=$((pass+1))
+fi
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

@@ -15,7 +15,7 @@ NE POSE JAMAIS de question à l'humain. N'utilise JAMAIS d'outil de question/cla
 3. Aucun `merge`/`push`/`tag`/`deploy` vers `main` sans GO explicite de Jocelyn. `main` reste `UNCHANGED` pendant tout le run.
 4. Toute affirmation tracée fichier:ligne (L-049). Chaque rapport finit par une section NON VÉRIFIÉ honnête (L-041) — jamais de chiffre inventé, "non mesuré" sinon.
 5. Un finding de review, même mineur, est documenté ; un finding P1/High reproduit est fixé avant de continuer (même doctrine que Run #3).
-6. Max 2 repairs par capacité. Max 3 retries infra (30s/120s/300s). Commit à chaque sous-capacité.
+6. Budget de réparation : `MAX_P0_REPAIR=30`, `MAX_P1_REPAIR=30` par phase, `MAX_INFRA_FAILS=10` retries infra (backoff 30s/120s/300s) — relevé 30/07 Jocelyn (tolérer plus de hoquets avant `FAIL`, cohérent avec le pilote). Autorité UNIQUE détaillée § « MACHINE À ÉTATS » et constante dans `run_run4_autonomous.sh` : aucune autre valeur ailleurs (sinon contradiction d'autorité). Commit à chaque sous-capacité.
 7. INTERDIT : toute commande cleanup/rm large ou récursive.
 
 ## 1. SCHÉMA DE LA MÉMOIRE
@@ -85,7 +85,7 @@ Tout état lu dans `CAMPAIGN_STATE` hors de cette liste est `illegal` : le pilot
 - `RUNNING → READY_FOR_FINAL_AUDIT` (builder, fin de phase) → audit simple Codex (Claude retire de la boucle 30/07, tokens exacts en première ligne : `PHASE_P0_PASS`/`PHASE_P0_FAIL` en P0, `PHASE_P1_PASS`/`PHASE_P1_FAIL` en P1).
 - Audit P0 PASS (Codex seul) → checkpoint P0 figé (commit, worktree, SHA-256 de l'audit) → `CAMPAIGN_PHASE=P1`, budget de repair réinitialisé, `RUNNING`.
 - Audit P1 PASS (Codex seul) → `WAITING_HUMAN_BOSS_GO` → arrêt. La suite (merge) est 100 % humaine.
-- Audit non-PASS → repair round (budget : `MAX_P0_REPAIR=30`, `MAX_P1_REPAIR=30` par phase — relevé 30/07 Jocelyn) ; budget épuisé → `FAIL`.
+- Audit non-PASS → repair round (budget : `MAX_P0_REPAIR=30`, `MAX_P1_REPAIR=30` par phase, `MAX_INFRA_FAILS=10` retries infra — relevé 30/07 Jocelyn) ; budget épuisé → `FAIL`.
 - `FAIL → RUNNING` : UNIQUEMENT via `RESUME_AFTER_FAIL=1` explicite, avec `resume_receipt.json` écrit (old_state, new_state, phase, commit, timestamp, reason). Reprise phase-aware : phase absente → reprise legacy en P0 (loggée) ; phase P0 → reprise P0 ; phase P1 → reprise P1 SEULEMENT si le checkpoint P0 se re-vérifie (hashes recalculés) ; phase inconnue ou checkpoint invalide → refus.
 - Mémoire de leçons : avant chaque itération builder, `lesson_injector.py --format quiet` est exécuté. Contrat strict : rc=0, ou rc=2 avec stderr vide (= mémoire valide, aucune leçon pertinente). Tout autre résultat → `MEMORY_SYSTEM_FAIL`. Note documentée : en V1, les reviewers de tranche reçoivent le diff, pas d'injection de leçons — la garde mémoire couvre le chemin builder.
 
